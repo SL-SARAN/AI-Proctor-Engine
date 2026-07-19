@@ -59,7 +59,7 @@ touching code.
   and the new enum values added by
   `20260718_0002_audit_reconciliation.py` are exactly the kind of
   invariants SQLite cannot model.
-- The three open decisions (admin identity, accumulated-score path,
+- The two remaining open decisions (accumulated-score path,
   embedding storage) are **not** to be silently resolved. Surface
   them and ask.
 
@@ -68,7 +68,8 @@ touching code.
 ## What is built today
 
 - Python 3.11+ project structure (`pyproject.toml`, package layout).
-- PostgreSQL ORM schema for all 10 entities (`src/proctoring_engine/models.py`).
+- PostgreSQL ORM schema for all 11 entities (`src/proctoring_engine/models.py`),
+  including `AdminUser` for structured admin/proctor/instructor identity.
 - Data integrity constraints (confidence `[0,1]`, timestamp ordering,
   retention, FK, uniqueness, policy gaze ordering, accumulated-score
   non-negative, embedding validation, `Flag` confidence interval
@@ -77,13 +78,18 @@ touching code.
   `TerminationRecord`, `ProctorReview`).
 - `Flag` and `TerminationRecord` immutability — both at the ORM
   event listener and at PostgreSQL triggers.
-- Two Alembic migrations: the initial revision
-  (`20260717_0001_initial_proctoring_schema.py`) and the audit
-  reconciliation
-  (`20260718_0002_audit_reconciliation.py`).
-- 19 unit boundary / integrity tests passing on SQLite
+- Three Alembic migrations: the initial revision
+  (`20260717_0001_initial_proctoring_schema.py`), the audit
+  reconciliation (`20260718_0002_audit_reconciliation.py`), and the
+  admin-user layer (`20260719_0003_admin_user.py`).
+- Admin identity resolution: `PolicyConfig.created_by_id`,
+  `AccommodationExemption.approved_by_admin_id`, and
+  `ProctorReview.reviewer_admin_id` are FK-backed columns pointing
+  to `admin_users`. Original string fields are preserved for
+  backward compatibility.
+- 35 unit boundary / integrity tests passing on SQLite
   (`tests/test_models.py`).
-- 12 PostgreSQL integration tests passing on the real engine
+- 16 PostgreSQL integration tests passing on the real engine
   (`tests/integration/test_postgres_immutability.py`).
 - GitHub Actions CI: unit + integration (with `postgres:15-alpine`
   service container) + Docker build smoke test
@@ -99,9 +105,8 @@ touching code.
 
 ## What is **not** built today (the unchecked items on the checklist)
 
-- `AdminUser` table + admin-identity resolution (the next atomic
-  layer).
-- LTI 1.3 launch + session creation + consent capture.
+- LTI 1.3 launch + session creation + consent capture (the next
+  atomic layer).
 - Authenticated WebSocket protocol (envelope, sparse frames,
   kill-switch, ack).
 - Preprocessing layer (decode, tiered scheduler, rolling buffer
@@ -169,6 +174,7 @@ of truth for each layer's contract. The locked spec at
 requirements. `docs/DEPLOYMENT.md` is the source of truth for the
 deployment topology, sizing, and secrets model.
 
-The next atomic layer is the **`AdminUser` table** — the admin-
-identity open decision from `docs/01`, which unblocks the LTI 1.3
-launch implementation.
+The next atomic layer is **LTI 1.3 launch + session creation +
+consent capture** — the ingestion layer from `docs/02`, which
+converts an LTI launch into a `Participant` + `ExamSession` and
+gates all subsequent telemetry on consent.

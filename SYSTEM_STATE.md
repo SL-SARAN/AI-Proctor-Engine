@@ -1,6 +1,6 @@
 # System State
 
-Last updated: 2026-07-18
+Last updated: 2026-07-19
 
 This file is the single source of truth for "where the AI Proctoring
 Engine is right now." Read this first at the start of every session
@@ -32,6 +32,7 @@ design docs but is not built.
 | Kubernetes manifest set | **Implemented** | `k8s/00-...` through `k8s/10-...` |
 | Deployment topology doc | **Implemented** | `docs/DEPLOYMENT.md` |
 | FastAPI application shell (health endpoint only) | **Implemented** | `src/proctoring_engine/api.py` |
+| AdminUser table + admin-identity resolution | **Implemented** | `src/proctoring_engine/models.py`, `migrations/versions/20260719_0003_admin_user.py` |
 | Ingestion (LTI 1.3 launch, WebSocket envelope) | Not started | `docs/02-ingestion-layer-design.md` |
 | Preprocessing (frame decode, tiered scheduler, rolling buffer) | Not started | `docs/03-preprocessing-layer-design.md` |
 | Inference modules (6 modalities) | Not started | `docs/04-inference-modules-design.md` |
@@ -53,7 +54,7 @@ Per `docs/VERIFICATION_LOG.md`:
 - `pip install -e ".[dev]"` resolves cleanly.
 - The original 9 boundary / integrity unit tests passed on SQLite
   (the count predates the audit reconciliation; the post-reconciliation
-  count is 19).
+  count is 28; the post-AdminUser count is 35).
 - `GET /healthz` via FastAPI `TestClient` returned `200 OK` and
   `{"status": "ok", "environment": "development"}`.
 - `alembic upgrade head --sql` (DDL compile only) generated enums,
@@ -62,14 +63,17 @@ Per `docs/VERIFICATION_LOG.md`:
 
 ### Audit reconciliation + integration suite
 
-- `pytest tests --ignore=tests/integration` → **28 logical cases passed**
+- `pytest tests --ignore=tests/integration` → **35 logical cases passed**
   (4 from the confidence-accepts parametrize, 4 from the confidence-rejects
   parametrize, 4 from the flag-interval-accepts parametrize, 4 from the
-  flag-interval-rejects parametrize, 12 individual tests).
+  flag-interval-rejects parametrize, 19 individual tests including 7 new
+  AdminUser tests).
 - `alembic upgrade head` against a real PostgreSQL 15 service
-  container applied both migrations; the `flag_immutable` and
-  `termination_record_immutable` triggers are installed.
-- `pytest tests/integration` against the real engine → **13 passed**.
+  container applied all three migrations; the `flag_immutable` and
+  `termination_record_immutable` triggers are installed; the
+  `admin_users` table and `admin_role` enum are created.
+- `pytest tests/integration` against the real engine → **16 passed**
+  (13 original + 3 AdminUser tests).
 - `docker build --tag proctoring-engine:ci-smoke --load .` builds
   successfully; the runtime stage boots as a non-root user with a
   read-only rootfs.
@@ -128,11 +132,11 @@ From `docs/proctoring-engine-v1-spec.md` §1 and the design docs:
 
 ## 5. Open decisions
 
-1. **Admin / reviewer identity model** — to be resolved in the next
-   atomic layer (`AdminUser` table). The current schema stores
-   `AccommodationExemption.approved_by`, `PolicyConfig.created_by`,
-   and `ProctorReview.reviewer_reference` as free-form strings; the
-   next layer will tighten them to a structured identity.
+1. **Admin / reviewer identity model** — **Resolved.** The `AdminUser`
+   table was added in migration `20260719_0003`. The three referencing
+   tables (`PolicyConfig.created_by_id`, `AccommodationExemption.approved_by_admin_id`,
+   `ProctorReview.reviewer_admin_id`) now carry FK columns alongside
+   the original string fields for backward compatibility.
 2. **Accumulated-score termination path** — proposed in
    `docs/05-fusion-flagging-engine-design.md` Path 3. The schema is
    now ready for it (`ExamSession.accumulated_medium_score` and
@@ -172,6 +176,7 @@ From the spec's "library availability" note:
 | `PolicyConfig` | same | Versioned snapshot; sessions reference a specific version. |
 | `TerminationRecord` | same | 1:1 with `ExamSession`, append-only (ORM + DB trigger). |
 | `ProctorReview` | same | Human override on a flag (sits alongside, never edits). |
+| `AdminUser` | same | Structured admin/proctor/instructor identity; FK target for `PolicyConfig.created_by_id`, `AccommodationExemption.approved_by_admin_id`, `ProctorReview.reviewer_admin_id`. |
 
 ## 8. Immutability guarantees already in code
 
@@ -191,9 +196,9 @@ From the spec's "library availability" note:
 ## 9. Recommended next-layer order (per `docs/CLAUDE_HANDOFF.md`)
 
 1. ~~Alembic / SQLAlchemy integration tests against PostgreSQL in CI.~~ **Done.**
-2. `AdminUser` table — resolve the open admin-identity decision.
+2. ~~`AdminUser` table — resolve the open admin-identity decision.~~ **Done** (migration `20260719_0003`).
 3. Authenticated LTI 1.3 launch + session creation + consent capture
-   + policy snapshot.
+   + policy snapshot — **next atomic layer**.
 4. Authenticated WebSocket event schema, sparse-frame protocol,
    evidence-buffer upload, kill-switch acknowledgement.
 5. Object-storage abstraction with checksums, encryption metadata,
@@ -230,8 +235,8 @@ From the spec's "library availability" note:
   initial DDL + the `termination_record_immutable` trigger.
 - `migrations/versions/20260718_0002_audit_reconciliation.py` —
   audit-reconciliation DDL + the `flag_immutable` trigger.
-- `tests/test_models.py` — 19 unit boundary / integrity tests.
-- `tests/integration/test_postgres_immutability.py` — 12 real-engine
+- `tests/test_models.py` — 35 unit boundary / integrity tests.
+- `tests/integration/test_postgres_immutability.py` — 16 real-engine
   integration tests.
 - `docs/proctoring-engine-v1-spec.md` — the locked v1 spec.
 - `docs/00-index-and-architecture-flow.md` — the layer-by-layer
@@ -249,7 +254,7 @@ it to mark progress and to identify the next single atomic layer.
 
 - [x] Python project structure (`pyproject.toml`, package layout,
       FastAPI shell)
-- [x] PostgreSQL ORM schema (all 10 entities)
+- [x] PostgreSQL ORM schema (all 11 entities)
 - [x] Data integrity constraints (confidence, timestamps, retention,
       FK, uniqueness)
 - [x] Configurable termination policy (`PolicyConfig`)
@@ -259,14 +264,14 @@ it to mark progress and to identify the next single atomic layer.
 - [x] `Flag` immutability (ORM + PostgreSQL trigger)
 - [x] Schema migration (initial revision)
 - [x] Audit reconciliation migration (20260718_0002)
-- [x] Boundary / integrity unit tests (28 logical cases passing on SQLite)
-- [x] PostgreSQL integration tests (13 passing on real engine)
+- [x] Boundary / integrity unit tests (35 logical cases passing on SQLite)
+- [x] PostgreSQL integration tests (16 passing on real engine)
 - [x] GitHub Actions CI workflow (unit + integration + build)
 - [x] Docker image + docker-compose for local dev
 - [x] Kubernetes manifest set
 - [x] Documentation suite (`docs/00`–`08`, `docs/DEPLOYMENT.md`, plus
       spec and handoff) — `docs/` is now in git
-- [ ] `AdminUser` table + admin-identity resolution
+- [x] `AdminUser` table + admin-identity resolution
 - [ ] LTI 1.3 launch + session creation + consent capture
 - [ ] Authenticated WebSocket protocol (envelope, sparse frames,
       kill-switch, ack)

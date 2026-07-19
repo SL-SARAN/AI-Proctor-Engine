@@ -29,10 +29,13 @@ from proctoring_engine.models import (
     FlagStatus,
     Participant,
     PolicyConfig,
+    ProctorReview,
+    ReviewDecision,
     TelemetryEvent,
     TelemetryModality,
     TerminationRecord,
 )
+from proctoring_engine.models import AdminRole, AdminUser
 
 
 def utc_now() -> datetime:
@@ -355,3 +358,94 @@ def test_referential_action_protects_termination_record(
             {"id": flag.id},
         )
     integration_engine_session.rollback()
+
+
+# ----------------------------------------------------------------------
+# AdminUser: unique constraint (database-level)
+# ----------------------------------------------------------------------
+
+
+def test_admin_users_unique_constraint_enforced(
+    integration_engine_session: Session,
+) -> None:
+    """The uq_admin_users_lms_identity constraint is enforced at SQL level."""
+
+    admin = AdminUser(
+        lti_issuer="https://lms.example.edu",
+        lms_user_reference="admin-unique-test",
+        role=AdminRole.ADMIN,
+    )
+    integration_engine_session.add(admin)
+    integration_engine_session.commit()
+
+    with pytest.raises(IntegrityError, match="uq_admin_users_lms_identity"):
+        integration_engine_session.execute(
+            text(
+                "INSERT INTO admin_users (id, lti_issuer, lms_user_reference, role) "
+                "VALUES (:id, :issuer, :ref, 'admin')"
+            ),
+            {
+                "id": str(uuid.uuid4()),
+                "issuer": "https://lms.example.edu",
+                "ref": "admin-unique-test",
+            },
+        )
+    integration_engine_session.rollback()
+
+
+# ----------------------------------------------------------------------
+# AdminUser: ON DELETE RESTRICT protects referencing rows
+# ----------------------------------------------------------------------
+
+
+def test_admin_user_fk_restrict_on_delete(
+    integration_engine_session: Session,
+) -> None:
+    """Deleting an AdminUser referenced by a ProctorReview is blocked."""
+
+    admin = AdminUser(
+        lti_issuer="https://lms.example.edu",
+        lms_user_reference=f"admin-restrict-{uuid.uuid4()}",
+        role=AdminRole.PROCTOR,
+    )
+    integration_engine_session.add(admin)
+    integration_engine_session.flush()
+
+    flag = _seed_flag(integration_engine_session)
+    review = ProctorReview(
+        flag_id=flag.id,
+        reviewer_reference="proctor@example.edu",
+        reviewer_admin_id=admin.id,
+        decision=ReviewDecision.UPHELD,
+    )
+    integration_engine_session.add(review)
+    integration_engine_session.commit()
+
+    with pytest.raises((IntegrityError, ProgrammingError)):
+        integration_engine_session.execute(
+            text("DELETE FROM admin_users WHERE id = :id"),
+            {"id": admin.id},
+        )
+    integration_engine_session.rollback()
+
+
+# ----------------------------------------------------------------------
+# AdminUser: admin_role enum values
+# ----------------------------------------------------------------------
+
+
+def test_admin_role_enum_values(
+    integration_engine_session: Session,
+) -> None:
+    """The admin_role enum contains the expected values."""
+
+    result = integration_engine_session.execute(
+        text(
+            "SELECT unnest(enum_range(NULL::admin_role))::text AS value "
+            "ORDER BY value"
+        )
+    )
+    values = [row[0] for row in result]
+    assert "instructor" in values
+    assert "admin" in values
+    assert "proctor" in values

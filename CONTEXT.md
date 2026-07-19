@@ -224,29 +224,61 @@ the `ON DELETE RESTRICT` behavior on `flags.policy_config_id`.
 
 ## 9. The shape of the next session
 
-The next atomic layer is the **`AdminUser` table + admin-identity
-resolution**. Specifically:
+The next atomic layer is the **LTI 1.3 launch + session creation +
+consent capture** (`docs/02-ingestion-layer-design.md` §1). This is
+the first layer that produces runtime behavior beyond the FastAPI
+`/healthz` endpoint and the first that crosses the LTI trust
+boundary. The `AdminUser` table is in place, so the launch handler
+can attribute `PolicyConfig.created_by_id` correctly.
 
-- A new `AdminUser` table with `(lti_issuer, lms_user_reference,
-  role, created_at, retired_at)` and a unique constraint on
-  `(lti_issuer, lms_user_reference)`.
-- A new Alembic migration `20260718_0003_admin_user.py` that creates
-  the table, adds a UNIQUE on the natural identifier pair, and
-  (optionally) backfills from existing string references if there is
-  any production data to migrate.
-- A migration of the three string columns to FKs:
-  `AccommodationExemption.approved_by`, `PolicyConfig.created_by`,
-  `ProctorReview.reviewer_reference`. For a non-production system
-  with no data to preserve, this is a column-type change (string →
-  UUID) plus a foreign-key constraint.
-- Tests: unit-level (string-to-FK migration rejects orphan values;
-  `AdminUser` natural-identifier uniqueness; retired admins
-  cannot be referenced from new `ProctorReview` rows) and
-  integration-level (the FK constraints are enforced at the SQL
-  level; cascade behavior on retirement is `RESTRICT`, not
-  `CASCADE`, so a retired admin is preserved for audit).
+Specifically, the next turn delivers:
 
-This closes the open decision called out in
-`docs/01-data-models-design.md` and unblocks the LTI 1.3 launch
-implementation, which needs an admin identity to attribute the
-`created_by` field on `PolicyConfig`.
+- `GET /lti/login` and `POST /lti/launch` FastAPI routes.
+- OIDC third-party-initiated login flow: validate the platform's
+  OIDC discovery document, redirect to the platform's authorization
+  endpoint with `state` + `nonce`, receive the `id_token` JWT on
+  callback.
+- JWT validation: signature against the platform's JWKS endpoint,
+  `iss` / `aud` / `nonce` / `state` checks, `exp` not in the past.
+- On launch: upsert `Participant` (keyed on `(lti_issuer,
+  lms_user_reference)`), resolve the active `PolicyConfig` by name,
+  create the `ExamSession` with `status=PENDING` and
+  `policy_config_id` set, and bind `consent_recorded_at` to the
+  current time.
+- Issue a short-lived session token (signed JWT or opaque token in
+  Redis) that the browser uses to open the WebSocket in the
+  following layer.
+- Role-based branching: an instructor / admin-role launch routes
+  to the `/admin/*` surfaces (still future); a learner-role launch
+  routes to the exam-taking flow.
+
+Tests, per the boundary cases the spec calls out in
+`docs/02-ingestion-layer-design.md` §1 and `docs/08-test-strategy-design.md`:
+
+- Unit: JWT validation against a mocked JWKS (wrong signature,
+  expired `exp`, mismatched `nonce`, mismatched `state`, missing
+  required claims, learner-role-on-admin-route). Use the
+  `pyjwt` library (already a transitive dep of FastAPI) and a
+  fixture that produces a self-signed test key.
+- Integration: end-to-end launch against a fake OIDC provider
+  (e.g. `pytest-httpx` mock or a small in-process aiohttp server
+  serving a minimal discovery + JWKS endpoint). Verifies the
+  upsert + session creation against the real Postgres engine.
+- Endpoint-to-end: a successful launch returns a 302 to the
+  exam client and creates the right rows; a malformed launch
+  returns 400 and creates nothing; a replayed `state` returns
+  400 (not 200) — fail-closed, not fail-open.
+
+Layer depends on:
+
+- `AdminUser` table (done) — for the instructor-role path that
+  creates a `PolicyConfig` and attributes `created_by_id`.
+- The current `pyproject.toml` deps do not yet include `pyjwt` as
+  a direct dep; it comes in via FastAPI. The next turn should add
+  it explicitly (`pyjwt[crypto]>=2.8,<3` for RS256 support) so
+  the dep is visible in the lockfile and the test harness can
+  rely on it.
+- A `tests/integration/oidc/` test double: a minimal OIDC
+  discovery + JWKS server that issues a self-signed JWT. This is
+  the smallest harness that exercises the launch path end-to-end
+  without needing a real LMS.

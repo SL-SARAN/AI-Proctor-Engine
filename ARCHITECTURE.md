@@ -292,17 +292,12 @@ audit trail for those changes.
 
 ## 9. Next single atomic layer (per `SKILLS_ALIGNMENT.md` §5 and `SYSTEM_STATE.md` §12)
 
-**`AdminUser` table + admin-identity resolution.** The current schema
-stores `AccommodationExemption.approved_by`,
-`PolicyConfig.created_by`, and `ProctorReview.reviewer_reference` as
-free-form strings. The next layer adds an `AdminUser` table with
-`(lti_issuer, lms_user_reference, role, created_at, retired_at)`,
-migrates the three string references to FKs, and adds a test that the
-admin route authorization (a future layer) can rely on the FK
-constraint. This closes the open decision called out in
-`docs/01-data-models-design.md` and unblocks the LTI 1.3 launch
-implementation, which needs an admin identity to attribute the
-`created_by` field on `PolicyConfig`.
+**LTI 1.3 launch + session creation + consent capture.** The ingestion
+layer from `docs/02-ingestion-layer-design.md` converts an LTI 1.3
+launch into a `Participant` + `ExamSession`, resolves admin identity
+via the `AdminUser` table (now implemented), and gates all subsequent
+telemetry on `ExamSession.consent_recorded_at`. This is the first
+layer that creates runtime behavior beyond the health endpoint.
 
 ## 10. Deployment topology (locked)
 
@@ -333,3 +328,4 @@ Full topology, sizing, and the secrets model are in
 | 2026-07-18 | Deployment target locked: Kubernetes (api + worker tiers) + managed Postgres + Cloudflare R2. CI locked: GitHub Actions. Local dev: Docker Compose with MinIO. Full topology, sizing, and secrets model in `docs/DEPLOYMENT.md`. | Claude |
 | 2026-07-18 | Integration test suite (12 cases) added; runs in CI against a real PostgreSQL 15 service container. Exercises both `flag_immutable` and `termination_record_immutable` triggers under direct `UPDATE` / `DELETE` SQL. | Claude |
 | 2026-07-18 | Open decision narrowed: admin identity will be a dedicated `AdminUser` table (next atomic layer). | Claude |
+| 2026-07-19 | **Admin identity resolved.** `AdminUser` table added (migration `20260719_0003`). `AdminRole` enum: `instructor`, `admin`, `proctor`. FK columns added to `PolicyConfig.created_by_id`, `AccommodationExemption.approved_by_admin_id`, `ProctorReview.reviewer_admin_id` (all nullable, `ON DELETE RESTRICT`). Original string fields preserved for backward compatibility. 7 new unit tests, 3 new integration tests. Open decisions narrowed from 3 to 2. | Antigravity |

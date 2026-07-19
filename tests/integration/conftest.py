@@ -169,6 +169,8 @@ def _drop_schema(engine: Engine) -> None:
             "DROP TABLE IF EXISTS exam_sessions CASCADE",
             "DROP TABLE IF EXISTS policy_configs CASCADE",
             "DROP TABLE IF EXISTS participants CASCADE",
+            "DROP TABLE IF EXISTS admin_users CASCADE",
+            "DROP TYPE IF EXISTS admin_role",
             "DROP TYPE IF EXISTS reference_material_policy",
             "DROP TYPE IF EXISTS session_status",
             "DROP TYPE IF EXISTS telemetry_modality",

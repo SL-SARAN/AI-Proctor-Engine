@@ -39,6 +39,13 @@ Invariants enforced here (cross-referenced to the design docs):
 * ``EnrollmentReference.embedding_model_version`` exists so a model upgrade
   can invalidate stale embeddings and force re-enrollment
   (``docs/01`` ``EnrollmentReference``).
+* ``AdminUser`` is the structured identity model for administrators,
+  proctors, and instructors. It replaces the free-form string references
+  in ``AccommodationExemption.approved_by``, ``PolicyConfig.created_by``,
+  and ``ProctorReview.reviewer_reference`` with FK-backed identities
+  scoped by ``(lti_issuer, lms_user_reference)`` — the same natural key
+  used for ``Participant``. The original string columns are preserved for
+  backward compatibility; new writes populate the FK.
 """
 
 from __future__ import annotations
@@ -173,6 +180,21 @@ class ReviewDecision(str, enum.Enum):
     NEEDS_MORE_INFO = "needs_more_info"
 
 
+class AdminRole(str, enum.Enum):
+    """Role tier for an administrative user.
+
+    Derived from the LTI ``roles`` claim: an instructor-role launch routes
+    to policy management and exemption approval; an admin-role launch adds
+    system-level configuration; a proctor-role launch routes to the review
+    queue. The role stored here is the *highest* applicable tier at the
+    time the admin was first seen.
+    """
+
+    INSTRUCTOR = "instructor"
+    ADMIN = "admin"
+    PROCTOR = "proctor"
+
+
 class Base(DeclarativeBase):
     """Declarative metadata shared by the complete v1 data model."""
 
@@ -195,6 +217,57 @@ def enum_type(enum_class: type[enum.Enum], name: str) -> SqlEnum:
 
 
 JsonPayload = JSONB().with_variant(JSON(), "sqlite")
+
+
+class AdminUser(Base):
+    """Structured identity for administrators, proctors, and instructors.
+
+    Resolves the open decision documented in ``docs/01-data-models-design.md``
+    §"Open decision: admin / reviewer identity". The natural key is
+    ``(lti_issuer, lms_user_reference)`` — the same shape used for
+    ``Participant``, scoped so the same admin across two LMS platforms
+    remains distinct.
+
+    ``retired_at`` is the soft-delete mechanism: a retired admin is
+    preserved for audit (``ON DELETE RESTRICT`` on the FK columns that
+    reference this table) but cannot be assigned to new reviews or
+    exemptions at the service layer.
+    """
+
+    __tablename__ = "admin_users"
+    __table_args__ = (
+        UniqueConstraint(
+            "lti_issuer",
+            "lms_user_reference",
+            name="uq_admin_users_lms_identity",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    lti_issuer: Mapped[str] = mapped_column(String(512), nullable=False)
+    lms_user_reference: Mapped[str] = mapped_column(String(512), nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(512))
+    role: Mapped[AdminRole] = mapped_column(
+        enum_type(AdminRole, "admin_role"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # Reverse relationships — populated by FK columns on the referencing tables.
+    created_policies: Mapped[list["PolicyConfig"]] = relationship(
+        back_populates="created_by_admin",
+        foreign_keys="PolicyConfig.created_by_id",
+    )
+    approved_exemptions: Mapped[list["AccommodationExemption"]] = relationship(
+        back_populates="approved_by_admin",
+        foreign_keys="AccommodationExemption.approved_by_admin_id",
+    )
+    reviewed_flags: Mapped[list["ProctorReview"]] = relationship(
+        back_populates="reviewer_admin",
+        foreign_keys="ProctorReview.reviewer_admin_id",
+    )
 
 
 class Participant(Base):
@@ -320,9 +393,16 @@ class PolicyConfig(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT")
+    )
 
     exam_sessions: Mapped[list["ExamSession"]] = relationship(
         back_populates="policy_config"
+    )
+    created_by_admin: Mapped["AdminUser | None"] = relationship(
+        back_populates="created_policies",
+        foreign_keys=[created_by_id],
     )
 
     @validates("medium_score_termination_threshold")
@@ -453,6 +533,9 @@ class AccommodationExemption(Base):
     exam_reference: Mapped[str] = mapped_column(String(512), nullable=False)
     object_class: Mapped[str] = mapped_column(String(128), nullable=False)
     approved_by: Mapped[str] = mapped_column(String(512), nullable=False)
+    approved_by_admin_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT")
+    )
     approval_reason: Mapped[str] = mapped_column(Text, nullable=False)
     effective_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
@@ -464,6 +547,10 @@ class AccommodationExemption(Base):
 
     participant: Mapped[Participant] = relationship(
         back_populates="accommodation_exemptions"
+    )
+    approved_by_admin: Mapped["AdminUser | None"] = relationship(
+        back_populates="approved_exemptions",
+        foreign_keys=[approved_by_admin_id],
     )
 
 
@@ -821,6 +908,9 @@ class ProctorReview(Base):
         ForeignKey("flags.id", ondelete="CASCADE"), nullable=False
     )
     reviewer_reference: Mapped[str] = mapped_column(String(512), nullable=False)
+    reviewer_admin_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT")
+    )
     decision: Mapped[ReviewDecision] = mapped_column(
         enum_type(ReviewDecision, "review_decision"), nullable=False
     )
@@ -830,6 +920,10 @@ class ProctorReview(Base):
     )
 
     flag: Mapped[Flag] = relationship(back_populates="reviews")
+    reviewer_admin: Mapped["AdminUser | None"] = relationship(
+        back_populates="reviewed_flags",
+        foreign_keys=[reviewer_admin_id],
+    )
 
 
 # ----------------------------------------------------------------------

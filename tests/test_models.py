@@ -3,13 +3,15 @@
 The test count below is the source of truth for ``docs/VERIFICATION_LOG.md``:
 
 * Four ``@parametrize`` blocks contribute 16 cases (4 cases each).
-* Twelve individual tests.
-* Total: 28 logical test cases.
+* Nineteen individual tests.
+* Total: 35 logical test cases.
 
 These tests are SQLite-only and cover portable constraints
 (confidence range, timestamp ordering, FK integrity, policy gaze ordering,
 the one-artifact-per-flag unique constraint, ORM-level immutability on
-both ``Flag`` and ``TerminationRecord``). The PostgreSQL-only
+both ``Flag`` and ``TerminationRecord``, and the ``AdminUser`` table
+with its FK relationships to ``PolicyConfig``,
+``AccommodationExemption``, and ``ProctorReview``). The PostgreSQL-only
 constraints — enum types, the database-level immutability triggers,
 JSONB indexes — are covered by the integration suite in
 ``tests/integration/``.
@@ -26,6 +28,8 @@ from sqlalchemy.orm import Session
 
 from proctoring_engine.models import (
     AccommodationExemption,
+    AdminRole,
+    AdminUser,
     EnrollmentReference,
     ExamSession,
     Flag,
@@ -35,7 +39,9 @@ from proctoring_engine.models import (
     ImmutableRecordError,
     Participant,
     PolicyConfig,
+    ProctorReview,
     ReferenceMaterialPolicy,
+    ReviewDecision,
     SessionStatus,
     TelemetryEvent,
     TelemetryModality,
@@ -612,3 +618,199 @@ def test_flag_suppressed_by_exemption_round_trips(db_session: Session) -> None:
     assert flag.suppressing_exemption is not None
     assert flag.suppressing_exemption.id == exemption.id
     assert flag.suppressing_exemption.object_class == "hearing_aid"
+
+
+# ----------------------------------------------------------------------
+# AdminUser: natural key uniqueness
+# ----------------------------------------------------------------------
+
+
+def test_admin_user_natural_key_uniqueness(db_session: Session) -> None:
+    """Two AdminUser rows with the same (lti_issuer, lms_user_reference)
+    must be rejected by the unique constraint."""
+
+    admin_1 = AdminUser(
+        lti_issuer="https://lms.example.edu",
+        lms_user_reference="admin-001",
+        display_name="Admin One",
+        role=AdminRole.ADMIN,
+    )
+    db_session.add(admin_1)
+    db_session.flush()
+
+    admin_2 = AdminUser(
+        lti_issuer="https://lms.example.edu",
+        lms_user_reference="admin-001",
+        display_name="Admin Duplicate",
+        role=AdminRole.PROCTOR,
+    )
+    db_session.add(admin_2)
+
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+    db_session.rollback()
+
+
+# ----------------------------------------------------------------------
+# AdminUser: role round-trip
+# ----------------------------------------------------------------------
+
+
+def test_admin_user_role_round_trips(db_session: Session) -> None:
+    """Each AdminRole value can be persisted and read back."""
+
+    for role in AdminRole:
+        admin = AdminUser(
+            lti_issuer="https://lms.example.edu",
+            lms_user_reference=f"admin-{role.value}-{uuid.uuid4()}",
+            role=role,
+        )
+        db_session.add(admin)
+
+    db_session.commit()
+
+    admins = db_session.query(AdminUser).all()
+    persisted_roles = {a.role for a in admins}
+    assert persisted_roles == set(AdminRole)
+
+
+# ----------------------------------------------------------------------
+# AdminUser FK round-trips: PolicyConfig, AccommodationExemption,
+# ProctorReview
+# ----------------------------------------------------------------------
+
+
+def test_policy_config_created_by_admin_round_trips(db_session: Session) -> None:
+    """A PolicyConfig with created_by_id set to an AdminUser round-trips."""
+
+    admin = AdminUser(
+        lti_issuer="https://lms.example.edu",
+        lms_user_reference=f"admin-{uuid.uuid4()}",
+        role=AdminRole.ADMIN,
+    )
+    db_session.add(admin)
+    db_session.flush()
+
+    policy = PolicyConfig(
+        name=f"admin-policy-{uuid.uuid4()}",
+        created_by_id=admin.id,
+    )
+    db_session.add(policy)
+    db_session.commit()
+
+    db_session.refresh(policy)
+    assert policy.created_by_id == admin.id
+    assert policy.created_by_admin is not None
+    assert policy.created_by_admin.lms_user_reference == admin.lms_user_reference
+
+
+def test_accommodation_exemption_approved_by_admin_round_trips(
+    db_session: Session,
+) -> None:
+    """An AccommodationExemption with approved_by_admin_id round-trips."""
+
+    admin = AdminUser(
+        lti_issuer="https://lms.example.edu",
+        lms_user_reference=f"admin-{uuid.uuid4()}",
+        role=AdminRole.INSTRUCTOR,
+    )
+    participant = Participant(
+        lti_issuer="https://lms.example.edu",
+        lms_user_reference=f"student-{uuid.uuid4()}",
+    )
+    db_session.add_all([admin, participant])
+    db_session.flush()
+
+    exemption = AccommodationExemption(
+        participant_id=participant.id,
+        exam_reference="exam-midterm",
+        object_class="hearing_aid",
+        approved_by="admin@example.edu",
+        approved_by_admin_id=admin.id,
+        approval_reason="documented accommodation",
+        effective_at=utc_now(),
+    )
+    db_session.add(exemption)
+    db_session.commit()
+
+    db_session.refresh(exemption)
+    assert exemption.approved_by_admin_id == admin.id
+    assert exemption.approved_by_admin is not None
+    assert exemption.approved_by_admin.role == AdminRole.INSTRUCTOR
+
+
+def test_proctor_review_reviewer_admin_round_trips(db_session: Session) -> None:
+    """A ProctorReview with reviewer_admin_id round-trips."""
+
+    admin = AdminUser(
+        lti_issuer="https://lms.example.edu",
+        lms_user_reference=f"proctor-{uuid.uuid4()}",
+        role=AdminRole.PROCTOR,
+    )
+    db_session.add(admin)
+    db_session.flush()
+
+    exam_session, policy = make_session(db_session)
+    flag = make_flag(db_session, exam_session=exam_session, policy=policy)
+    db_session.commit()
+
+    review = ProctorReview(
+        flag_id=flag.id,
+        reviewer_reference="proctor@example.edu",
+        reviewer_admin_id=admin.id,
+        decision=ReviewDecision.UPHELD,
+        notes="Confirmed cheating behavior.",
+    )
+    db_session.add(review)
+    db_session.commit()
+
+    db_session.refresh(review)
+    assert review.reviewer_admin_id == admin.id
+    assert review.reviewer_admin is not None
+    assert review.reviewer_admin.role == AdminRole.PROCTOR
+
+
+# ----------------------------------------------------------------------
+# AdminUser: retired_at round-trip
+# ----------------------------------------------------------------------
+
+
+def test_admin_user_retired_at_round_trips(db_session: Session) -> None:
+    """Setting retired_at persists correctly."""
+
+    admin = AdminUser(
+        lti_issuer="https://lms.example.edu",
+        lms_user_reference=f"admin-{uuid.uuid4()}",
+        role=AdminRole.ADMIN,
+        retired_at=utc_now(),
+    )
+    db_session.add(admin)
+    db_session.commit()
+
+    db_session.refresh(admin)
+    assert admin.retired_at is not None
+
+
+# ----------------------------------------------------------------------
+# AdminUser: FK rejects nonexistent admin
+# ----------------------------------------------------------------------
+
+
+def test_admin_user_fk_rejects_nonexistent(db_session: Session) -> None:
+    """A ProctorReview with a nonexistent reviewer_admin_id is rejected."""
+
+    exam_session, policy = make_session(db_session)
+    flag = make_flag(db_session, exam_session=exam_session, policy=policy)
+    db_session.commit()
+
+    review = ProctorReview(
+        flag_id=flag.id,
+        reviewer_reference="ghost@example.edu",
+        reviewer_admin_id=uuid.uuid4(),  # Does not exist.
+        decision=ReviewDecision.OVERTURNED,
+    )
+    db_session.add(review)
+
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+    db_session.rollback()
