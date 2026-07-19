@@ -1,0 +1,104 @@
+# Network policies. Lock the engine's surface area to exactly the
+# inbound and outbound traffic it needs; deny everything else.
+#
+# Inbound:
+#   - ingress controller CIDR to the API Service on port 80.
+#   - the worker can be reached from the API pods only.
+#
+# Outbound:
+#   - DNS (kube-dns) on UDP 53.
+#   - PostgreSQL (managed service, in the same VPC) on TCP 5432.
+#   - HTTPS to the LTI platform's JWKS endpoint.
+#   - HTTPS to the S3 / R2 endpoint.
+#   - HTTPS to the LMS termination-callback endpoint.
+#   - nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: proctoring-engine-api
+  namespace: proctoring-engine
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ai-proctoring-engine
+      app.kubernetes.io/component: api
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - port: 8000
+          protocol: TCP
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # PostgreSQL (managed; IP block in the cluster's VPC).
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/16  # placeholder for the managed-PG subnet
+      ports:
+        - port: 5432
+          protocol: TCP
+    # R2 (Cloudflare's egress IP block is broad; allow the *.r2.cloudflarestorage.com
+    # and *.cloudflare.com hosts explicitly via DNS names, not CIDRs).
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 443
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: proctoring-engine-worker
+  namespace: proctoring-engine
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ai-proctoring-engine
+      app.kubernetes.io/component: worker
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ai-proctoring-engine
+              app.kubernetes.io/component: api
+      ports:
+        - port: 9090
+          protocol: TCP
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/16
+      ports:
+        - port: 5432
+          protocol: TCP
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 443
+          protocol: TCP

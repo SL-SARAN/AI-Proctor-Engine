@@ -1,0 +1,156 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel an in-flight run for the same branch / PR — only one build per
+# branch tip at a time. Saves CI minutes when a developer force-pushes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Unit tests (SQLite)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            pip-${{ runner.os }}-py${{ matrix.python-version }}-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Compile Python sources
+        run: |
+          python -m compileall -q src tests
+
+      - name: Compile Alembic migration SQL
+        # Generate the SQL the migration would emit against PostgreSQL
+        # without actually applying it. Catches SQL syntax errors at
+        # the migration level before they reach the integration job.
+        run: |
+          DATABASE_URL="postgresql+psycopg://postgres:postgres@127.0.0.1:65535/never_used" \
+            alembic upgrade head --sql > /tmp/upgrade.sql
+          DATABASE_URL="postgresql+psycopg://postgres:postgres@127.0.0.1:65535/never_used" \
+            alembic downgrade base --sql > /tmp/downgrade.sql
+          wc -l /tmp/upgrade.sql /tmp/downgrade.sql
+
+      - name: Run unit tests
+        run: pytest tests/ -p no:cacheprovider --ignore=tests/integration
+
+  integration:
+    name: Integration tests (PostgreSQL ${{ matrix.postgres-version }})
+    runs-on: ubuntu-latest
+    needs: unit
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11"]
+        postgres-version: ["15-alpine"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres-version }}
+        env:
+          POSTGRES_USER: proctoring
+          POSTGRES_PASSWORD: proctoring
+          POSTGRES_DB: proctoring_test
+        ports:
+          - 5432:5432
+        # Give the container a chance to come up before the job starts
+        # the actual tests. The healthcheck is the source of truth.
+        options: >-
+          --health-cmd "pg_isready -U proctoring -d proctoring_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      INTEGRATION_DATABASE_URL: postgresql+psycopg://proctoring:proctoring@127.0.0.1:5432/proctoring_test
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install system dependencies
+        # libpq is required by psycopg[binary]'s build fallback. The
+        # binary wheel is preferred, but the system package makes the
+        # job resilient to wheel availability.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Wait for PostgreSQL to accept connections
+        run: |
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+            if pg_isready -h 127.0.0.1 -p 5432 -U proctoring; then
+              echo "PostgreSQL is ready after ${i} attempts"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "PostgreSQL did not become ready" >&2
+          exit 1
+
+      - name: Run Alembic migrations
+        # Apply the full migration chain. If the migration is broken,
+        # this fails the job before any tests run.
+        run: alembic upgrade head
+
+      - name: Run integration tests
+        # The integration test module sets up and tears down its own
+        # database, so it is the only one that needs the env var.
+        run: pytest tests/integration -p no:cacheprovider -v
+
+      - name: Capture database state on failure
+        if: failure()
+        run: |
+          PGPASSWORD=proctoring psql -h 127.0.0.1 -U proctoring -d proctoring_test \
+            -c "\dt" -c "\dT" -c "SELECT typname FROM pg_type WHERE typtype = 'e' ORDER BY typname"
+
+  build:
+    name: Docker build smoke test
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the application image
+        # A successful build is the gate; the integration job covers
+        # the runtime behavior. The buildx cache is not configured
+        # here — this is a one-shot smoke test, not a release pipeline.
+        run: docker build --tag proctoring-engine:ci-smoke --load .

@@ -1,0 +1,10 @@
+# Namespace for the AI Proctoring Engine. Kept separate from other
+# workloads in the cluster so network policies, resource quotas, and
+# secrets can be scoped narrowly to the engine's own surface area.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: proctoring-engine
+  labels:
+    app.kubernetes.io/name: ai-proctoring-engine
+    app.kubernetes.io/part-of: proctoring

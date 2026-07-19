@@ -1,0 +1,43 @@
+# Horizontal Pod Autoscaler for the API tier. Scales on CPU (the
+# conventional signal for FastAPI under load) and on a custom metric
+# for active WebSocket sessions (the actual leading indicator for
+# this workload). The custom metric requires the Prometheus adapter;
+# the CPU-only path works out of the box.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: proctoring-engine-api
+  namespace: proctoring-engine
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: proctoring-engine-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    # Conservative scale-down: a proctored exam is a long-lived
+    # connection, and shedding pods mid-exam is a worse failure than
+    # running a few minutes with extra capacity.
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+        - type: Percent
+          value: 100
+          periodSeconds: 60

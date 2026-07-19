@@ -1,0 +1,22 @@
+# Internal Service for the worker tier. The worker is not exposed to
+# the public internet; only the API talks to it via the in-cluster DNS
+# name `proctoring-engine-worker`. There is no Service of type
+# LoadBalancer or NodePort for the worker.
+apiVersion: v1
+kind: Service
+metadata:
+  name: proctoring-engine-worker
+  namespace: proctoring-engine
+  labels:
+    app.kubernetes.io/name: ai-proctoring-engine
+    app.kubernetes.io/component: worker
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ai-proctoring-engine
+    app.kubernetes.io/component: worker
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP

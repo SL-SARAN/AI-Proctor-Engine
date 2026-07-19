@@ -1,0 +1,34 @@
+# Public ingress. The annotations request WebSocket-aware timeouts
+# (longer than the default 60s) so an idle proctored exam session does
+# not get torn down by the load balancer. TLS termination happens here;
+# the upstream service is plain HTTP on the cluster network.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: proctoring-engine
+  namespace: proctoring-engine
+  annotations:
+    # nginx-ingress specific; replace with the equivalent annotation
+    # for your ingress controller (Traefik: traefik.ingress.kubernetes.io/...;
+    # ALB: alb.ingress.kubernetes.io/...).
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - proctoring.example.edu
+      secretName: proctoring-engine-tls
+  rules:
+    - host: proctoring.example.edu
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: proctoring-engine-api
+                port:
+                  number: 80

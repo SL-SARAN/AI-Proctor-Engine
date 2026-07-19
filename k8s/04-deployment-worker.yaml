@@ -1,0 +1,78 @@
+# Inference worker tier. Runs the async job queue consumer for the
+# 6-modality inference pipeline. Separated from the API so the heavy
+# ML workload can be scaled independently of the request-handling tier.
+# The actual implementation lands in a future layer; this manifest
+# reserves the slot and documents the resource shape.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proctoring-engine-worker
+  namespace: proctoring-engine
+  labels:
+    app.kubernetes.io/name: ai-proctoring-engine
+    app.kubernetes.io/component: worker
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ai-proctoring-engine
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ai-proctoring-engine
+        app.kubernetes.io/component: worker
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ai-proctoring-engine
+              app.kubernetes.io/component: worker
+      containers:
+        - name: worker
+          image: proctoring-engine:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "proctoring_engine.worker"]
+          envFrom:
+            - configMapRef:
+                name: proctoring-engine-config
+            - secretRef:
+                name: proctoring-engine-secret
+          # Resource sizing: ML inference is memory-heavy. The CPU
+          # request matches the API tier so a single node can host a
+          # 1:1 mix, but the limit is higher to absorb bursty frame
+          # arrival.
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 4000m
+              memory: 4Gi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi
+      securityContext:
+        fsGroup: 1000

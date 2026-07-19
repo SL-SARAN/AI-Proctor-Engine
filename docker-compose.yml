@@ -1,0 +1,148 @@
+# docker-compose.yml — local development environment.
+#
+# Brings up the full stack needed to develop and test the data-model layer
+# and (when implemented) the ingestion / WebSocket / inference layers:
+#
+#   - postgres:    PostgreSQL 15 with the v1 schema applied via Alembic on
+#                  startup. Stores all relational audit data.
+#   - minio:       S3-compatible object storage. Production uses Cloudflare
+#                  R2 instead (see docs/DEPLOYMENT.md), but MinIO ships
+#                  with the same S3 API and runs locally with no account.
+#                  Stores the evidence blobs.
+#   - migrate:     One-shot init container that waits for Postgres, then
+#                  runs `alembic upgrade head`. Exits 0 on success, and
+#                  the `app` service depends on it being healthy.
+#   - app:         The FastAPI service. Hot-reloads on source changes
+#                  through a mounted volume in development.
+#   - worker:      Placeholder for the async inference worker pool. The
+#                  service definition is here so the compose network is
+#                  stable; the actual implementation lands in a future
+#                  layer. It currently runs an entrypoint that blocks
+#                  until the FastAPI service is healthy, so the worker
+#                  slot is reserved without claiming resources.
+#
+# Usage:
+#   docker compose up --build
+#   docker compose run --rm migrate   # one-off migration
+#   docker compose down -v            # tear down with the data volumes
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: proctoring-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: proctoring
+      POSTGRES_PASSWORD: proctoring
+      POSTGRES_DB: proctoring
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U proctoring -d proctoring"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
+    container_name: proctoring-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: proctoring
+      MINIO_ROOT_PASSWORD: proctoring-dev-only
+    ports:
+      - "9000:9000"  # S3 API
+      - "9001:9001"  # Web console (dev only)
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot init container that applies Alembic migrations. Kept
+  # separate from the app so a migration failure does not start the
+  # API in a half-configured state.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: proctoring-migrate
+    profiles: ["migration"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://proctoring:proctoring@postgres:5432/proctoring
+      APP_ENV: development
+    entrypoint: ["alembic", "upgrade", "head"]
+    restart: "no"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: proctoring-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://proctoring:proctoring@postgres:5432/proctoring
+      APP_ENV: development
+      # S3-compatible storage. Cloudflare R2 is used in production;
+      # MinIO is the local stand-in. The two are interchangeable from
+      # the boto3 / S3 client perspective.
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: proctoring
+      S3_SECRET_KEY: proctoring-dev-only
+      S3_BUCKET: proctoring-evidence
+      S3_REGION: us-east-1
+    ports:
+      - "8000:8000"
+    volumes:
+      # Hot reload: the source tree is bind-mounted into the container
+      # so edits on the host are picked up by uvicorn without rebuilding
+      # the image. The mounted directory is owned by the host user, not
+      # the in-container proctoring user, so the container's write
+      # attempts fail loudly if the application tries to mutate the
+      # source tree.
+      - ./src:/app/src:ro
+    command: >
+      uvicorn proctoring_engine.api:app
+        --host 0.0.0.0
+        --port 8000
+        --reload
+        --reload-dir /app/src
+
+  # Placeholder for the async inference worker. The actual implementation
+  # lands in a future layer; the entrypoint here keeps the slot reserved
+  # so the compose network is stable for development.
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: proctoring-worker
+    restart: unless-stopped
+    profiles: ["with-worker"]
+    depends_on:
+      app:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://proctoring:proctoring@postgres:5432/proctoring
+      APP_ENV: development
+    command: ["python", "-c", "import time; print('inference worker placeholder'); time.sleep(3600)"]
+
+volumes:
+  postgres_data:
+    name: proctoring-postgres-data
+  minio_data:
+    name: proctoring-minio-data

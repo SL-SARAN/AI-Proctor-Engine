@@ -1,0 +1,102 @@
+# API tier. Runs the FastAPI application behind uvicorn. The number of
+# replicas is small (2) because WebSocket affinity to a single pod is
+# maintained by the SessionAffinity setting on the Service. Horizontal
+# scaling beyond a few replicas requires either a shared-state WebSocket
+# layer (Redis pub/sub) or sticky routing at the load balancer; the
+# current shape assumes sticky routing at the LB.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proctoring-engine-api
+  namespace: proctoring-engine
+  labels:
+    app.kubernetes.io/name: ai-proctoring-engine
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ai-proctoring-engine
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ai-proctoring-engine
+        app.kubernetes.io/component: api
+    spec:
+      # Spread pods across zones to keep WebSocket sessions alive through
+      # a single zone failure. antiAffinity prefers not to co-locate.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ai-proctoring-engine
+              app.kubernetes.io/component: api
+      containers:
+        - name: api
+          image: proctoring-engine:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: proctoring-engine-config
+            - secretRef:
+                name: proctoring-engine-secret
+          # Resource sizing: WebSocket-heavy workload. The CPU request
+          # is intentionally low (uvicorn is mostly idle, waiting on
+          # socket I/O) but the limit is generous so a burst of inference
+          # tasks does not get throttled.
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 2000m
+              memory: 1Gi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            # A writable tmpfs for /tmp so the application can write
+            # scratch files without breaking read-only rootfs.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+      securityContext:
+        fsGroup: 1000

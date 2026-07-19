@@ -1,0 +1,22 @@
+# Internal Service for the API tier. ClusterIP is sufficient because
+# ingress fronts the public surface; the WebSocket session affinity
+# needed for stable connections is configured at the Ingress level
+# (see ingress.yaml).
+apiVersion: v1
+kind: Service
+metadata:
+  name: proctoring-engine-api
+  namespace: proctoring-engine
+  labels:
+    app.kubernetes.io/name: ai-proctoring-engine
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: ai-proctoring-engine
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

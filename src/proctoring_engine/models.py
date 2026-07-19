@@ -1,4 +1,45 @@
-"""PostgreSQL-oriented ORM schema for the locked v1 proctoring specification."""
+"""PostgreSQL-oriented ORM schema for the locked v1 proctoring specification.
+
+This module is the single source of truth for the persisted data model. It
+implements the entities defined in ``docs/01-data-models-design.md`` against
+PostgreSQL 15+ and is used by Alembic migrations, the FastAPI service, and
+the test suite.
+
+Invariants enforced here (cross-referenced to the design docs):
+
+* ``Participant`` identity is scoped by ``(lti_issuer, lms_user_reference)``
+  per the LTI 1.3 launch contract (``docs/02-ingestion-layer-design.md`` §1).
+* ``ExamSession.policy_config_id`` references a versioned snapshot of
+  ``PolicyConfig`` so a mid-semester policy change does not silently mutate
+  the rules under which an already-run session is interpreted
+  (``docs/01`` ``PolicyConfig`` notes).
+* ``Flag`` and ``TerminationRecord`` rows are append-only. ``TerminationRecord``
+  is enforced both at the ORM level and (in the initial migration) at the
+  PostgreSQL trigger level. ``Flag`` immutability was added in the audit
+  reconciliation migration ``20260718_0002`` to match the spec's audit story
+  for flags (corrections land in ``ProctorReview``, never in the flag itself).
+* Confidence values are constrained to ``[0.0, 1.0]`` at the SQL level
+  (``ck_telemetry_confidence_range``) and at the ORM level
+  (``TelemetryEvent.validate_confidence``,
+  ``Flag.validate_flag_confidence``). The two layers are belt-and-suspenders,
+  not redundant: a bypass of the ORM still hits the SQL constraint.
+* ``ExamSession.accumulated_medium_score`` carries the running weighted
+  total for the accumulated-score termination path proposed in
+  ``docs/05-fusion-flagging-engine-design.md`` Path 3.
+* ``Flag.triggered_termination`` is the single source of truth for "this flag
+  fired the kill-switch" — the orchestration layer reads it, not
+  ``severity == CRITICAL``, because policy may set a non-CRITICAL severity
+  as the termination trigger in the future.
+* ``Flag.suppressed_by_exemption_id`` records the *exemption that acted* on
+  the flag, never silently drops a detection — see
+  ``docs/05`` §"Exemption suppression".
+* ``EvidenceArtifact.flag_id`` is unique because the v1 spec is explicit
+  that "one primary artifact per flag" is the model; adding more per flag
+  is a schema change, not a row change.
+* ``EnrollmentReference.embedding_model_version`` exists so a model upgrade
+  can invalidate stale embeddings and force re-enrollment
+  (``docs/01`` ``EnrollmentReference``).
+"""
 
 from __future__ import annotations
 
@@ -19,32 +60,52 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
+    UniqueConstraint,
     Uuid,
     event,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, validates
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    mapped_column,
+    relationship,
+    validates,
+)
 
 
 class SessionStatus(str, enum.Enum):
-    CREATED = "created"
+    """Lifecycle states for an exam session.
+
+    The state machine is defined in ``docs/07-api-orchestration-design.md``
+    §2. Only the fusion engine or an admin can move ``ACTIVE → TERMINATED``;
+    every other transition is either student-driven (``COMPLETED``) or
+    admin-driven (``UNDER_REVIEW``).
+    """
+
+    PENDING = "pending"
     ACTIVE = "active"
     COMPLETED = "completed"
     TERMINATED = "terminated"
-    CANCELLED = "cancelled"
+    UNDER_REVIEW = "under_review"
 
 
 class ReferenceMaterialPolicy(str, enum.Enum):
+    """How the fusion engine treats a detected ``book`` object."""
+
     CLOSED_BOOK = "closed_book"
     OPEN_BOOK = "open_book"
     SPECIFIC_LIST = "specific_list"
 
 
 class TelemetryModality(str, enum.Enum):
+    """The six modalities covered by v1 plus ``system`` for non-modal events."""
+
     BROWSER = "browser"
     FACE = "face"
     GAZE = "gaze"
@@ -55,6 +116,13 @@ class TelemetryModality(str, enum.Enum):
 
 
 class FlagSeverity(str, enum.Enum):
+    """Severity tier for a fused ``Flag`` row.
+
+    ``CRITICAL`` flags may trigger an auto-termination depending on
+    ``PolicyConfig.termination_severity``; ``MEDIUM`` and below contribute
+    to the accumulated-score path.
+    """
+
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
@@ -62,13 +130,25 @@ class FlagSeverity(str, enum.Enum):
 
 
 class FlagStatus(str, enum.Enum):
+    """Workflow status for a ``Flag`` row.
+
+    Flags are append-only at the row level (no field is updated after
+    creation) — but a *new* flag with the same rule code can be raised in a
+    later turn. The status taxonomy here describes the *workflow* state,
+    not a field that is mutated; transitions are represented by a new
+    ``ProctorReview`` decision row, not by updating this column on the
+    original flag.
+    """
+
     RAISED = "raised"
-    ACKNOWLEDGED = "acknowledged"
-    DISMISSED = "dismissed"
     CONFIRMED = "confirmed"
+    DISMISSED = "dismissed"
+    OVERTURNED = "overturned"
 
 
 class EvidenceKind(str, enum.Enum):
+    """Type of evidence stored alongside a flag."""
+
     FRAME = "frame"
     CLIP = "clip"
     AUDIO = "audio"
@@ -76,6 +156,8 @@ class EvidenceKind(str, enum.Enum):
 
 
 class DeliveryStatus(str, enum.Enum):
+    """Lifecycle of a side-effect message (kill-switch, LMS callback)."""
+
     PENDING = "pending"
     SENT = "sent"
     ACKNOWLEDGED = "acknowledged"
@@ -83,9 +165,12 @@ class DeliveryStatus(str, enum.Enum):
 
 
 class ReviewDecision(str, enum.Enum):
+    """The four terminal outcomes a human proctor can record."""
+
     UPHELD = "upheld"
     OVERTURNED = "overturned"
     ANNOTATED = "annotated"
+    NEEDS_MORE_INFO = "needs_more_info"
 
 
 class Base(DeclarativeBase):
@@ -93,7 +178,12 @@ class Base(DeclarativeBase):
 
 
 def enum_type(enum_class: type[enum.Enum], name: str) -> SqlEnum:
-    """Persist stable enum values rather than Python member names."""
+    """Persist stable enum values rather than Python member names.
+
+    ``values_callable`` emits the ``.value`` of each member so that the
+    stored representation is independent of the Python attribute name and
+    survives renames.
+    """
 
     return SqlEnum(
         enum_class,
@@ -108,11 +198,24 @@ JsonPayload = JSONB().with_variant(JSON(), "sqlite")
 
 
 class Participant(Base):
-    """A test-taker identified by a stable LMS subject within an issuer."""
+    """A test-taker identified by a stable LMS subject within an issuer.
+
+    The (lti_issuer, lms_user_reference) pair is the natural identifier
+    that LTI 1.3 delivers on every launch
+    (``docs/02-ingestion-layer-design.md`` §1). Uniqueness on that pair is
+    enforced at the index level so the same student across two course
+    contexts in the same LMS still resolves to one row per context, while
+    two issuers' student "12345" stay distinct.
+    """
 
     __tablename__ = "participants"
     __table_args__ = (
-        Index("ix_participants_lms_identity", "lti_issuer", "lms_user_reference", unique=True),
+        Index(
+            "ix_participants_lms_identity",
+            "lti_issuer",
+            "lms_user_reference",
+            unique=True,
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
@@ -135,19 +238,49 @@ class Participant(Base):
 
 
 class PolicyConfig(Base):
-    """Configurable policy thresholds; avoids hard-coded termination logic."""
+    """Configurable policy thresholds; avoids hard-coded termination logic.
+
+    Rows are append-only: a policy change creates a new version, never
+    mutates the old one. Sessions reference a specific snapshot via
+    ``ExamSession.policy_config_id`` so an institution tightening the gaze
+    threshold mid-semester does not retroactively change the rules under
+    which an already-completed session is interpreted.
+    """
 
     __tablename__ = "policy_configs"
     __table_args__ = (
-        CheckConstraint("gaze_min_duration_ms >= 0", name="ck_policy_gaze_min_duration_nonnegative"),
-        CheckConstraint("gaze_window_seconds > 0", name="ck_policy_gaze_window_positive"),
-        CheckConstraint("gaze_warning_limit >= 0", name="ck_policy_gaze_warning_nonnegative"),
-        CheckConstraint("gaze_termination_limit > 0", name="ck_policy_gaze_termination_positive"),
+        CheckConstraint(
+            "gaze_min_duration_ms >= 0",
+            name="ck_policy_gaze_min_duration_nonnegative",
+        ),
+        CheckConstraint(
+            "gaze_window_seconds > 0",
+            name="ck_policy_gaze_window_positive",
+        ),
+        CheckConstraint(
+            "gaze_warning_limit >= 0",
+            name="ck_policy_gaze_warning_nonnegative",
+        ),
+        CheckConstraint(
+            "gaze_termination_limit > 0",
+            name="ck_policy_gaze_termination_positive",
+        ),
         CheckConstraint(
             "gaze_warning_limit <= gaze_termination_limit",
             name="ck_policy_gaze_warning_before_termination",
         ),
-        CheckConstraint("second_face_confirmation_frames > 0", name="ck_policy_confirmation_frames_positive"),
+        CheckConstraint(
+            "gaze_min_duration_ms <= gaze_window_seconds * 1000",
+            name="ck_policy_gaze_min_duration_within_window",
+        ),
+        CheckConstraint(
+            "second_face_confirmation_frames > 0",
+            name="ck_policy_confirmation_frames_positive",
+        ),
+        CheckConstraint(
+            "medium_score_termination_threshold >= 0",
+            name="ck_policy_medium_score_threshold_nonnegative",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
@@ -155,25 +288,58 @@ class PolicyConfig(Base):
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     termination_severity: Mapped[FlagSeverity] = mapped_column(
-        enum_type(FlagSeverity, "flag_severity"), nullable=False, default=FlagSeverity.CRITICAL
+        enum_type(FlagSeverity, "flag_severity"),
+        nullable=False,
+        default=FlagSeverity.CRITICAL,
     )
-    terminate_on_second_face: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    second_face_confirmation_frames: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
-    gaze_min_duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=800)
-    gaze_window_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=300)
-    gaze_warning_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
-    gaze_termination_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=8)
-    extra_rules: Mapped[dict[str, Any]] = mapped_column(JsonPayload, nullable=False, default=dict)
+    terminate_on_second_face: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True
+    )
+    second_face_confirmation_frames: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=3
+    )
+    gaze_min_duration_ms: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=800
+    )
+    gaze_window_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=300
+    )
+    gaze_warning_limit: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=3
+    )
+    gaze_termination_limit: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=8
+    )
+    medium_score_termination_threshold: Mapped[float] = mapped_column(
+        Numeric(10, 4), nullable=False, default=10.0
+    )
+    extra_rules: Mapped[dict[str, Any]] = mapped_column(
+        JsonPayload, nullable=False, default=dict
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
-    exam_sessions: Mapped[list["ExamSession"]] = relationship(back_populates="policy_config")
+    exam_sessions: Mapped[list["ExamSession"]] = relationship(
+        back_populates="policy_config"
+    )
+
+    @validates("medium_score_termination_threshold")
+    def validate_medium_score_threshold(self, _: str, value: float) -> float:
+        if value < 0:
+            raise ValueError("medium_score_termination_threshold must be >= 0")
+        return float(value)
 
 
 class ExamSession(Base):
-    """One auditable proctored attempt in an LMS exam context."""
+    """One auditable proctored attempt in an LMS exam context.
+
+    Holds the lifecycle status, the immutable policy snapshot reference,
+    the consent timestamp (gating all persistence of telemetry and
+    evidence), and the running accumulated-medium-score counter used by
+    the fusion engine's Path 3.
+    """
 
     __tablename__ = "exam_sessions"
     __table_args__ = (
@@ -185,22 +351,38 @@ class ExamSession(Base):
             "retention_expires_at IS NULL OR started_at IS NULL OR retention_expires_at >= started_at",
             name="ck_exam_session_retention_after_start",
         ),
-        Index("ix_exam_sessions_lms_context", "lti_issuer", "lti_context_id"),
+        CheckConstraint(
+            "accumulated_medium_score >= 0",
+            name="ck_exam_session_medium_score_nonnegative",
+        ),
+        Index(
+            "ix_exam_sessions_lms_context",
+            "lti_issuer",
+            "lti_context_id",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     participant_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("participants.id", ondelete="RESTRICT"), nullable=False, index=True
+        ForeignKey("participants.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
     )
     policy_config_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("policy_configs.id", ondelete="RESTRICT"), nullable=False, index=True
+        ForeignKey("policy_configs.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
     )
     lti_issuer: Mapped[str] = mapped_column(String(512), nullable=False)
     lti_context_id: Mapped[str] = mapped_column(String(512), nullable=False)
     exam_reference: Mapped[str] = mapped_column(String(512), nullable=False)
-    attempt_reference: Mapped[str] = mapped_column(String(512), nullable=False, unique=True)
+    attempt_reference: Mapped[str] = mapped_column(
+        String(512), nullable=False, unique=True
+    )
     status: Mapped[SessionStatus] = mapped_column(
-        enum_type(SessionStatus, "session_status"), nullable=False, default=SessionStatus.CREATED
+        enum_type(SessionStatus, "session_status"),
+        nullable=False,
+        default=SessionStatus.PENDING,
     )
     allowed_reference_materials: Mapped[ReferenceMaterialPolicy] = mapped_column(
         enum_type(ReferenceMaterialPolicy, "reference_material_policy"),
@@ -212,6 +394,9 @@ class ExamSession(Base):
     )
     consent_recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     retention_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    accumulated_medium_score: Mapped[float] = mapped_column(
+        Numeric(10, 4), nullable=False, default=0
+    )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -226,11 +411,26 @@ class ExamSession(Base):
     flags: Mapped[list["Flag"]] = relationship(
         back_populates="exam_session", cascade="all, delete-orphan"
     )
-    termination_record: Mapped["TerminationRecord | None"] = relationship(back_populates="exam_session")
+    termination_record: Mapped["TerminationRecord | None"] = relationship(
+        back_populates="exam_session"
+    )
+
+    @validates("accumulated_medium_score")
+    def validate_accumulated_medium_score(self, _: str, value: float) -> float:
+        if value < 0:
+            raise ValueError("accumulated_medium_score must be >= 0")
+        return float(value)
 
 
 class AccommodationExemption(Base):
-    """Administrator-approved object-class exception, recorded before an exam."""
+    """Administrator-approved object-class exception, recorded before an exam.
+
+    In v1 the fusion engine's exemption suppression logic checks this table
+    for every object-detection flag even though the v1 object-detection
+    scope does not yet include earbuds or smartwatches. The logic is wired
+    now so the moment those classes are added it is a config change, not
+    a code change.
+    """
 
     __tablename__ = "accommodation_exemptions"
     __table_args__ = (
@@ -254,22 +454,41 @@ class AccommodationExemption(Base):
     object_class: Mapped[str] = mapped_column(String(128), nullable=False)
     approved_by: Mapped[str] = mapped_column(String(512), nullable=False)
     approval_reason: Mapped[str] = mapped_column(Text, nullable=False)
-    effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    effective_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
-    participant: Mapped[Participant] = relationship(back_populates="accommodation_exemptions")
+    participant: Mapped[Participant] = relationship(
+        back_populates="accommodation_exemptions"
+    )
 
 
 class EnrollmentReference(Base):
-    """Enrollment image metadata and its protected face-embedding vector."""
+    """Enrollment image metadata and its protected face-embedding vector.
+
+    ``embedding`` is stored as a JSONB float array in v1 — the design
+    tradeoff is recorded in ``docs/01`` §"Open decision — embedding storage".
+    The ``embedding_model_version`` column exists so a model upgrade can
+    invalidate stale embeddings and force re-enrollment; the matched pair
+    of (model_name, embedding_model_version) is what the identity-match
+    module will use to decide whether an existing enrollment is usable.
+    """
 
     __tablename__ = "enrollment_references"
     __table_args__ = (
-        CheckConstraint("embedding_dimensions > 0", name="ck_enrollment_embedding_dimensions_positive"),
-        Index("ix_enrollment_references_participant_active", "participant_id", "revoked_at"),
+        CheckConstraint(
+            "embedding_dimensions > 0",
+            name="ck_enrollment_embedding_dimensions_positive",
+        ),
+        Index(
+            "ix_enrollment_references_participant_active",
+            "participant_id",
+            "revoked_at",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
@@ -281,6 +500,9 @@ class EnrollmentReference(Base):
     embedding: Mapped[list[float]] = mapped_column(JsonPayload, nullable=False)
     embedding_dimensions: Mapped[int] = mapped_column(Integer, nullable=False)
     model_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    embedding_model_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, server_default="unknown"
+    )
     enrolled_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -292,7 +514,10 @@ class EnrollmentReference(Base):
     def validate_embedding(self, _: str, value: list[float]) -> list[float]:
         if not value:
             raise ValueError("embedding must contain at least one value")
-        if any(not isinstance(item, (int, float)) or not math.isfinite(float(item)) for item in value):
+        if any(
+            not isinstance(item, (int, float)) or not math.isfinite(float(item))
+            for item in value
+        ):
             raise ValueError("embedding must contain only finite numeric values")
         return [float(item) for item in value]
 
@@ -302,13 +527,28 @@ class EnrollmentReference(Base):
             raise ValueError("embedding_dimensions must be positive")
         return value
 
+    @validates("embedding_model_version")
+    def validate_embedding_model_version(self, _: str, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("embedding_model_version must be a non-empty string")
+        return value.strip()
+
 
 class TelemetryEvent(Base):
-    """Raw timestamped reading emitted by one client or server modality."""
+    """Raw timestamped reading emitted by one client or server modality.
+
+    The ``confidence`` field is constrained to ``[0.0, 1.0]`` at both the
+    SQL level (``ck_telemetry_confidence_range``) and the ORM level
+    (``validate_confidence``). The two layers are belt-and-suspenders: a
+    bypass of the ORM still hits the SQL constraint.
+    """
 
     __tablename__ = "telemetry_events"
     __table_args__ = (
-        CheckConstraint("confidence >= 0 AND confidence <= 1", name="ck_telemetry_confidence_range"),
+        CheckConstraint(
+            "confidence >= 0 AND confidence <= 1",
+            name="ck_telemetry_confidence_range",
+        ),
         Index("ix_telemetry_session_occurred", "exam_session_id", "occurred_at"),
         Index("ix_telemetry_session_modality", "exam_session_id", "modality"),
     )
@@ -326,12 +566,18 @@ class TelemetryEvent(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     confidence: Mapped[float] = mapped_column(Float, nullable=False)
-    raw_value: Mapped[dict[str, Any]] = mapped_column(JsonPayload, nullable=False, default=dict)
-    bounding_boxes: Mapped[list[dict[str, Any]]] = mapped_column(JsonPayload, nullable=False, default=list)
+    raw_value: Mapped[dict[str, Any]] = mapped_column(
+        JsonPayload, nullable=False, default=dict
+    )
+    bounding_boxes: Mapped[list[dict[str, Any]]] = mapped_column(
+        JsonPayload, nullable=False, default=list
+    )
     correlation_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, index=True)
 
     exam_session: Mapped[ExamSession] = relationship(back_populates="telemetry_events")
-    flag_links: Mapped[list["FlagTelemetryEvent"]] = relationship(back_populates="telemetry_event")
+    flag_links: Mapped[list["FlagTelemetryEvent"]] = relationship(
+        back_populates="telemetry_event"
+    )
 
     @validates("confidence")
     def validate_confidence(self, _: str, value: float) -> float:
@@ -341,7 +587,14 @@ class TelemetryEvent(Base):
 
 
 class Flag(Base):
-    """Fused policy decision supported by one or more telemetry readings."""
+    """Fused policy decision supported by one or more telemetry readings.
+
+    ``Flag`` rows are append-only at the row level. The
+    ``confidence_interval`` triple — ``(confidence_lower, confidence_score,
+    confidence_upper)`` — is the statistical interval, not a point estimate
+    (see ``docs/04-inference-modules-design.md`` §2 for how identity-match
+    produces it; the same shape applies to all modalities).
+    """
 
     __tablename__ = "flags"
     __table_args__ = (
@@ -351,7 +604,12 @@ class Flag(Base):
             "confidence_lower <= confidence_score AND confidence_score <= confidence_upper",
             name="ck_flag_confidence_interval_contains_score",
         ),
-        Index("ix_flags_session_severity_created", "exam_session_id", "severity", "created_at"),
+        Index(
+            "ix_flags_session_severity_created",
+            "exam_session_id",
+            "severity",
+            "created_at",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
@@ -371,7 +629,15 @@ class Flag(Base):
     confidence_score: Mapped[float] = mapped_column(Float, nullable=False)
     confidence_lower: Mapped[float] = mapped_column(Float, nullable=False)
     confidence_upper: Mapped[float] = mapped_column(Float, nullable=False)
-    detail: Mapped[dict[str, Any]] = mapped_column(JsonPayload, nullable=False, default=dict)
+    triggered_termination: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    suppressed_by_exemption_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("accommodation_exemptions.id", ondelete="RESTRICT")
+    )
+    detail: Mapped[dict[str, Any]] = mapped_column(
+        JsonPayload, nullable=False, default=dict
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -379,7 +645,9 @@ class Flag(Base):
 
     exam_session: Mapped[ExamSession] = relationship(back_populates="flags")
     telemetry_links: Mapped[list["FlagTelemetryEvent"]] = relationship(
-        back_populates="flag", cascade="all, delete-orphan", order_by="FlagTelemetryEvent.position"
+        back_populates="flag",
+        cascade="all, delete-orphan",
+        order_by="FlagTelemetryEvent.position",
     )
     evidence_artifacts: Mapped[list["EvidenceArtifact"]] = relationship(
         back_populates="flag", cascade="all, delete-orphan"
@@ -387,7 +655,13 @@ class Flag(Base):
     reviews: Mapped[list["ProctorReview"]] = relationship(
         back_populates="flag", cascade="all, delete-orphan"
     )
-    termination_records: Mapped[list["TerminationRecord"]] = relationship(back_populates="triggering_flag")
+    termination_records: Mapped[list["TerminationRecord"]] = relationship(
+        back_populates="triggering_flag"
+    )
+    suppressing_exemption: Mapped["AccommodationExemption | None"] = relationship(
+        back_populates="suppressed_flags",
+        foreign_keys=[suppressed_by_exemption_id],
+    )
 
     @validates("confidence_score", "confidence_lower", "confidence_upper")
     def validate_flag_confidence(self, _: str, value: float) -> float:
@@ -397,7 +671,12 @@ class Flag(Base):
 
 
 class FlagTelemetryEvent(Base):
-    """Ordered evidence trail from a fused flag back to raw telemetry."""
+    """Ordered evidence trail from a fused flag back to raw telemetry.
+
+    The composite primary key ``(flag_id, telemetry_event_id)`` enforces
+    the "no duplicate link of the same telemetry to one flag" invariant
+    at the schema level (``docs/08-test-strategy-design.md``).
+    """
 
     __tablename__ = "flag_telemetry_events"
     __table_args__ = (
@@ -417,7 +696,17 @@ class FlagTelemetryEvent(Base):
 
 
 class EvidenceArtifact(Base):
-    """Stored evidence linked to a flag, with retention and integrity metadata."""
+    """Stored evidence linked to a flag, with retention and integrity metadata.
+
+    The v1 spec is explicit that "one primary artifact per flag" is the
+    model. The unique constraint on ``flag_id`` enforces that; adding more
+    per flag later is a schema change, not a row change.
+
+    The ``content_sha256`` field is the integrity check; ``encryption_key_reference``
+    is the KMS key identifier (or empty if the deployment does not use
+    envelope encryption). ``retention_expires_at`` is what the deletion
+    job acts on (``docs/06-evidence-audit-store-design.md`` §3).
+    """
 
     __tablename__ = "evidence_artifacts"
     __table_args__ = (
@@ -430,6 +719,7 @@ class EvidenceArtifact(Base):
             "retention_expires_at >= capture_started_at",
             name="ck_evidence_retention_after_capture",
         ),
+        UniqueConstraint("flag_id", name="uq_evidence_artifacts_one_per_flag"),
         Index("ix_evidence_retention_expiry", "retention_expires_at"),
     )
 
@@ -444,9 +734,13 @@ class EvidenceArtifact(Base):
     content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     media_type: Mapped[str] = mapped_column(String(128), nullable=False)
     byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    capture_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    capture_started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
     capture_ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    retention_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    retention_expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
     encryption_key_reference: Mapped[str | None] = mapped_column(String(512))
     sealed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -457,7 +751,14 @@ class EvidenceArtifact(Base):
 
 
 class TerminationRecord(Base):
-    """Append-only audit record of an automatic session termination."""
+    """Append-only audit record of an automatic session termination.
+
+    The two delivery timestamps (``client_command_sent_at`` /
+    ``client_acknowledged_at`` and ``lms_callback_sent_at`` /
+    ``lms_callback_completed_at``) are the receipt-side proof of the
+    kill-switch and the LMS callback having landed. The check constraints
+    enforce that an acknowledgment cannot predate the send.
+    """
 
     __tablename__ = "termination_records"
     __table_args__ = (
@@ -480,12 +781,16 @@ class TerminationRecord(Base):
     )
     reason: Mapped[str] = mapped_column(String(512), nullable=False)
     client_delivery_status: Mapped[DeliveryStatus] = mapped_column(
-        enum_type(DeliveryStatus, "delivery_status"), nullable=False, default=DeliveryStatus.PENDING
+        enum_type(DeliveryStatus, "delivery_status"),
+        nullable=False,
+        default=DeliveryStatus.PENDING,
     )
     client_command_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     client_acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     lms_delivery_status: Mapped[DeliveryStatus] = mapped_column(
-        enum_type(DeliveryStatus, "delivery_status"), nullable=False, default=DeliveryStatus.PENDING
+        enum_type(DeliveryStatus, "delivery_status"),
+        nullable=False,
+        default=DeliveryStatus.PENDING,
     )
     lms_callback_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     lms_callback_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -499,7 +804,14 @@ class TerminationRecord(Base):
 
 
 class ProctorReview(Base):
-    """Human review or override tied to a single fused flag."""
+    """Human review or override tied to a single fused flag.
+
+    Sits alongside a ``Flag``; never edits it. The decision taxonomy
+    (``UPHELD / OVERTURNED / ANNOTATED / NEEDS_MORE_INFO``) covers the
+    full review surface: overturning, annotating without overturning, and
+    flagging that the evidence is inconclusive are all first-class
+    outcomes.
+    """
 
     __tablename__ = "proctor_reviews"
     __table_args__ = (Index("ix_proctor_reviews_flag_created", "flag_id", "created_at"),)
@@ -520,6 +832,21 @@ class ProctorReview(Base):
     flag: Mapped[Flag] = relationship(back_populates="reviews")
 
 
+# ----------------------------------------------------------------------
+# Back-reference: AccommodationExemption.suppressed_flags
+# ----------------------------------------------------------------------
+# The forward reference ``Flag.suppressing_exemption`` is set above; the
+# back-reference is attached here so the class is fully defined before the
+# relationship is added. This is the standard SQLAlchemy pattern for
+# two-way relationships on a class declared later in the file.
+AccommodationExemption.suppressed_flags: Mapped[list["Flag"]] = relationship(
+    "Flag",
+    primaryjoin="AccommodationExemption.id == Flag.suppressed_by_exemption_id",
+    back_populates="suppressing_exemption",
+    viewonly=True,
+)
+
+
 class ImmutableRecordError(SQLAlchemyError):
     """Raised when application code attempts to change an append-only record."""
 
@@ -537,3 +864,21 @@ def reject_termination_record_delete(*_: object) -> None:
 
     raise ImmutableRecordError("termination records are immutable")
 
+
+@event.listens_for(Flag, "before_update")
+def reject_flag_update(*_: object) -> None:
+    """Mirror the PostgreSQL ``flag_immutable`` trigger for ORM-mediated writes.
+
+    See ``migrations/versions/20260718_0002_audit_reconciliation.py`` for
+    the database-level mirror. Corrections land in ``ProctorReview``,
+    never in the flag itself.
+    """
+
+    raise ImmutableRecordError("flag records are immutable")
+
+
+@event.listens_for(Flag, "before_delete")
+def reject_flag_delete(*_: object) -> None:
+    """Mirror the PostgreSQL ``flag_immutable`` trigger for ORM-mediated deletes."""
+
+    raise ImmutableRecordError("flag records are immutable")
