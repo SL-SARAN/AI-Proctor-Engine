@@ -15,7 +15,7 @@ host and runs this module explicitly.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text
@@ -147,7 +147,13 @@ def test_flag_immutable_trigger_rejects_update(
 ) -> None:
     flag = _seed_flag(integration_engine_session)
 
-    with pytest.raises(IntegrityError, match="flag records are immutable"):
+    # PostgreSQL's ``RAISE EXCEPTION`` from a trigger returns
+    # SQLSTATE ``P0001`` (the generic ``raise_exception`` class), which
+    # SQLAlchemy maps to ``ProgrammingError`` — not ``IntegrityError``,
+    # which is reserved for SQLSTATE class 23 (constraint violations).
+    # The ``RAISE`` message is preserved on the exception, so we
+    # ``match=`` against it to assert the right trigger fired.
+    with pytest.raises(ProgrammingError, match="flag records are immutable"):
         integration_engine_session.execute(
             text("UPDATE flags SET severity = 'low' WHERE id = :id"),
             {"id": flag.id},
@@ -160,7 +166,7 @@ def test_flag_immutable_trigger_rejects_delete(
 ) -> None:
     flag = _seed_flag(integration_engine_session)
 
-    with pytest.raises(IntegrityError, match="flag records are immutable"):
+    with pytest.raises(ProgrammingError, match="flag records are immutable"):
         integration_engine_session.execute(
             text("DELETE FROM flags WHERE id = :id"),
             {"id": flag.id},
@@ -185,7 +191,7 @@ def test_termination_record_immutable_trigger_rejects_update(
     integration_engine_session.add(termination)
     integration_engine_session.commit()
 
-    with pytest.raises(IntegrityError, match="termination_records are immutable"):
+    with pytest.raises(ProgrammingError, match="termination_records are immutable"):
         integration_engine_session.execute(
             text("UPDATE termination_records SET reason = 'altered' WHERE id = :id"),
             {"id": termination.id},
@@ -205,7 +211,7 @@ def test_termination_record_immutable_trigger_rejects_delete(
     integration_engine_session.add(termination)
     integration_engine_session.commit()
 
-    with pytest.raises(IntegrityError, match="termination_records are immutable"):
+    with pytest.raises(ProgrammingError, match="termination_records are immutable"):
         integration_engine_session.execute(
             text("DELETE FROM termination_records WHERE id = :id"),
             {"id": termination.id},
@@ -244,6 +250,13 @@ def test_one_evidence_artifact_per_flag_is_enforced_by_postgres(
 
     flag = _seed_flag(integration_engine_session)
     capture_started = utc_now()
+    # Retention must be at or after capture_started (the
+    # ``ck_evidence_retention_after_capture`` check on the
+    # ``evidence_artifacts`` table). The retention period is
+    # configurable per session, but for the test fixture a fixed
+    # 30-day offset is self-documenting and never before the
+    # capture regardless of the test date.
+    retention_expires = capture_started + timedelta(days=30)
     first = EvidenceArtifact(
         flag_id=flag.id,
         kind=EvidenceKind.CLIP,
@@ -252,7 +265,7 @@ def test_one_evidence_artifact_per_flag_is_enforced_by_postgres(
         media_type="video/webm",
         byte_size=1024,
         capture_started_at=capture_started,
-        retention_expires_at=capture_started.replace(day=1),
+        retention_expires_at=retention_expires,
     )
     integration_engine_session.add(first)
     integration_engine_session.commit()
@@ -265,7 +278,7 @@ def test_one_evidence_artifact_per_flag_is_enforced_by_postgres(
         media_type="video/webm",
         byte_size=2048,
         capture_started_at=capture_started,
-        retention_expires_at=capture_started.replace(day=1),
+        retention_expires_at=retention_expires,
     )
     integration_engine_session.add(second)
     with pytest.raises(IntegrityError, match="uq_evidence_artifacts_one_per_flag"):

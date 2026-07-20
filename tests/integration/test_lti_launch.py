@@ -115,6 +115,28 @@ def _build_claims(
     return LtiIdToken.from_jwt_payload(payload)
 
 
+# --- fixtures --------------------------------------------------------
+
+
+@pytest.fixture()
+def settings() -> LtiSettings:
+    """An ``LtiSettings`` instance configured for the integration tests.
+
+    Mirrors the fixture in the unit-test files (``tests/test_lti_routes.py``,
+    ``tests/test_lti_service.py``, ``tests/test_lti_session_token.py``) so
+    the integration test signatures match the unit tests'. The OIDC test
+    double's discovery URL is wired in at call time, not at settings
+    creation time, so the static URL is fine.
+    """
+
+    return LtiSettings(
+        tool_client_id="proctoring-engine",
+        launch_url="http://localhost:8000/lti/launch",
+        session_token_secret="x" * 32,
+        oidc_http_timeout_seconds=1.0,
+    )
+
+
 # --- tests -----------------------------------------------------------
 
 
