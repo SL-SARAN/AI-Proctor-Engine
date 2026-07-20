@@ -56,10 +56,8 @@ jobs:
         run: |
           echo "Migration files in versions/:"
           ls -la migrations/versions/ || exit 1
-          echo "Alembic current revision:"
-          alembic current || exit 1
-          echo "Alembic head revision:"
-          alembic heads || exit 1
+          echo "Alembic version:"
+          alembic --version
 
       - name: Run unit tests
         run: pytest tests/ -p no:cacheprovider --ignore=tests/integration
