@@ -47,7 +47,7 @@ from proctoring_engine.models import (
     PolicyConfig,
     SessionStatus,
 )
-from tests.integration.oidc_test_double import (
+from .integration.oidc_test_double import (
     ADMIN_URI,
     INSTRUCTOR_URI,
     LEARNER_URI,

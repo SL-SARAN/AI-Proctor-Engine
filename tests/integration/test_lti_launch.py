@@ -49,7 +49,7 @@ from proctoring_engine.models import (
     Participant,
     PolicyConfig,
 )
-from tests.integration.oidc_test_double import (
+from .oidc_test_double import (
     ADMIN_URI,
     INSTRUCTOR_URI,
     LEARNER_URI,

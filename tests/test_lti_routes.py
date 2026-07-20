@@ -37,7 +37,7 @@ from proctoring_engine.lti import (
 from proctoring_engine.lti.roles import AppRole
 from proctoring_engine.lti.routes import _RouterDeps
 from proctoring_engine.models import Base, PolicyConfig
-from tests.integration.oidc_test_double import (
+from .integration.oidc_test_double import (
     INSTRUCTOR_URI,
     build_signed_launch_claims,
     make_test_oidc_setup,
