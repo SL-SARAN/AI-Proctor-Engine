@@ -1,6 +1,6 @@
 # System State
 
-Last updated: 2026-07-20 (turn N+1: LTI 1.3 launch routes + service + integration)
+Last updated: 2026-07-20 (turn N+1+fix: CI unit job alembic validation)
 
 This file is the single source of truth for "where the AI Proctoring
 Engine is right now." Read this first at the start of every session
