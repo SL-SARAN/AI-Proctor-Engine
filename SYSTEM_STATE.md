@@ -1,6 +1,6 @@
 # System State
 
-Last updated: 2026-07-19 (turn N: LTI 1.3 foundation)
+Last updated: 2026-07-20 (turn N+1: LTI 1.3 launch routes + service + integration)
 
 This file is the single source of truth for "where the AI Proctoring
 Engine is right now." Read this first at the start of every session
@@ -34,7 +34,7 @@ design docs but is not built.
 | FastAPI application shell (health endpoint only) | **Implemented** | `src/proctoring_engine/api.py` |
 | AdminUser table + admin-identity resolution | **Implemented** | `src/proctoring_engine/models.py`, `migrations/versions/20260719_0003_admin_user.py` |
 | LTI 1.3 foundation (config, claims, roles, state store, session token, OIDC discovery, JWKS fetcher) | **Implemented (turn N, 70 unit tests)** | `src/proctoring_engine/lti/` |
-| Ingestion routes + service + OIDC test double + integration tests | Not started (turn N+1) | `docs/02-ingestion-layer-design.md` |
+| LTI 1.3 launch routes + `process_launch` service + OIDC test double + PostgreSQL integration tests | **Implemented (turn N+1, 134 unit + 9 integration tests)** | `src/proctoring_engine/lti/routes.py`, `src/proctoring_engine/lti/service.py`, `tests/integration/test_lti_launch.py` |
 | Preprocessing (frame decode, tiered scheduler, rolling buffer) | Not started | `docs/03-preprocessing-layer-design.md` |
 | Inference modules (6 modalities) | Not started | `docs/04-inference-modules-design.md` |
 | Fusion & flagging engine (3 termination paths) | Not started | `docs/05-fusion-flagging-engine-design.md` |
@@ -290,6 +290,8 @@ it to mark progress and to identify the next single atomic layer.
 - [x] `AdminUser` table + admin-identity resolution
 - [x] LTI 1.3 foundation (config, claims, roles, state store, session
       token, OIDC discovery, JWKS fetcher) — 70 unit tests passing
+- [x] LTI 1.3 launch routes + `process_launch` service + OIDC test
+      double + integration tests (turn N+1)
 - [ ] LTI 1.3 launch routes + `process_launch` service + OIDC test
       double + PostgreSQL integration tests (turn N+1)
 - [ ] Authenticated WebSocket protocol (envelope, sparse frames,

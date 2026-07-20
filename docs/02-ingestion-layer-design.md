@@ -162,8 +162,157 @@ SQLite in `pytest tests --ignore=tests/integration`.
   `invalidate(jwks_uri)` is the manual flush for an admin endpoint
   that wants to force a key refresh.
 
-**Turn N+1 — routes + service + integration tests (next):** the
-FastAPI router (`GET /lti/login`, `POST /lti/launch`), the
-`process_launch` service, the OIDC test double, and the
-PostgreSQL integration suite. Documented in
-`CONTEXT.md` §9.
+**Turn N+1 — routes + service + integration tests (this commit):**
+closes the ingestion layer. The FastAPI router
+(`GET /lti/login`, `POST /lti/launch`), the `process_launch`
+service, the OIDC test double, and the PostgreSQL integration
+suite. 134 unit tests + 9 PostgreSQL integration tests pass.
+
+- `src/proctoring_engine/lti/service.py` — `process_launch(db,
+  claims, role, *, settings, now) -> LaunchResult`. Pure
+  function over a SQLAlchemy `Session` and a validated
+  `LtiIdToken` + `AppRole` + `LtiSettings`. Steps:
+  1. **Upsert `Participant`** on `(lti_issuer, lms_user_reference)`.
+     `display_name` is set from the launch's `name` claim when
+     present; if the row already exists and the new name is
+     non-null, it's overwritten (the launch is the source of
+     truth for the LMS-side display name). `consent_recorded_at`
+     and `consent_notice_version` are **not** set on the
+     participant here — consent is per-session, not
+     per-participant, so the column stays null on the participant
+     and is set on the `ExamSession` row at launch time.
+  2. **Resolve `PolicyConfig`** by `name ==
+     claims.custom.policy_config_name` AND `is_active == true`.
+     If the name is missing or no active policy matches, raise
+     `LtiLaunchError("policy_not_found")`. The route handler
+     maps this to a 400 with a short error code.
+  3. **Create `ExamSession`** with `status=PENDING`,
+     `policy_config_id` bound to the resolved policy,
+     `lti_issuer = claims.issuer`,
+     `lti_context_id = f"{claims.context.id}:{claims.resource_link.id}"`
+     (the same `combined_context_id` helper from
+     `lti/claims.py`),
+     `exam_reference = claims.resource_link.id`,
+     `attempt_reference = uuid4()` (collision-free across
+     platforms; the existing unique constraint enforces it),
+     `consent_recorded_at = now(UTC)`,
+     `started_at = consent_recorded_at` (the documented
+     "consent is start" choice — the
+     `ck_exam_session_timestamp_order` and
+     `ck_exam_session_retirement_after_start` checks are
+     self-consistent at creation time. The WS layer enforces
+     the PENDING → ACTIVE transition separately).
+  4. **Upsert `AdminUser`** when `is_admin_route(role)` is True.
+     The natural key is `(lti_issuer, lms_user_reference)`. The
+     `role` field stores the *highest* applicable tier from
+     the launch (`AppRole.ADMIN` > `AppRole.PROCTOR` >
+     `AppRole.INSTRUCTOR`), so the same instructor cannot be
+     demoted by a later lower-privilege launch.
+  5. **Issue the session token** via
+     `lti.session_token.issue_session_token(participant_id,
+     exam_session_id, role, settings=settings, now=now)`.
+  6. **Return `LaunchResult(participant, exam_session,
+     session_token, role, redirect_url)`** where
+     `redirect_url` is:
+     - For `AppRole.LEARNER`:
+       `f"{settings.exam_client_url}?session_token={token}"`
+     - For `AppRole.INSTRUCTOR` / `ADMIN` / `PROCTOR`:
+       `f"{settings.admin_surface_url}?session_token={token}"`.
+  7. **The service does not commit.** The route receives a
+     `Session`, calls `process_launch`, then commits after
+     `process_launch` returns so a single launch is a single
+     atomic write. A failure between "participant upserted"
+     and "exam session created" rolls back the whole launch —
+     no orphan `Participant` rows from a partial launch.
+
+- `src/proctoring_engine/lti/routes.py` — FastAPI `APIRouter`
+  factory `_build_lti_router(deps)`. Returns a router with:
+  - `GET /lti/login` — login initiation. Required query
+    parameters: `iss`, `login_hint`, `target_link_uri`,
+    `lti_message_hint`. Optional: `client_id` (when the
+    platform uses an explicit client id). Generates a
+    32-byte URL-safe `state` and a 32-byte URL-safe `nonce`,
+    registers them in `LaunchStateStore` (with
+    `redirect_uri = settings.launch_url` and
+    `lti_issuer = iss`), fetches OIDC discovery for `iss` (or
+    uses `settings.oidc_discovery_url` if set as an override
+    for non-conformant platforms), and 302-redirects to the
+    platform's authorization endpoint with
+    `scope=openid`, `response_type=id_token`,
+    `response_mode=form_post`, `prompt=none`,
+    `client_id=settings.tool_client_id` (or the explicit
+    `client_id` param when provided),
+    `redirect_uri=settings.launch_url`, `login_hint`,
+    `state`, `nonce`. Failure modes: missing required param →
+    422; target_link_uri mismatch → 400 `claims_invalid`;
+    discovery error → 502.
+  - `POST /lti/launch` — launch callback. Body is
+    `application/x-www-form-urlencoded` with a single
+    `id_token` field. Validates the JWT against the
+    platform's JWKS endpoint, parses the payload via
+    `LtiIdToken.from_jwt_payload` (after stripping the
+    OIDC `state` claim, which is not an LTI claim and
+    `extra=forbid` rejects it), calls
+    `state_store.peek(state)` to validate the `iss` claim
+    against the state-registered issuer (a cross-issuer
+    state-reuse attempt is rejected here, before the
+    discovery fetch), then calls `state_store.consume(state,
+    claims.nonce)` (one-shot, fail-closed), then calls
+    `service.process_launch`. On success: 302 to the
+    resolved `redirect_url`. On failure: 400 (or 502 for
+    `discovery_error`) with a short error code from a
+    closed enumeration (`policy_not_found`,
+    `signature_invalid`, `state_expired`, `state_unknown`,
+    `claims_invalid`, `nonce_mismatch`, `audience_invalid`,
+    `issuer_invalid`) — the JWT contents are never echoed
+    in the response.
+
+  The factory takes the per-test dependencies via the
+  `_RouterDeps` dataclass (`settings`, `state_store`,
+  `jwks_cache`, `discovery_cache`, `http_client_factory`,
+  `get_db`) so the route can use a process-shared
+  `httpx.AsyncClient` in production and a `pytest-httpx`
+  mock in tests.
+
+- `tests/integration/oidc_test_double.py` — the OIDC test
+  double. Generates an RSA keypair, builds the discovery
+  document + JWKS payloads, and signs launch JWTs against
+  the generated key. Exports `LEARNER_URI`, `INSTRUCTOR_URI`,
+  `ADMIN_URI`, `PROCTOR_URI` role constants, plus
+  `make_test_oidc_setup`, `register_oidc_responses`, and
+  `build_signed_launch_claims`. Used by both the unit
+  tests (`tests/test_lti_routes.py`,
+  `tests/test_lti_service.py`) and the integration tests
+  (`tests/integration/test_lti_launch.py`).
+
+- `tests/test_lti_service.py` — `process_launch` unit
+  tests. 14 cases: learner launch, instructor launch,
+  admin-role promotion (one-way), unknown policy,
+  retired policy, two consecutive launches (upsert
+  semantics), `attempt_reference` is a UUID4, session
+  token round-trips, redirect URL uses exam client for
+  learner / admin surface for instructor, learner
+  launch does not create an `AdminUser`, failed
+  launch rolls back participant.
+
+- `tests/test_lti_routes.py` — endpoint tests. 17 cases
+  covering `/lti/login` happy path, missing params,
+  discovery failure, target_link_uri mismatch, and
+  `/lti/launch` happy path (learner + instructor),
+  replay, expired `exp`, signature from a key not in
+  the JWKS, wrong `iss` (issuer_invalid), wrong
+  `nonce` (nonce_mismatch), missing `policy_config_name`
+  (policy_not_found), wrong `aud` (audience_invalid),
+  unknown role URI (claims_invalid).
+
+- `tests/integration/test_lti_launch.py` — same boundary
+  cases as the unit tests, but against a real
+  PostgreSQL engine. 9 cases verifying the
+  database-level invariants: the JSONB
+  `PolicyConfig.extra_rules` is not mutated, the
+  `accumulated_medium_score` default of `0` is
+  preserved, `consent_recorded_at = started_at`, the
+  `AdminUser` natural key matches the `Participant`'s,
+  the upsert is transactional, the `attempt_reference`
+  is a UUID4, and the admin role promotion preserves
+  the participant.

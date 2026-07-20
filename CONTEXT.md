@@ -231,68 +231,60 @@ the `ON DELETE RESTRICT` behavior on `flags.policy_config_id`.
 
 ## 9. The shape of the next session
 
-The **LTI 1.3 foundation** (turn N) is now in: `LtiSettings`, claim
-parsing, role mapping, the in-memory `LaunchStateStore`, the HS256
-session token, OIDC discovery, and JWKS fetchers — 71 unit tests
-passing. Turn N+1 closes out the ingestion layer: the launch
-routes, the `process_launch` service, an OIDC test double, and
-the PostgreSQL integration tests. This is described in detail in
-`docs/02-ingestion-layer-design.md` §1 and
-`docs/08-test-strategy-design.md` §"Ingestion layer".
+The **LTI 1.3 ingestion layer** is now complete (turns N + N+1).
+Turn N landed the foundation (`LtiSettings`, claim parsing, role
+mapping, `LaunchStateStore`, the HS256 session token, OIDC
+discovery, and JWKS fetchers). Turn N+1 landed the launch routes
+(`GET /lti/login` and `POST /lti/launch`), the `process_launch`
+service, the OIDC test double, and 9 PostgreSQL integration
+tests. The launch is a single atomic transaction; the route
+commits after `process_launch` returns. A closed error-code
+enumeration (`signature_invalid`, `claims_invalid`,
+`policy_not_found`, `state_unknown`, `state_expired`,
+`nonce_mismatch`, `audience_invalid`, `issuer_invalid`,
+`discovery_error`) maps each failure to a deterministic HTTP
+status. `LaunchStateStore.consume` now returns a
+`(redirect_uri, lti_issuer)` tuple; a new `LaunchStateStore.peek`
+lets the route validate the `iss` claim against the
+state-registered issuer before the OIDC discovery fetch
+(rejects cross-issuer state-reuse without an outbound HTTP
+call). 134 unit tests + 9 PostgreSQL integration tests pass.
 
-Specifically, turn N+1 delivers:
+The next layer is the **authenticated WebSocket protocol** —
+the `docs/02-ingestion-layer-design.md` §2–§4 envelope (the
+JSON envelope that wraps every inbound and outbound frame),
+sparse-frame handling, the kill-switch, and the per-frame ack.
+The WebSocket is the transport the exam client uses to push
+sparse telemetry frames after the launch redirect lands the
+learner on the exam client. The session token issued at launch
+is the auth credential for the WebSocket handshake; the same
+HS256 secret signs it. The session token is verified at the
+handshake; per-frame authentication is by the same token in the
+envelope (or by a short-lived ack token derived from it). The
+WebSocket is also the channel through which the server sends
+the `kill-switch` and the per-frame `ack`. The next-turn
+deliverables are described in detail in
+`docs/02-ingestion-layer-design.md` §2–§4.
 
-- `GET /lti/login` and `POST /lti/launch` FastAPI routes that wire
-  the foundation modules together.
-- The OIDC test double (`tests/integration/oidc_test_double.py`):
-  a small helper that generates an RSA keypair, exposes a
-  discovery document + JWKS endpoint, and signs launch JWTs against
-  the generated key. Wraps `pytest-httpx` so the unit and
-  integration tests can run without a real socket.
-- The `process_launch` service: upsert `Participant` on
-  `(lti_issuer, lms_user_reference)`, resolve the active
-  `PolicyConfig` by `custom.policy_config_name`, create the
-  `ExamSession` with `status=PENDING` and `policy_config_id` set,
-  bind `consent_recorded_at = started_at = now()`, and issue the
-  HS256 session token. Instructor / admin-role launches also
-  upsert an `AdminUser` row so the admin surfaces (a later layer)
-  can attribute `PolicyConfig.created_by_id` correctly.
-- Role-based branching: learner launches redirect to the exam
-  client; instructor / admin / proctor launches redirect to the
-  admin surface.
+Specifically, the next layer delivers:
+
+- A `WebSocketEnvelope` Pydantic model for the frame envelope
+  (sparse, typed, with the `provenance` field that ties every
+  inbound frame to the `TelemetryEvent` it will create).
+- A `frame_router` (or equivalent) that decodes the envelope,
+  dispatches to the preprocessing layer, and emits the
+  `ack` per frame.
+- A `kill_switch` channel — server-initiated, with a
+  non-`2xx` close code that the client treats as
+  "terminate the session immediately."
+- A `consume_session_token` step at the WebSocket handshake
+  (the same HS256 token issued at launch; one-shot — the token
+  is consumed at the handshake and the WS layer uses a derived
+  ack token for per-frame authentication).
 - Integration tests against a real PostgreSQL engine that verify
-  the launch's persistence invariants (the JSONB `extra_rules`
-  column is not mutated; `accumulated_medium_score` default is
-  preserved; the launch is transactional; an `AdminUser` row is
-  upserted for the admin path).
-
-Tests, per the boundary cases the spec calls out in
-`docs/02-ingestion-layer-design.md` §1 and
-`docs/08-test-strategy-design.md` §"Ingestion layer":
-
-- Unit: `process_launch` boundary cases (missing policy name, no
-  active policy, two launches from the same
-  `(lti_issuer, lms_user_reference)` upsert correctly), and
-  endpoint tests (`/lti/login` happy-path redirect, `/lti/launch`
-  happy-path token issuance, replay of `state` returns 400,
-  expired `exp` returns 400, signature from a key not in the JWKS
-  returns 400, wrong `iss` returns 400, wrong `nonce` returns 400,
-  missing `custom.policy_config_name` returns 400, retired policy
-  returns 400, instructor-role launch upserts `AdminUser`).
-- Integration: same suite as the unit tests but against the real
-  PostgreSQL engine, verifying that the launch does not mutate
-  the policy snapshot and that the upsert is correct across
-  schema columns.
-- Endpoint-to-end: a successful launch returns a 302 to the
-  exam client and creates the right rows; a malformed launch
-  returns 400 and creates nothing; a replayed `state` returns
-  400 (not 200) — fail-closed, not fail-open.
-
-Layer depends on:
-
-- `AdminUser` table (done) — for the instructor-role path.
-- `pyjwt[crypto]`, `httpx`, `pytest-asyncio`, `pytest-httpx` —
-  added in turn N's `pyproject.toml` updates.
-- The OIDC test double is reused by both unit and integration
-  tests so the launch path is exercised end-to-end without a
-  real LMS.
+  the WebSocket layer's persistence invariants (the
+  `TelemetryEvent` is created with the right
+  `provenance`; the `Flag` (if any) carries the structural
+  proof path; the `EvidenceArtifact` checksum is set; the
+  rolling buffer is **never** transmitted during normal
+  operation — flush only on a confirmed flag).

@@ -46,8 +46,9 @@ def test_register_and_consume_returns_redirect_uri() -> None:
         lti_issuer="https://lms.example.edu",
     )
     assert state in store
-    returned = store.consume(state, nonce)
-    assert returned == "http://localhost:8000/lti/launch"
+    redirect_uri, lti_issuer = store.consume(state, nonce)
+    assert redirect_uri == "http://localhost:8000/lti/launch"
+    assert lti_issuer == "https://lms.example.edu"
     assert state not in store
 
 
@@ -115,7 +116,8 @@ def test_register_overwrites_existing_state() -> None:
     store.register(state, LaunchStateStore.new_nonce(), redirect_uri="first", lti_issuer="y")
     new_nonce = LaunchStateStore.new_nonce()
     store.register(state, new_nonce, redirect_uri="second", lti_issuer="y")
-    assert store.consume(state, new_nonce) == "second"
+    redirect_uri, _ = store.consume(state, new_nonce)
+    assert redirect_uri == "second"
 
 
 def test_purge_expired_removes_stale_entries() -> None:

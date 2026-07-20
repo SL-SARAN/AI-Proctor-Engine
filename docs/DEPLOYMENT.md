@@ -145,6 +145,19 @@ with `REPLACE_ME` placeholders. In production:
   derived from an external system; it exists because the
   fusion-engine-to-orchestration call is service-to-service and must
   not be reachable via an LTI-derived token.
+- **Exam client URL** (`EXAM_CLIENT_URL`) — the URL the launch
+  handler 302-redirects a learner to, with `?session_token=...`.
+  Defaults to `http://localhost:5173/exam` for local dev;
+  overridden per environment. **Must be HTTPS in production.**
+- **Admin surface URL** (`ADMIN_SURFACE_URL`) — the URL the
+  launch handler 302-redirects a non-learner
+  (instructor / admin / proctor) to, with `?session_token=...`.
+  Defaults to `http://localhost:5173/admin` for local dev;
+  overridden per environment. **Must be HTTPS in production.**
+- **OIDC HTTP timeout** (`OIDC_HTTP_TIMEOUT_SECONDS`) — the
+  timeout the production `httpx.AsyncClient` uses for OIDC
+  discovery and JWKS fetches. Defaults to 5.0 seconds; the
+  default is suitable for a stable LMS on a low-latency link.
 
 ## 5. CI/CD
 

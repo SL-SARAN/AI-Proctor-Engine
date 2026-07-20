@@ -130,13 +130,17 @@ class LaunchStateStore:
             self._purge_expired_locked()
             self._entries[state] = entry
 
-    def consume(self, state: str, nonce: str) -> str:
+    def consume(self, state: str, nonce: str) -> tuple[str, str]:
         """Atomically validate and remove a pending launch.
 
-        Returns the ``redirect_uri`` recorded at registration time so
-        the route handler can confirm the ``redirect_uri`` claim in
-        the ``id_token`` matches the one the platform was redirected
-        to.
+        Returns a ``(redirect_uri, lti_issuer)`` tuple. ``redirect_uri``
+        is the value recorded at registration time so the route
+        handler can confirm the ``redirect_uri`` claim in the
+        ``id_token`` matches the one the platform was redirected
+        to. ``lti_issuer`` is the issuer bound to the state at
+        :meth:`register` time; the route handler uses it to detect a
+        cross-issuer state-reuse attempt (a state issued for one
+        platform being replayed against another).
 
         Raises:
             LaunchStateMissing: ``state`` is not in the store.
@@ -170,8 +174,9 @@ class LaunchStateStore:
             # All checks passed: pop the entry to make this consume
             # one-shot.
             redirect_uri = entry.redirect_uri
+            lti_issuer = entry.lti_issuer
             del self._entries[state]
-        return redirect_uri
+        return redirect_uri, lti_issuer
 
     def __len__(self) -> int:
         """Return the number of live entries (testing surface)."""
@@ -186,6 +191,24 @@ class LaunchStateStore:
         with self._lock:
             self._purge_expired_locked()
             return state in self._entries
+
+    def peek(self, state: str) -> str | None:
+        """Return the ``lti_issuer`` registered for ``state`` without
+        consuming the entry.
+
+        Returns ``None`` if the state is not registered or has
+        expired. Used by the route handler to validate the
+        ``iss`` claim before doing the expensive OIDC discovery
+        fetch — a cross-issuer replay attempt can be rejected
+        without an outbound HTTP call.
+        """
+
+        with self._lock:
+            self._purge_expired_locked()
+            entry = self._entries.get(state)
+            if entry is None:
+                return None
+            return entry.lti_issuer
 
     def purge_expired(self) -> int:
         """Remove entries older than the TTL. Returns the count removed.

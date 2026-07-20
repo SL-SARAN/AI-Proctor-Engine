@@ -19,6 +19,9 @@ _DEFAULT_STATE_STORE_TTL_SECONDS = 600
 _DEFAULT_SESSION_TOKEN_TTL_SECONDS = 14400
 _DEFAULT_SESSION_TOKEN_ISSUER = "proctoring-engine"
 _DEFAULT_SESSION_TOKEN_AUDIENCE = "proctoring-client"
+_DEFAULT_EXAM_CLIENT_URL = "http://localhost:5173/exam"
+_DEFAULT_ADMIN_SURFACE_URL = "http://localhost:5173/admin"
+_DEFAULT_OIDC_HTTP_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +48,16 @@ class LtiSettings:
     # Reserved for v2 — deep linking launches. Captured here so the
     # dataclass shape does not have to change when v2 lands.
     deep_link_url: Optional[str] = None
+    # The URL the launch handler 302s a learner to, with
+    # ``?session_token=...``. The admin surface and the exam
+    # client are separate processes in v1; both URLs are
+    # environment-specific and HTTPS in production.
+    exam_client_url: str = _DEFAULT_EXAM_CLIENT_URL
+    admin_surface_url: str = _DEFAULT_ADMIN_SURFACE_URL
+    # The timeout the production ``httpx.AsyncClient`` uses for
+    # OIDC discovery and JWKS fetches. Tests override this with
+    # a smaller value where the real timeout is a noisy bound.
+    oidc_http_timeout_seconds: float = _DEFAULT_OIDC_HTTP_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
         """Validate the secret length and numeric bounds.
@@ -64,10 +77,16 @@ class LtiSettings:
             raise ValueError("state_store_ttl_seconds must be positive")
         if self.session_token_ttl_seconds <= 0:
             raise ValueError("session_token_ttl_seconds must be positive")
+        if self.oidc_http_timeout_seconds <= 0:
+            raise ValueError("oidc_http_timeout_seconds must be positive")
         if not self.tool_client_id:
             raise ValueError("tool_client_id must be set")
         if not self.launch_url:
             raise ValueError("launch_url must be set")
+        if not self.exam_client_url:
+            raise ValueError("exam_client_url must be set")
+        if not self.admin_surface_url:
+            raise ValueError("admin_surface_url must be set")
 
 
 _settings: LtiSettings | None = field(default=None, init=False)
@@ -145,6 +164,12 @@ def _load_from_env() -> LtiSettings:
             "SESSION_TOKEN_AUDIENCE",
             _DEFAULT_SESSION_TOKEN_AUDIENCE,
         ),
+        exam_client_url=getenv("EXAM_CLIENT_URL", _DEFAULT_EXAM_CLIENT_URL),
+        admin_surface_url=getenv("ADMIN_SURFACE_URL", _DEFAULT_ADMIN_SURFACE_URL),
+        oidc_http_timeout_seconds=_float(
+            "OIDC_HTTP_TIMEOUT_SECONDS",
+            _DEFAULT_OIDC_HTTP_TIMEOUT_SECONDS,
+        ),
     )
 
 
@@ -165,3 +190,15 @@ def _int(name: str, default: int) -> int:
         return int(raw)
     except ValueError as exc:
         raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+
+
+def _float(name: str, default: float) -> float:
+    """Return an env var as a ``float``, with a clear error on garbage."""
+
+    raw = getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a float, got {raw!r}") from exc

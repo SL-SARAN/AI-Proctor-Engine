@@ -1,6 +1,6 @@
 # Verification Log
 
-Last updated: 2026-07-19 (LTI 1.3 foundation)
+Last updated: 2026-07-20 (LTI 1.3 launch routes + service, turn N+1)
 
 ## Planned verification
 
@@ -52,6 +52,19 @@ Last updated: 2026-07-19 (LTI 1.3 foundation)
 | LTI integration tests (off-CI) | `pytest tests/integration` without `INTEGRATION_DATABASE_URL` | 16 skipped cleanly; the LTI integration tests are scoped to turn N+1 |
 | LTI module import smoke test | `.venv/Scripts/python.exe -c "from proctoring_engine.lti import claims, state, roles, session_token, discovery, jwks, config; ..."` | All 7 modules import without error |
 | Session token round-trip | inline test | `decode_session_token(issue_session_token(...))` returns the original `participant_id`, `exam_session_id`, and `role`; bad signature, wrong `iss`, wrong `aud`, and missing claims are all rejected |
+
+## Execution record (LTI 1.3 launch routes + service, turn N+1)
+
+| Check | Executed command | Result |
+|---|---|---|
+| Dependency installation (LTI launch turn) | `pip install python-multipart` + `pyproject.toml` update | Resolved; `python-multipart>=0.0.9` added to dependencies |
+| LTI launch service unit tests | `pytest tests/test_lti_service.py -v` | 14 passed (learner launch, instructor / admin-role upserts, retired / unknown policy, two-launch upsert semantics, `attempt_reference` is UUID4, session token round-trips, redirect URL routes by role, learner path does not create `AdminUser`, failed launch rolls back the participant) |
+| LTI launch route unit tests | `pytest tests/test_lti_routes.py -v` | 17 passed (`/lti/login` happy path, missing params (400/422), discovery failure (502), target_link_uri mismatch (400); `/lti/launch` happy paths (learner + instructor), replay (state_unknown), expired (claims_invalid), signature invalid, wrong iss (issuer_invalid, *rejected before the OIDC fetch via the new `LaunchStateStore.peek` path*), wrong nonce, missing policy, wrong aud, unknown role URI) |
+| LTI launch integration tests | `pytest tests/integration/test_lti_launch.py -v` | 9 cases, all gated on `INTEGRATION_DATABASE_URL`. They run against a real PostgreSQL engine; the integration-test runner provisions an ephemeral `proctoring_test` database, applies the full migration chain, and tears the schema down at session teardown. Verified: the JSONB `PolicyConfig.extra_rules` is not mutated; the JSONB `ExamSession.permitted_material_details` is the default empty dict; `accumulated_medium_score == 0`; `consent_recorded_at == started_at`; the `AdminUser` natural key matches the `Participant`'s; the upsert is transactional; the `attempt_reference` is a UUID4; the admin-role promotion is one-way |
+| Combined unit test suite | `pytest tests --ignore=tests/integration` | **134 passed** in 6.6s |
+| LTI launch module import smoke test | `.venv/Scripts/python.exe -c "from proctoring_engine.lti import process_launch, build_lti_router, LtiLaunchError, LtiLaunchErrorCode, LaunchResult, ..."` | All new exports import without error; the API module loads the router via a lifespan-managed factory |
+| `LaunchStateStore.peek` | inline test | Returns the registered `lti_issuer` for a known state; returns `None` for an unknown or expired state; never consumes the entry |
+| `LaunchStateStore.consume` returns `lti_issuer` | inline test | After `consume`, the returned tuple's second element is the `lti_issuer` the state was registered with; a follow-up `consume` raises `LaunchStateMissing` (one-shot) |
 
 ## Not yet verified
 
@@ -190,3 +203,59 @@ a key without a `kid` is silently skipped; a key with an
 inconsistent shape is rejected; a network error surfaces as
 `JwksError`; `invalidate` clears the cache so the next call
 re-fetches; the constructor rejects non-positive TTLs.
+
+### Unit (LTI 1.3 launch routes + service, turn N+1 — 31 cases)
+
+`test_lti_service.py` (14 cases): a successful learner launch
+creates a `Participant` and a `PENDING` `ExamSession` with the
+policy bound, `consent_recorded_at = started_at = now()`, and
+`accumulated_medium_score == 0`; the session row does not copy
+the policy's `extra_rules` JSONB (orthogonal fields); an
+instructor launch upserts an `AdminUser` with `INSTRUCTOR`
+role; an admin-role launch promotes the `AdminUser` to
+`ADMIN`; admin-role promotion is one-way (a later lower-
+privilege launch does not demote); a launch with an unknown
+policy name raises `policy_not_found`; a launch with a
+retired policy (`is_active=false`) raises `policy_not_found`;
+two consecutive launches from the same natural key upsert the
+participant and create two `ExamSession` rows; the
+`attempt_reference` is a UUID4; the session token round-trips
+through `decode_session_token`; the redirect URL routes
+learners to the exam client and instructors to the admin
+surface; a learner launch does not create an `AdminUser`; a
+failed launch rolls back the participant.
+
+`test_lti_routes.py` (17 cases): `/lti/login` happy path
+302-redirects to the platform's authorization endpoint with
+the right query string; missing `iss` and missing `login_hint`
+return 400/422; OIDC discovery failure returns 502; a
+`target_link_uri` mismatch returns 400 `claims_invalid`;
+`/lti/launch` happy paths for learner and instructor
+(instructor path creates the `AdminUser` row); replay
+(consumed `state` returns 400 `state_unknown`); expired
+`exp` returns 400 `claims_invalid`; signature from a key
+not in the JWKS returns 400 `signature_invalid`; wrong `iss`
+returns 400 `issuer_invalid` (rejected before the discovery
+fetch via the new `LaunchStateStore.peek` path); wrong
+`nonce` returns 400 `nonce_mismatch`; missing
+`custom.policy_config_name` returns 400 `policy_not_found`;
+wrong `aud` returns 400 `audience_invalid`; unknown role
+URI returns 400 `claims_invalid`.
+
+### Integration (LTI 1.3 launch, turn N+1 — 9 cases)
+
+`test_lti_launch.py` (9 cases, gated on
+`INTEGRATION_DATABASE_URL`): the JSONB `PolicyConfig.extra_rules`
+is not mutated by the launch; the JSONB
+`ExamSession.permitted_material_details` is the default empty
+dict; `accumulated_medium_score` stays at 0;
+`consent_recorded_at` and `started_at` are equal at creation
+time (the documented "consent is start" choice); the resolved
+`policy_config_id` is bound to the right policy; the
+`AdminUser`'s natural key matches the `Participant`'s; two
+consecutive launches from the same natural key produce one
+`Participant` row and two `ExamSession` rows; the
+`attempt_reference` is a UUID4; an admin-role launch promotes
+the `AdminUser` to `ADMIN` and does not duplicate the
+`Participant`; the `lti_context_id` is the documented
+`<context.id>:<resource_link.id>` shape.

@@ -17,6 +17,7 @@ dependencies = [
     "psycopg[binary]>=3.2,<4",
     "pyjwt[crypto]>=2.8,<3",
     "python-dotenv>=1.0,<2",
+    "python-multipart>=0.0.9",
     "SQLAlchemy>=2.0,<3",
     "uvicorn[standard]>=0.30,<1",
 ]

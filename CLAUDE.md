@@ -102,11 +102,17 @@ touching code.
 - Design doc suite (`docs/00`–`08`, plus the spec and the handoff) —
   `docs/` is now committed to git.
 - FastAPI app shell with `/healthz` only.
+- LTI 1.3 launch + session creation + consent capture (turns N + N+1):
+  `LtiSettings`, claim parsing, role mapping, the in-memory
+  `LaunchStateStore`, the HS256 session token, OIDC discovery, JWKS
+  fetchers, the `process_launch` service, the FastAPI router
+  (`GET /lti/login`, `POST /lti/launch`), and the OIDC test double.
+  134 unit tests pass on SQLite; 9 PostgreSQL integration tests cover
+  the JSONB-column preservation, the `consent_recorded_at` /
+  `started_at` invariants, and the upsert semantics.
 
 ## What is **not** built today (the unchecked items on the checklist)
 
-- LTI 1.3 launch + session creation + consent capture (the next
-  atomic layer).
 - Authenticated WebSocket protocol (envelope, sparse frames,
   kill-switch, ack).
 - Preprocessing layer (decode, tiered scheduler, rolling buffer
@@ -174,7 +180,8 @@ of truth for each layer's contract. The locked spec at
 requirements. `docs/DEPLOYMENT.md` is the source of truth for the
 deployment topology, sizing, and secrets model.
 
-The next atomic layer is **LTI 1.3 launch + session creation +
-consent capture** — the ingestion layer from `docs/02`, which
-converts an LTI launch into a `Participant` + `ExamSession` and
-gates all subsequent telemetry on consent.
+The next atomic layer is the **authenticated WebSocket
+protocol** — the envelope, sparse-frame handling, kill-switch,
+and per-frame ack that the exam client uses to push sparse
+telemetry frames after the launch redirect lands the learner on
+the exam client.
