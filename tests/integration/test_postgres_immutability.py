@@ -235,7 +235,10 @@ def test_gaze_min_duration_within_window_is_enforced_by_postgres(
 def test_one_evidence_artifact_per_flag_is_enforced_by_postgres(
     integration_engine_session: Session,
 ) -> None:
-    """The unique constraint added in 20260718_0002 is honored by Postgres."""
+    """The ``uq_evidence_artifacts_one_per_flag`` unique constraint
+    declared on the ``EvidenceArtifact`` model is honored by Postgres
+    (emitted by the initial migration's ``Base.metadata.create_all``).
+    """
 
     from proctoring_engine.models import EvidenceArtifact, EvidenceKind
 
