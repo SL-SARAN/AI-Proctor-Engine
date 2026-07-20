@@ -34,7 +34,7 @@ RUN apt-get update \
         libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml ./
+COPY pyproject.toml README.md ./
 COPY src ./src
 
 # Install the package into a prefix that the runtime stage can copy.
