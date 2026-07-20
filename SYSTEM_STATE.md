@@ -1,6 +1,6 @@
 # System State
 
-Last updated: 2026-07-19
+Last updated: 2026-07-19 (turn N: LTI 1.3 foundation)
 
 This file is the single source of truth for "where the AI Proctoring
 Engine is right now." Read this first at the start of every session
@@ -33,7 +33,8 @@ design docs but is not built.
 | Deployment topology doc | **Implemented** | `docs/DEPLOYMENT.md` |
 | FastAPI application shell (health endpoint only) | **Implemented** | `src/proctoring_engine/api.py` |
 | AdminUser table + admin-identity resolution | **Implemented** | `src/proctoring_engine/models.py`, `migrations/versions/20260719_0003_admin_user.py` |
-| Ingestion (LTI 1.3 launch, WebSocket envelope) | Not started | `docs/02-ingestion-layer-design.md` |
+| LTI 1.3 foundation (config, claims, roles, state store, session token, OIDC discovery, JWKS fetcher) | **Implemented (turn N, 70 unit tests)** | `src/proctoring_engine/lti/` |
+| Ingestion routes + service + OIDC test double + integration tests | Not started (turn N+1) | `docs/02-ingestion-layer-design.md` |
 | Preprocessing (frame decode, tiered scheduler, rolling buffer) | Not started | `docs/03-preprocessing-layer-design.md` |
 | Inference modules (6 modalities) | Not started | `docs/04-inference-modules-design.md` |
 | Fusion & flagging engine (3 termination paths) | Not started | `docs/05-fusion-flagging-engine-design.md` |
@@ -77,6 +78,21 @@ Per `docs/VERIFICATION_LOG.md`:
 - `docker build --tag proctoring-engine:ci-smoke --load .` builds
   successfully; the runtime stage boots as a non-root user with a
   read-only rootfs.
+
+### LTI 1.3 foundation (turn N)
+
+- `pip install -e ".[dev]"` resolves cleanly with the added
+  `httpx>=0.27,<1`, `pyjwt[crypto]>=2.8,<3`,
+  `pytest-asyncio>=0.24,<1`, and `pytest-httpx>=0.30,<1`
+  dependencies; `asyncio_mode = "auto"` is set in `pyproject.toml`.
+- `pytest tests --ignore=tests/integration` → **105 passed**
+  (35 boundary / integrity + 70 new LTI-foundation unit tests across
+  `test_lti_claims.py`, `test_lti_state.py`, `test_lti_roles.py`,
+  `test_lti_session_token.py`, `test_lti_discovery.py`, and
+  `test_lti_jwks.py`).
+- `pytest tests/integration` without `INTEGRATION_DATABASE_URL` →
+  16 skipped (the LTI integration tests will be added in turn N+1
+  alongside the launch routes).
 
 ## 3. What is NOT yet verified
 
@@ -272,7 +288,10 @@ it to mark progress and to identify the next single atomic layer.
 - [x] Documentation suite (`docs/00`–`08`, `docs/DEPLOYMENT.md`, plus
       spec and handoff) — `docs/` is now in git
 - [x] `AdminUser` table + admin-identity resolution
-- [ ] LTI 1.3 launch + session creation + consent capture
+- [x] LTI 1.3 foundation (config, claims, roles, state store, session
+      token, OIDC discovery, JWKS fetcher) — 70 unit tests passing
+- [ ] LTI 1.3 launch routes + `process_launch` service + OIDC test
+      double + PostgreSQL integration tests (turn N+1)
 - [ ] Authenticated WebSocket protocol (envelope, sparse frames,
       kill-switch, ack)
 - [ ] Ingestion layer implementation

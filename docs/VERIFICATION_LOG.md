@@ -1,6 +1,6 @@
 # Verification Log
 
-Last updated: 2026-07-18
+Last updated: 2026-07-19 (LTI 1.3 foundation)
 
 ## Planned verification
 
@@ -35,6 +35,24 @@ Last updated: 2026-07-18
 | Local development environment | `.venv/Scripts/python.exe -c "import fastapi, sqlalchemy, alembic, psycopg"` | All four core deps import; FastAPI 0.139.2, SQLAlchemy 2.0.51, Alembic 1.18.5, psycopg 3.3.4 |
 | FastAPI healthz smoke test | `.venv/Scripts/python.exe -c "from proctoring_engine.api import app; from starlette.testclient import TestClient; ..."` | 200 OK, `{"status": "ok", "environment": "development"}`. One benign `StarletteDeprecationWarning` about `httpx2` — see `docs/KNOWN_ISSUES.md` §1. |
 
+## Execution record (AdminUser layer)
+
+| Check | Executed command | Result |
+|---|---|---|
+| Model unit tests (post-AdminUser) | `pytest tests --ignore=tests/integration` | 35 logical cases passed (28 reconciliation cases + 7 AdminUser cases) |
+| Migration upgrade against PostgreSQL 15 | `alembic upgrade head` against `postgres:15-alpine` | All three migrations applied; `admin_users` table and `admin_role` enum created |
+| AdminUser integration test suite | `INTEGRATION_DATABASE_URL=postgresql+psycopg://... pytest tests/integration` | 16 real-engine tests pass (13 reconciliation + 3 AdminUser) |
+
+## Execution record (LTI 1.3 foundation, turn N)
+
+| Check | Executed command | Result |
+|---|---|---|
+| Dependency installation | `pip install -e ".[dev]"` | Resolved; `httpx>=0.27,<1`, `pyjwt[crypto]>=2.8,<3`, `pytest-asyncio>=0.24,<1`, and `pytest-httpx>=0.30,<1` added |
+| LTI foundation unit tests | `pytest tests --ignore=tests/integration` | **105 passed** in 2.13s (35 boundary / integrity + 70 new LTI-foundation unit cases across `test_lti_claims.py`, `test_lti_state.py`, `test_lti_roles.py`, `test_lti_session_token.py`, `test_lti_discovery.py`, `test_lti_jwks.py`) |
+| LTI integration tests (off-CI) | `pytest tests/integration` without `INTEGRATION_DATABASE_URL` | 16 skipped cleanly; the LTI integration tests are scoped to turn N+1 |
+| LTI module import smoke test | `.venv/Scripts/python.exe -c "from proctoring_engine.lti import claims, state, roles, session_token, discovery, jwks, config; ..."` | All 7 modules import without error |
+| Session token round-trip | inline test | `decode_session_token(issue_session_token(...))` returns the original `participant_id`, `exam_session_id`, and `role`; bad signature, wrong `iss`, wrong `aud`, and missing claims are all rejected |
+
 ## Not yet verified
 
 - Live deployment to a real Kubernetes cluster (the manifests exist;
@@ -42,9 +60,10 @@ Last updated: 2026-07-18
 - Postgres write throughput under a sustained flag-fire rate (the
   workload is read-light and write-bursty; a load test is the next
   environment to provision).
-- The LTI 1.3 launch / callback path (next atomic layer).
-- The WebSocket transport and the kill-switch flow (the next
-  atomic layer after LTI).
+- The LTI 1.3 launch routes + `process_launch` service + OIDC test
+  double + PostgreSQL integration tests (turn N+1).
+- The WebSocket transport and the kill-switch flow (the layer after
+  the LTI routes close out).
 
 ## Test coverage implemented
 
@@ -102,3 +121,72 @@ Last updated: 2026-07-18
 - `flags.policy_config_id` FK is enforced at the SQL level;
   `ON DELETE RESTRICT` blocks the cascade when a termination
   record depends on the flag.
+
+### Unit (LTI 1.3 foundation, turn N — 70 cases)
+
+`test_lti_claims.py` (14 cases): valid payload parses; missing
+required claim raises; wrong LTI version raises; wrong message
+type raises; deep-linking launch raises at the parse boundary;
+empty roles list raises; empty `policy_config_name` raises on
+`require_policy_config_name`; a launch without the custom claim
+parses but `require_policy_config_name` raises; non-object
+payload raises; unknown LTI-namespaced claim raises (strict
+validation); combined context id is `<context.id>:<resource_link.id>`;
+sub-models reject unknown fields (except `LtiCustomClaims`,
+which uses `extra=allow` by design so the platform can pass
+through other custom values); `require_lti_version_1_3` accepts
+`1.3.0` and rejects other versions; `require_resource_link_request`
+accepts resource-link and rejects other message types.
+
+`test_lti_state.py` (11 cases): register + consume round-trips
+the redirect URI; consume is one-shot (second call raises
+`LaunchStateMissing`); consume of an unknown state raises
+`LaunchStateMissing`; consume after the TTL raises
+`LaunchStateExpired` and the entry is purged; a wrong nonce
+raises `ValueError` and the entry is **not** consumed; a
+re-registration overwrites the prior entry; `purge_expired` evicts
+expired entries and reports the count; empty state or nonce is
+rejected at register time; concurrent register + consume is
+thread-safe (exactly one consumer wins); `new_state` and
+`new_nonce` produce fresh tokens each call; the constructor
+rejects non-positive TTLs.
+
+`test_lti_roles.py` (6 cases): single role maps to the right
+`AppRole`; multiple roles take the highest privilege (admin >
+proctor > instructor > learner); `is_admin_route` returns `True`
+for non-learner roles; unknown role URI raises `ValueError`;
+empty role list raises `ValueError`; `AppRole` is a real enum
+with the four expected members.
+
+`test_lti_session_token.py` (8 cases): HS256 round-trip preserves
+participant id, exam session id, and role; expired `exp` is
+rejected; wrong `iss` is rejected; wrong `aud` is rejected; missing
+required claim is rejected; signed with a different secret is
+rejected; the issued token includes `iat`, `jti`, and the standard
+OIDC shape; `decode_session_token` raises `SessionTokenError` for
+malformed input. The constructor's `session_token_secret` length
+check and the default TTL of 14 400 s are pinned by
+`LtiSettings`'s own unit tests.
+
+`test_lti_discovery.py` (10 cases): happy-path fetch returns the
+parsed `OidcDiscovery`; the document is cached per-issuer; the
+fetched `issuer` is validated against the requested issuer; an
+HTTP error surfaces as `OidcDiscoveryError`; a non-200 response
+surfaces as `OidcDiscoveryError`; a non-JSON body surfaces as
+`OidcDiscoveryError`; a document missing required fields surfaces
+as `OidcDiscoveryError`; an `oidc_discovery_url` override is
+honored; the cache returns the same document on a second call
+without an extra HTTP request; concurrent fetches share a single
+in-flight request.
+
+`test_lti_jwks.py` (13 cases): happy-path returns the JWK with
+the requested `kid`; an unknown `kid` triggers a re-fetch and
+finds the rotated key; a cached JWKS within its TTL is reused
+(no second request); a JWKS past its TTL is re-fetched; a `kid`
+genuinely absent after a fresh fetch is a hard error; a non-200
+response is reported as `JwksError`; a non-JSON body is reported
+as `JwksError`; a document without a `keys` array is rejected;
+a key without a `kid` is silently skipped; a key with an
+inconsistent shape is rejected; a network error surfaces as
+`JwksError`; `invalidate` clears the cache so the next call
+re-fetches; the constructor rejects non-positive TTLs.

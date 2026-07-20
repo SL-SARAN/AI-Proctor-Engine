@@ -88,6 +88,11 @@ relevant design doc in the same turn.
 | `ProctorReview` is the correct mechanism for correcting a flag — sits alongside, never edits | `docs/01-data-models-design.md`, `docs/06` §4 |
 | One `EvidenceArtifact` per `Flag` in v1; the `uq_evidence_artifacts_one_per_flag` unique constraint enforces this | `docs/01` EvidenceArtifact, `migrations/.../20260718_0002_audit_reconciliation.py` |
 | The `flag_immutable` trigger is the database-level mirror of the ORM listener | `migrations/.../20260718_0002_audit_reconciliation.py`, `src/proctoring_engine/models.py` |
+| **LTI 1.3 session token shape: signed JWT, server-side secret (HS256)** | Turn N (`SYSTEM_STATE.md` §2) |
+| **LTI 1.3 session token TTL: 14 400 s (4 h)** | Turn N (`SYSTEM_STATE.md` §2) |
+| **LTI 1.3 policy lookup: custom LTI claim `policy_config_name`** | Turn N (`SYSTEM_STATE.md` §2) |
+| **LTI 1.3 OIDC test double: `pytest-httpx` mocked transport** | Turn N (`SYSTEM_STATE.md` §2) |
+| **LTI 1.3 in-memory launch-state store: process-local, single replica acceptable for v1** | Turn N (`src/proctoring_engine/lti/state.py`, `docs/02` §1) |
 
 ## 4. Open decisions (do not silently resolve)
 
@@ -95,12 +100,12 @@ These are explicitly called out in the design docs as **not yet
 confirmed** by the user. A turn that resolves any of them silently
 is non-conformant under `SKILLS_ALIGNMENT.md` §7.
 
-1. **Admin / reviewer identity model** — dedicated `AdminUser` table
-   (chosen in the architecture review) is the next atomic layer.
-   The current schema stores `AccommodationExemption.approved_by`,
-   `PolicyConfig.created_by`, and `ProctorReview.reviewer_reference`
-   as free-form strings; the next layer adds the table and migrates
-   the three references to FKs.
+1. **Admin / reviewer identity model** — **Resolved.** The `AdminUser`
+   table was added in migration `20260719_0003`. The three referencing
+   tables (`PolicyConfig.created_by_id`,
+   `AccommodationExemption.approved_by_admin_id`,
+   `ProctorReview.reviewer_admin_id`) now carry FK columns alongside
+   the original string fields for backward compatibility.
 2. **Accumulated-score termination path** — `MEDIUM` flags adding
    weighted increments to `ExamSession.accumulated_medium_score`,
    with a `medium_score_termination_threshold` that triggers a
@@ -132,6 +137,8 @@ is non-conformant under `SKILLS_ALIGNMENT.md` §7.
 | Read what is intentionally deferred | `docs/KNOWN_ISSUES.md` |
 | Read what is done vs. not done | `docs/COMPLETION_STATUS.md` |
 | Read the handoff to the next implementer | `docs/CLAUDE_HANDOFF.md` |
+| Read the LTI 1.3 foundation (turn N) | `src/proctoring_engine/lti/` (`config.py`, `claims.py`, `roles.py`, `state.py`, `session_token.py`, `discovery.py`, `jwks.py`) |
+| Read the LTI 1.3 foundation tests (turn N) | `tests/test_lti_*.py` (71 unit cases) |
 | Run the project locally | `README.md`, `pyproject.toml`, `.env.example`, `alembic.ini`, `Dockerfile`, `docker-compose.yml` |
 | Deploy to production | `docs/DEPLOYMENT.md`, `k8s/` |
 
@@ -224,46 +231,58 @@ the `ON DELETE RESTRICT` behavior on `flags.policy_config_id`.
 
 ## 9. The shape of the next session
 
-The next atomic layer is the **LTI 1.3 launch + session creation +
-consent capture** (`docs/02-ingestion-layer-design.md` §1). This is
-the first layer that produces runtime behavior beyond the FastAPI
-`/healthz` endpoint and the first that crosses the LTI trust
-boundary. The `AdminUser` table is in place, so the launch handler
-can attribute `PolicyConfig.created_by_id` correctly.
+The **LTI 1.3 foundation** (turn N) is now in: `LtiSettings`, claim
+parsing, role mapping, the in-memory `LaunchStateStore`, the HS256
+session token, OIDC discovery, and JWKS fetchers — 71 unit tests
+passing. Turn N+1 closes out the ingestion layer: the launch
+routes, the `process_launch` service, an OIDC test double, and
+the PostgreSQL integration tests. This is described in detail in
+`docs/02-ingestion-layer-design.md` §1 and
+`docs/08-test-strategy-design.md` §"Ingestion layer".
 
-Specifically, the next turn delivers:
+Specifically, turn N+1 delivers:
 
-- `GET /lti/login` and `POST /lti/launch` FastAPI routes.
-- OIDC third-party-initiated login flow: validate the platform's
-  OIDC discovery document, redirect to the platform's authorization
-  endpoint with `state` + `nonce`, receive the `id_token` JWT on
-  callback.
-- JWT validation: signature against the platform's JWKS endpoint,
-  `iss` / `aud` / `nonce` / `state` checks, `exp` not in the past.
-- On launch: upsert `Participant` (keyed on `(lti_issuer,
-  lms_user_reference)`), resolve the active `PolicyConfig` by name,
-  create the `ExamSession` with `status=PENDING` and
-  `policy_config_id` set, and bind `consent_recorded_at` to the
-  current time.
-- Issue a short-lived session token (signed JWT or opaque token in
-  Redis) that the browser uses to open the WebSocket in the
-  following layer.
-- Role-based branching: an instructor / admin-role launch routes
-  to the `/admin/*` surfaces (still future); a learner-role launch
-  routes to the exam-taking flow.
+- `GET /lti/login` and `POST /lti/launch` FastAPI routes that wire
+  the foundation modules together.
+- The OIDC test double (`tests/integration/oidc_test_double.py`):
+  a small helper that generates an RSA keypair, exposes a
+  discovery document + JWKS endpoint, and signs launch JWTs against
+  the generated key. Wraps `pytest-httpx` so the unit and
+  integration tests can run without a real socket.
+- The `process_launch` service: upsert `Participant` on
+  `(lti_issuer, lms_user_reference)`, resolve the active
+  `PolicyConfig` by `custom.policy_config_name`, create the
+  `ExamSession` with `status=PENDING` and `policy_config_id` set,
+  bind `consent_recorded_at = started_at = now()`, and issue the
+  HS256 session token. Instructor / admin-role launches also
+  upsert an `AdminUser` row so the admin surfaces (a later layer)
+  can attribute `PolicyConfig.created_by_id` correctly.
+- Role-based branching: learner launches redirect to the exam
+  client; instructor / admin / proctor launches redirect to the
+  admin surface.
+- Integration tests against a real PostgreSQL engine that verify
+  the launch's persistence invariants (the JSONB `extra_rules`
+  column is not mutated; `accumulated_medium_score` default is
+  preserved; the launch is transactional; an `AdminUser` row is
+  upserted for the admin path).
 
 Tests, per the boundary cases the spec calls out in
-`docs/02-ingestion-layer-design.md` §1 and `docs/08-test-strategy-design.md`:
+`docs/02-ingestion-layer-design.md` §1 and
+`docs/08-test-strategy-design.md` §"Ingestion layer":
 
-- Unit: JWT validation against a mocked JWKS (wrong signature,
-  expired `exp`, mismatched `nonce`, mismatched `state`, missing
-  required claims, learner-role-on-admin-route). Use the
-  `pyjwt` library (already a transitive dep of FastAPI) and a
-  fixture that produces a self-signed test key.
-- Integration: end-to-end launch against a fake OIDC provider
-  (e.g. `pytest-httpx` mock or a small in-process aiohttp server
-  serving a minimal discovery + JWKS endpoint). Verifies the
-  upsert + session creation against the real Postgres engine.
+- Unit: `process_launch` boundary cases (missing policy name, no
+  active policy, two launches from the same
+  `(lti_issuer, lms_user_reference)` upsert correctly), and
+  endpoint tests (`/lti/login` happy-path redirect, `/lti/launch`
+  happy-path token issuance, replay of `state` returns 400,
+  expired `exp` returns 400, signature from a key not in the JWKS
+  returns 400, wrong `iss` returns 400, wrong `nonce` returns 400,
+  missing `custom.policy_config_name` returns 400, retired policy
+  returns 400, instructor-role launch upserts `AdminUser`).
+- Integration: same suite as the unit tests but against the real
+  PostgreSQL engine, verifying that the launch does not mutate
+  the policy snapshot and that the upsert is correct across
+  schema columns.
 - Endpoint-to-end: a successful launch returns a 302 to the
   exam client and creates the right rows; a malformed launch
   returns 400 and creates nothing; a replayed `state` returns
@@ -271,14 +290,9 @@ Tests, per the boundary cases the spec calls out in
 
 Layer depends on:
 
-- `AdminUser` table (done) — for the instructor-role path that
-  creates a `PolicyConfig` and attributes `created_by_id`.
-- The current `pyproject.toml` deps do not yet include `pyjwt` as
-  a direct dep; it comes in via FastAPI. The next turn should add
-  it explicitly (`pyjwt[crypto]>=2.8,<3` for RS256 support) so
-  the dep is visible in the lockfile and the test harness can
-  rely on it.
-- A `tests/integration/oidc/` test double: a minimal OIDC
-  discovery + JWKS server that issues a self-signed JWT. This is
-  the smallest harness that exercises the launch path end-to-end
-  without needing a real LMS.
+- `AdminUser` table (done) — for the instructor-role path.
+- `pyjwt[crypto]`, `httpx`, `pytest-asyncio`, `pytest-httpx` —
+  added in turn N's `pyproject.toml` updates.
+- The OIDC test double is reused by both unit and integration
+  tests so the launch path is exercised end-to-end without a
+  real LMS.

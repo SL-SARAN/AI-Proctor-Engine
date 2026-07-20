@@ -120,6 +120,25 @@ with `REPLACE_ME` placeholders. In production:
 - **LTI tool private key** — generated once at tool registration,
   stored in the secret store. The platform's public keys are fetched
   from the platform's JWKS endpoint at launch-validation time.
+- **LTI tool client ID** (`LTI_TOOL_CLIENT_ID`) — the value the
+  platform registers for this tool; sent as the `aud` claim and
+  the `client_id` query parameter on every launch. Per-platform
+  in a multi-LMS deployment; identical to the value the tool
+  returns in the OIDC authorization request.
+- **LTI launch URL** (`LTI_LAUNCH_URL`) — the absolute URL the
+  platform redirects the browser to after the platform
+  authenticates the user; the tool's OIDC `redirect_uri`. Must
+  match the URL registered with the platform's LTI 1.3 tool
+  registry to the byte. Defaults to
+  `http://localhost:8000/lti/launch` for local dev; overridden
+  per environment.
+- **Session-token secret** (`SESSION_TOKEN_SECRET`) — the HS256
+  key used to sign the short-lived session token the tool issues
+  on a successful LTI launch. Must be at least 32 bytes of
+  cryptographically random material (`openssl rand -base64 48`
+  is fine). Rotated quarterly; on rotation, all live sessions
+  are invalidated (the WebSocket client re-launches from the
+  LMS, which is the documented recovery path).
 - **Internal terminate-token** — a shared secret between the API and
   the worker, used only for the internal `/sessions/{id}/terminate`
   call. Rotated quarterly. This is the one credential that is not
@@ -157,13 +176,25 @@ redesign:
    WebSocket gateway that routes by session ID, or (b) move the
    WebSocket layer to a managed product (Cloudflare Durable Objects,
    Ably, Pusher). Neither is needed yet.
-2. **Postgres becomes the bottleneck** past ~10k concurrent sessions
+2. **The LTI launch-state store is process-local.** v1's
+   `LaunchStateStore` lives in the API pod's memory (see
+   `src/proctoring_engine/lti/state.py`). The launch routes are
+   single-shot, so a pending `state`/`nonce` value is only ever
+   read by the same replica that issued it. This is fine while
+   the API tier is pinned to one replica (the v1 default; the
+   WebSocket affinity in §6.1 is the larger constraint), but
+   becomes a correctness issue the moment a second API replica
+   is added. The fix is a Redis-backed implementation of the
+   same interface — a configuration swap, not a code rewrite,
+   because the route handler and the launch service depend on
+   the abstract store.
+3. **Postgres becomes the bottleneck** past ~10k concurrent sessions
    with the current write pattern (heavy at flag time, light
    otherwise). The mitigations, in order: (a) add a read replica for
    the review surface; (b) add a connection pooler (PgBouncer) in
    front of the managed instance; (c) shard by `lti_issuer` if
    multi-tenancy demands it.
-3. **R2 lifecycle rules** are how `retention_expires_at` actually
+4. **R2 lifecycle rules** are how `retention_expires_at` actually
    means something. Set a bucket-level lifecycle policy that mirrors
    the per-row `retention_expires_at` to delete objects past their
    retention date. The application-level deletion worker in the

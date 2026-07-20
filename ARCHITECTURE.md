@@ -82,8 +82,9 @@ design doc, and code anchor is enumerated; the checklist mirrors
 | 7 | Docker + docker-compose | Implemented | `Dockerfile`, `docker-compose.yml` | (same) |
 | 8 | Kubernetes manifest set | Implemented | `k8s/00-` through `k8s/10-` | (same) |
 | 9 | FastAPI app shell (health only) | Implemented | `docs/07-api-orchestration-design.md` | `src/proctoring_engine/api.py` |
-| 10 | `AdminUser` table | **Next** | `docs/01` open decision | — |
-| 11 | LTI 1.3 launch + session creation + consent capture | Pending | `docs/02-ingestion-layer-design.md` §1 | — |
+| 10 | `AdminUser` table | **Implemented (2026-07-19, commit `e0ef809`)** | `docs/01` open decision | `migrations/versions/20260719_0003_admin_user.py` |
+| 11a | LTI 1.3 foundation (config, claims, roles, state store, session token, OIDC discovery, JWKS fetcher) | **Implemented (turn N, 70 unit tests)** | `docs/02-ingestion-layer-design.md` §1, §6 | `src/proctoring_engine/lti/` |
+| 11b | LTI 1.3 launch routes + `process_launch` service + OIDC test double + PostgreSQL integration tests | **Next (turn N+1)** | `docs/02-ingestion-layer-design.md` §1, §6 | — |
 | 12 | Authenticated WebSocket protocol | Pending | `docs/02-ingestion-layer-design.md` §2–§4 | — |
 | 13 | Preprocessing layer | Pending | `docs/03-preprocessing-layer-design.md` | — |
 | 14 | Inference modules (6 modalities) | Pending | `docs/04-inference-modules-design.md` | — |
@@ -292,12 +293,16 @@ audit trail for those changes.
 
 ## 9. Next single atomic layer (per `SKILLS_ALIGNMENT.md` §5 and `SYSTEM_STATE.md` §12)
 
-**LTI 1.3 launch + session creation + consent capture.** The ingestion
-layer from `docs/02-ingestion-layer-design.md` converts an LTI 1.3
-launch into a `Participant` + `ExamSession`, resolves admin identity
-via the `AdminUser` table (now implemented), and gates all subsequent
-telemetry on `ExamSession.consent_recorded_at`. This is the first
-layer that creates runtime behavior beyond the health endpoint.
+**LTI 1.3 launch routes + `process_launch` service + OIDC test
+double + PostgreSQL integration tests** (turn N+1). The LTI 1.3
+foundation is in place (turn N): `LtiSettings`, claim parsing,
+role mapping, the in-memory `LaunchStateStore`, the HS256 session
+token, OIDC discovery, and JWKS fetchers. Turn N+1 wires the
+launch routes (`GET /lti/login`, `POST /lti/launch`) and the
+`process_launch` service together, then exercises the end-to-end
+path against a real PostgreSQL engine. This is the first layer
+that creates runtime behavior beyond the health endpoint and the
+first that crosses the LTI trust boundary.
 
 ## 10. Deployment topology (locked)
 
@@ -329,3 +334,4 @@ Full topology, sizing, and the secrets model are in
 | 2026-07-18 | Integration test suite (12 cases) added; runs in CI against a real PostgreSQL 15 service container. Exercises both `flag_immutable` and `termination_record_immutable` triggers under direct `UPDATE` / `DELETE` SQL. | Claude |
 | 2026-07-18 | Open decision narrowed: admin identity will be a dedicated `AdminUser` table (next atomic layer). | Claude |
 | 2026-07-19 | **Admin identity resolved.** `AdminUser` table added (migration `20260719_0003`). `AdminRole` enum: `instructor`, `admin`, `proctor`. FK columns added to `PolicyConfig.created_by_id`, `AccommodationExemption.approved_by_admin_id`, `ProctorReview.reviewer_admin_id` (all nullable, `ON DELETE RESTRICT`). Original string fields preserved for backward compatibility. 7 new unit tests, 3 new integration tests. Open decisions narrowed from 3 to 2. | Antigravity |
+| 2026-07-19 | **LTI 1.3 foundation landed (turn N).** New `src/proctoring_engine/lti/` package: `LtiSettings` (env-loaded, frozen, slots), `LtiIdToken` (Pydantic v2 with strict alias-only field names and a parse boundary that applies the LTI-version and message-type checks), `AppRole` + role mapper (highest-privilege wins; admin > proctor > instructor > learner), `LaunchStateStore` (in-memory, thread-safe, monotonic-clock TTL, atomic `consume`), `issue_session_token` / `decode_session_token` (HS256, 14 400 s TTL), `OidcDiscoveryCache` (per-issuer, 5 s timeout, validates `issuer` against the fetched document), `JwksCache` (TTL-bounded, refreshes on a kid-miss after a first refresh — the key-rotation handling). 70 new unit tests pass on SQLite. `pyproject.toml` now pins `httpx>=0.27,<1`, `pyjwt[crypto]>=2.8,<3`, `pytest-asyncio>=0.24,<1`, and `pytest-httpx>=0.30,<1`. LTI 1.3 layer is split into turn N (foundation) and turn N+1 (routes + service + integration tests) per the one-atomic-layer-per-turn rule. | Claude |
