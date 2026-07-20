@@ -1,6 +1,6 @@
 # System State
 
-Last updated: 2026-07-20 (turn N+1+fix: CI unit job alembic validation)
+Last updated: 2026-07-20 (turn N+1+fix: CI DATABASE_URL + Dockerfile pip pin)
 
 This file is the single source of truth for "where the AI Proctoring
 Engine is right now." Read this first at the start of every session

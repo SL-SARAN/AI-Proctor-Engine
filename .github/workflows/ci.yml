@@ -88,6 +88,11 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
+      # The integration test fixtures read INTEGRATION_DATABASE_URL.
+      # The standalone `alembic upgrade head` gate step (and any other
+      # tooling that reads `get_settings().database_url`) reads
+      # DATABASE_URL — both must point at the same database.
+      DATABASE_URL: postgresql+psycopg://proctoring:proctoring@127.0.0.1:5432/proctoring_test
       INTEGRATION_DATABASE_URL: postgresql+psycopg://proctoring:proctoring@127.0.0.1:5432/proctoring_test
     steps:
       - name: Check out repository

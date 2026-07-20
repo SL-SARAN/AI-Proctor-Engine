@@ -41,7 +41,14 @@ COPY src ./src
 # The [dev] extra is added here so the test runner is available inside
 # the builder if a future stage wants to run tests; the runtime stage
 # does not include [dev].
-RUN pip install --upgrade pip \
+# Pin pip to a specific version for build reproducibility. The
+# `python:3.11-slim` base image ships with a recent pip, but
+# `pip install --upgrade pip` without a version pin pulls whatever
+# is latest on PyPI at build time — which can change `--prefix`
+# install behavior or PEP 517 resolution and break the build in
+# non-obvious ways. Pin to the pip version that was current when
+# this project was last verified to build cleanly.
+RUN pip install --upgrade "pip==25.0.1" \
     && pip install --prefix=/install ".[dev]"
 
 
