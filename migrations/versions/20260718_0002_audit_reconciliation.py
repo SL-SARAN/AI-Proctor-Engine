@@ -16,15 +16,13 @@ Changes
 
 Enum
 ----
-* ``session_status``: add ``under_review`` to match the spec's state
-  machine. The initial migration created the type from the Python
-  ``SessionStatus`` enum, which already has ``pending`` (not
-  ``created``) as its first value — no rename is needed.
-* ``flag_status``: add ``overturned`` so a flag whose review overturned it
-  is distinguishable from one that was dismissed without review. The
-  existing ``raised``, ``confirmed``, ``dismissed`` values are unchanged.
-* ``review_decision``: add ``needs_more_info`` so a reviewer can flag
-  inconclusive evidence without overturning the flag.
+* The initial migration creates the ``session_status``, ``flag_status``,
+  and ``review_decision`` enum types from the Python enums in
+  ``src/proctoring_engine/models.py`` (``Base.metadata.create_all``).
+  Those Python enums already include the values added by the audit
+  reconciliation (``under_review``, ``overturned``, ``needs_more_info``),
+  so no ``ALTER TYPE ... ADD VALUE`` statements are needed here — the
+  values are present from the initial migration onward.
 
 Columns
 -------
@@ -85,37 +83,31 @@ def upgrade() -> None:
     bind = op.get_bind()
 
     # ------------------------------------------------------------------
-    # 1. session_status enum: drop 'cancelled', add 'under_review'.
+    # 1. session_status enum: ``under_review`` is already present.
     #
-    #    The initial migration created the enum from the Python
-    #    ``SessionStatus`` enum, which already has ``pending`` (not
-    #    ``created``) as its first value — so no rename is needed.
-    #    ``cancelled`` was never in the Python enum and was never in
-    #    the spec, so nothing references it. ``under_review`` is added
-    #    to match the spec's state machine.
+    #    The initial migration creates the schema from the Python
+    #    ``SessionStatus`` enum (``Base.metadata.create_all``), which
+    #    already includes ``UNDER_REVIEW = "under_review"``. So by the
+    #    time this migration runs, the PostgreSQL ``session_status``
+    #    type already has ``under_review`` as a label, and an
+    #    ``ALTER TYPE ... ADD VALUE 'under_review'`` would fail with
+    #    ``DuplicateObject``.
     #
-    #    Postgres allows ALTER TYPE ... ADD VALUE since 9.1, but the
-    #    new value cannot be used in the same transaction it was
-    #    added in — so we close Alembic's transaction boundary after
-    #    the ADD VALUE and let the subsequent operations see it.
+    #    The same is true of ``flag_status.overturned`` and
+    #    ``review_decision.needs_more_info`` — the Python enums in
+    #    ``src/proctoring_engine/models.py`` are the single source of
+    #    truth for the type labels, and they already include the values
+    #    this migration was originally written to add. Nothing needs
+    #    to be done here.
+    #
+    #    Note: there is no ``cancelled`` label in the Python enum and
+    #    never was; no rename is needed. ``pending`` is the first
+    #    value of the Python enum, which is what the initial migration
+    #    emits.
     # ------------------------------------------------------------------
-    if bind.dialect.name == "postgresql":
-        op.execute("ALTER TYPE session_status ADD VALUE 'under_review'")
 
     # ------------------------------------------------------------------
-    # 2. flag_status enum: add 'overturned'.
-    # ------------------------------------------------------------------
-    if bind.dialect.name == "postgresql":
-        op.execute("ALTER TYPE flag_status ADD VALUE 'overturned'")
-
-    # ------------------------------------------------------------------
-    # 3. review_decision enum: add 'needs_more_info'.
-    # ------------------------------------------------------------------
-    if bind.dialect.name == "postgresql":
-        op.execute("ALTER TYPE review_decision ADD VALUE 'needs_more_info'")
-
-    # ------------------------------------------------------------------
-    # 4. policy_configs: new column + new check constraints.
+    # 2. policy_configs: new column + new check constraints.
     # ------------------------------------------------------------------
     op.add_column(
         "policy_configs",
@@ -138,7 +130,7 @@ def upgrade() -> None:
     )
 
     # ------------------------------------------------------------------
-    # 5. exam_sessions: new column + new check constraint.
+    # 3. exam_sessions: new column + new check constraint.
     # ------------------------------------------------------------------
     op.add_column(
         "exam_sessions",
@@ -156,7 +148,7 @@ def upgrade() -> None:
     )
 
     # ------------------------------------------------------------------
-    # 6. enrollment_references: new column.
+    # 4. enrollment_references: new column.
     #
     #    The default 'unknown' is the only way to add a NOT NULL column
     #    to a non-empty table without a separate data backfill. Existing
@@ -174,7 +166,7 @@ def upgrade() -> None:
     )
 
     # ------------------------------------------------------------------
-    # 7. flags: two new columns + a new FK to accommodation_exemptions.
+    # 5. flags: two new columns + a new FK to accommodation_exemptions.
     # ------------------------------------------------------------------
     op.add_column(
         "flags",
@@ -203,7 +195,7 @@ def upgrade() -> None:
     )
 
     # ------------------------------------------------------------------
-    # 8. evidence_artifacts: unique constraint on flag_id.
+    # 6. evidence_artifacts: unique constraint on flag_id.
     # ------------------------------------------------------------------
     op.create_unique_constraint(
         "uq_evidence_artifacts_one_per_flag",
@@ -212,7 +204,7 @@ def upgrade() -> None:
     )
 
     # ------------------------------------------------------------------
-    # 9. flag_immutable trigger (Postgres mirror of the ORM-level
+    # 7. flag_immutable trigger (Postgres mirror of the ORM-level
     #    reject_flag_update / reject_flag_delete listeners).
     # ------------------------------------------------------------------
     if bind.dialect.name == "postgresql":
@@ -239,11 +231,15 @@ def upgrade() -> None:
 def downgrade() -> None:
     """Reverse the audit-reconciliation changes.
 
-    Downgrade drops the new trigger, columns, constraints, and enum values
-    in reverse order. Note that ``ALTER TYPE ... DROP VALUE`` is not
-    supported in Postgres 15, so the new enum values (``under_review``,
-    ``overturned``, ``needs_more_info``) cannot be cleanly removed — they
-    are left in place with a warning.
+    Downgrade drops the new trigger, columns, and constraints in reverse
+    order. The enum labels (``session_status``, ``flag_status``,
+    ``review_decision``) are not modified by this migration: the initial
+    migration creates the enum types from the Python enums in
+    ``src/proctoring_engine/models.py``, so reversing this migration does
+    not change which values the enums contain. To change the enum
+    membership, update the Python enums and write a new migration —
+    ``ALTER TYPE ... DROP VALUE`` is not supported in Postgres 15, so any
+    removal would require a new migration that recreates the type.
     """
 
     bind = op.get_bind()
@@ -275,10 +271,11 @@ def downgrade() -> None:
     )
     op.drop_column("policy_configs", "medium_score_termination_threshold")
 
-    # The added enum values cannot be dropped in Postgres 15 (no
-    # ALTER TYPE ... DROP VALUE support). The downgrade is therefore
-    # partial by design: the new enum values remain in the type after
-    # downgrade, and the columns that used them are dropped along with
-    # the tables. This matches the policy that the audit reconciliation
-    # is forward-only — once the schema has been applied, the only safe
-    # path is forward.
+    # The enum types (``session_status``, ``flag_status``,
+    # ``review_decision``) are owned by the initial migration's
+    # ``Base.metadata.create_all``. This migration did not add any enum
+    # values, so there is nothing to drop here. The downgrade is partial
+    # by design: only the changes made by this migration are reversed.
+    # To remove an enum value, write a new migration that recreates the
+    # type — ``ALTER TYPE ... DROP VALUE`` is not supported in Postgres
+    # 15.

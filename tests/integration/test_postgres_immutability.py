@@ -93,7 +93,9 @@ def _seed_flag(db_session: Session) -> Flag:
 def test_session_status_enum_contains_under_review(
     integration_engine_session: Session,
 ) -> None:
-    """The audit-reconciliation migration added ``under_review`` to the enum."""
+    """The ``session_status`` enum contains ``under_review`` from the Python
+    ``SessionStatus`` enum (``Base.metadata.create_all`` in the initial
+    migration). The audit-reconciliation migration does not add it."""
 
     result = integration_engine_session.execute(
         text(
