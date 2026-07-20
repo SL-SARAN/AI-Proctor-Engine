@@ -1,6 +1,6 @@
 # System State
 
-Last updated: 2026-07-20 (turn N+1+fix: CI DATABASE_URL + Dockerfile pip pin + audit-reconciliation migration reduced to trigger-only)
+Last updated: 2026-07-20 (turn N+1+fix: third migration deleted; only triggers remain post-initial)
 
 This file is the single source of truth for "where the AI Proctoring
 Engine is right now." Read this first at the start of every session
@@ -32,7 +32,7 @@ design docs but is not built.
 | Kubernetes manifest set | **Implemented** | `k8s/00-...` through `k8s/10-...` |
 | Deployment topology doc | **Implemented** | `docs/DEPLOYMENT.md` |
 | FastAPI application shell (health endpoint only) | **Implemented** | `src/proctoring_engine/api.py` |
-| AdminUser table + admin-identity resolution | **Implemented** | `src/proctoring_engine/models.py`, `migrations/versions/20260719_0003_admin_user.py` |
+| AdminUser table + admin-identity resolution | **Implemented (part of initial schema)** | `src/proctoring_engine/models.py` — `AdminUser` is created by the initial migration's `Base.metadata.create_all` |
 | LTI 1.3 foundation (config, claims, roles, state store, session token, OIDC discovery, JWKS fetcher) | **Implemented (turn N, 70 unit tests)** | `src/proctoring_engine/lti/` |
 | LTI 1.3 launch routes + `process_launch` service + OIDC test double + PostgreSQL integration tests | **Implemented (turn N+1, 134 unit + 9 integration tests)** | `src/proctoring_engine/lti/routes.py`, `src/proctoring_engine/lti/service.py`, `tests/integration/test_lti_launch.py` |
 | Preprocessing (frame decode, tiered scheduler, rolling buffer) | Not started | `docs/03-preprocessing-layer-design.md` |
@@ -70,9 +70,11 @@ Per `docs/VERIFICATION_LOG.md`:
   flag-interval-rejects parametrize, 19 individual tests including 7 new
   AdminUser tests).
 - `alembic upgrade head` against a real PostgreSQL 15 service
-  container applied all three migrations; the `flag_immutable` and
-  `termination_record_immutable` triggers are installed; the
-  `admin_users` table and `admin_role` enum are created.
+  container applied the initial migration (which creates the entire
+  current schema — all 12 tables, all 9 enum types, the
+  `termination_record_immutable` trigger) and the second migration
+  (the `flag_immutable` trigger). The `admin_users` table and
+  `admin_role` enum are part of the initial schema.
 - `pytest tests/integration` against the real engine → **16 passed**
   (13 original + 3 AdminUser tests).
 - `docker build --tag proctoring-engine:ci-smoke --load .` builds
@@ -149,10 +151,16 @@ From `docs/proctoring-engine-v1-spec.md` §1 and the design docs:
 ## 5. Open decisions
 
 1. **Admin / reviewer identity model** — **Resolved.** The `AdminUser`
-   table was added in migration `20260719_0003`. The three referencing
-   tables (`PolicyConfig.created_by_id`, `AccommodationExemption.approved_by_admin_id`,
-   `ProctorReview.reviewer_admin_id`) now carry FK columns alongside
-   the original string fields for backward compatibility.
+   table is part of the initial schema (created by the initial
+   migration's `Base.metadata.create_all`). The three referencing
+   tables (`PolicyConfig.created_by_id`,
+   `AccommodationExemption.approved_by_admin_id`,
+   `ProctorReview.reviewer_admin_id`) carry FK columns alongside the
+   original string fields for backward compatibility. An earlier
+   `20260719_0003_admin_user.py` migration was entirely redundant and
+   has been removed; `tests/test_migration_chain.py` enforces the
+   invariant that no post-initial migration may re-add anything the
+   initial migration already emits.
 2. **Accumulated-score termination path** — proposed in
    `docs/05-fusion-flagging-engine-design.md` Path 3. The schema is
    now ready for it (`ExamSession.accumulated_medium_score` and
@@ -212,9 +220,10 @@ From the spec's "library availability" note:
 ## 9. Recommended next-layer order (per `docs/CLAUDE_HANDOFF.md`)
 
 1. ~~Alembic / SQLAlchemy integration tests against PostgreSQL in CI.~~ **Done.**
-2. ~~`AdminUser` table — resolve the open admin-identity decision.~~ **Done** (migration `20260719_0003`).
-3. Authenticated LTI 1.3 launch + session creation + consent capture
-   + policy snapshot — **next atomic layer**.
+2. ~~`AdminUser` table — resolve the open admin-identity decision.~~ **Done** (initial schema, no migration needed; regression-tested by `tests/test_migration_chain.py`).
+3. ~~LTI 1.3 launch routes + `process_launch` service + OIDC test double + PostgreSQL integration tests.~~ **Done** (turn N+1).
+4. Authenticated WebSocket event schema, sparse-frame protocol,
+   evidence-buffer upload, kill-switch acknowledgement — **next atomic layer**.
 4. Authenticated WebSocket event schema, sparse-frame protocol,
    evidence-buffer upload, kill-switch acknowledgement.
 5. Object-storage abstraction with checksums, encryption metadata,
@@ -292,8 +301,12 @@ it to mark progress and to identify the next single atomic layer.
       token, OIDC discovery, JWKS fetcher) — 70 unit tests passing
 - [x] LTI 1.3 launch routes + `process_launch` service + OIDC test
       double + integration tests (turn N+1)
-- [ ] LTI 1.3 launch routes + `process_launch` service + OIDC test
-      double + PostgreSQL integration tests (turn N+1)
+- [x] Migration-chain structural regression tests
+      (`tests/test_migration_chain.py` — no post-initial migration may
+      re-add an enum value, column, table, index, or constraint that
+      the initial migration's `Base.metadata.create_all` already emits;
+      the `20260719_0003_admin_user.py` migration was deleted as
+      redundant and this guard prevents recurrence)
 - [ ] Authenticated WebSocket protocol (envelope, sparse frames,
       kill-switch, ack)
 - [ ] Ingestion layer implementation

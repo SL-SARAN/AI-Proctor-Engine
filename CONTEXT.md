@@ -101,11 +101,17 @@ confirmed** by the user. A turn that resolves any of them silently
 is non-conformant under `SKILLS_ALIGNMENT.md` §7.
 
 1. **Admin / reviewer identity model** — **Resolved.** The `AdminUser`
-   table was added in migration `20260719_0003`. The three referencing
-   tables (`PolicyConfig.created_by_id`,
+   table is part of the initial schema (created by the initial
+   migration's `Base.metadata.create_all` from the post-resolution ORM
+   in `src/proctoring_engine/models.py`). The three referencing tables
+   (`PolicyConfig.created_by_id`,
    `AccommodationExemption.approved_by_admin_id`,
-   `ProctorReview.reviewer_admin_id`) now carry FK columns alongside
-   the original string fields for backward compatibility.
+   `ProctorReview.reviewer_admin_id`) carry FK columns alongside the
+   original string fields for backward compatibility. An earlier
+   `20260719_0003_admin_user.py` migration was entirely redundant and
+   has been removed; `tests/test_migration_chain.py` enforces the
+   invariant that no post-initial migration may re-add anything the
+   initial migration already emits.
 2. **Accumulated-score termination path** — `MEDIUM` flags adding
    weighted increments to `ExamSession.accumulated_medium_score`,
    with a `medium_score_termination_threshold` that triggers a

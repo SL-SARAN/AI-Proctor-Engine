@@ -78,10 +78,18 @@ touching code.
   `TerminationRecord`, `ProctorReview`).
 - `Flag` and `TerminationRecord` immutability — both at the ORM
   event listener and at PostgreSQL triggers.
-- Three Alembic migrations: the initial revision
-  (`20260717_0001_initial_proctoring_schema.py`), the audit
-  reconciliation (`20260718_0002_audit_reconciliation.py`), and the
-  admin-user layer (`20260719_0003_admin_user.py`).
+- Two Alembic migrations: the initial revision
+  (`20260717_0001_initial_proctoring_schema.py`) and the audit
+  reconciliation (`20260718_0002_audit_reconciliation.py`). The
+  initial migration creates the entire current schema via
+  `Base.metadata.create_all`; the audit-reconciliation migration
+  installs only the `flag_immutable` PostgreSQL trigger
+  (the schema-shape operations it once carried are emitted by the
+  initial migration). `tests/test_migration_chain.py` enforces the
+  invariant that no post-initial migration may re-add an enum value,
+  column, table, index, or constraint that the initial migration
+  already emits — the only legitimate content of a post-initial
+  migration is a DML trigger.
 - Admin identity resolution: `PolicyConfig.created_by_id`,
   `AccommodationExemption.approved_by_admin_id`, and
   `ProctorReview.reviewer_admin_id` are FK-backed columns pointing
