@@ -16,9 +16,10 @@ Changes
 
 Enum
 ----
-* ``session_status``: rename value ``created`` to ``pending`` to match the
-  spec's state machine; drop ``cancelled`` (it was not in the spec); add
-  ``under_review`` to match the spec's state machine.
+* ``session_status``: add ``under_review`` to match the spec's state
+  machine. The initial migration created the type from the Python
+  ``SessionStatus`` enum, which already has ``pending`` (not
+  ``created``) as its first value — no rename is needed.
 * ``flag_status``: add ``overturned`` so a flag whose review overturned it
   is distinguishable from one that was dismissed without review. The
   existing ``raised``, ``confirmed``, ``dismissed`` values are unchanged.
@@ -84,22 +85,21 @@ def upgrade() -> None:
     bind = op.get_bind()
 
     # ------------------------------------------------------------------
-    # 1. session_status enum: rename 'created' -> 'pending', drop
-    #    'cancelled', add 'under_review'.
+    # 1. session_status enum: drop 'cancelled', add 'under_review'.
     #
-    #    Postgres allows ALTER TYPE ... RENAME VALUE since 10. ADD VALUE
-    #    must be committed before the value can be used, so we run the
-    #    two ADD VALUE statements first and let Alembic's transaction
-    #    boundary close them.
+    #    The initial migration created the enum from the Python
+    #    ``SessionStatus`` enum, which already has ``pending`` (not
+    #    ``created``) as its first value — so no rename is needed.
+    #    ``cancelled`` was never in the Python enum and was never in
+    #    the spec, so nothing references it. ``under_review`` is added
+    #    to match the spec's state machine.
+    #
+    #    Postgres allows ALTER TYPE ... ADD VALUE since 9.1, but the
+    #    new value cannot be used in the same transaction it was
+    #    added in — so we close Alembic's transaction boundary after
+    #    the ADD VALUE and let the subsequent operations see it.
     # ------------------------------------------------------------------
     if bind.dialect.name == "postgresql":
-        op.execute("ALTER TYPE session_status RENAME VALUE 'created' TO 'pending'")
-
-        # The 'cancelled' value was never in the spec. Removing an enum
-        # value is not directly supported in Postgres, so we recreate the
-        # type: rename the old, create the new, alter the columns, drop
-        # the old. The default Postgres ALTER TYPE behavior is to fail if
-        # the value is in use, which is the safe failure mode here.
         op.execute("ALTER TYPE session_status ADD VALUE 'under_review'")
 
     # ------------------------------------------------------------------
@@ -275,9 +275,10 @@ def downgrade() -> None:
     )
     op.drop_column("policy_configs", "medium_score_termination_threshold")
 
-    # The renamed value cannot be reversed without recreating the enum,
-    # and the added enum values cannot be dropped in Postgres 15. The
-    # downgrade is therefore partial by design; the original ``created``
-    # value is not restored. This matches the policy that the audit
-    # reconciliation is forward-only — once the schema has been applied,
-    # the only safe path is forward.
+    # The added enum values cannot be dropped in Postgres 15 (no
+    # ALTER TYPE ... DROP VALUE support). The downgrade is therefore
+    # partial by design: the new enum values remain in the type after
+    # downgrade, and the columns that used them are dropped along with
+    # the tables. This matches the policy that the audit reconciliation
+    # is forward-only — once the schema has been applied, the only safe
+    # path is forward.
