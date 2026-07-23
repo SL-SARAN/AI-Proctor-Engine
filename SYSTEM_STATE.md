@@ -1,6 +1,6 @@
 # System State
 
-Last updated: 2026-07-20 (turn N+1+fix: third migration deleted; only triggers remain post-initial)
+Last updated: 2026-07-23 (turn N+2: WebSocket protocol layer)
 
 This file is the single source of truth for "where the AI Proctoring
 Engine is right now." Read this first at the start of every session
@@ -35,6 +35,7 @@ design docs but is not built.
 | AdminUser table + admin-identity resolution | **Implemented (part of initial schema)** | `src/proctoring_engine/models.py` — `AdminUser` is created by the initial migration's `Base.metadata.create_all` |
 | LTI 1.3 foundation (config, claims, roles, state store, session token, OIDC discovery, JWKS fetcher) | **Implemented (turn N, 70 unit tests)** | `src/proctoring_engine/lti/` |
 | LTI 1.3 launch routes + `process_launch` service + OIDC test double + PostgreSQL integration tests | **Implemented (turn N+1, 134 unit + 9 integration tests)** | `src/proctoring_engine/lti/routes.py`, `src/proctoring_engine/lti/service.py`, `tests/integration/test_lti_launch.py` |
+| Authenticated WebSocket protocol (envelope, sparse frames, kill-switch, ack) | **Implemented (turn N+2, 88 unit tests)** | `src/proctoring_engine/websocket/` |
 | Preprocessing (frame decode, tiered scheduler, rolling buffer) | Not started | `docs/03-preprocessing-layer-design.md` |
 | Inference modules (6 modalities) | Not started | `docs/04-inference-modules-design.md` |
 | Fusion & flagging engine (3 termination paths) | Not started | `docs/05-fusion-flagging-engine-design.md` |
@@ -95,6 +96,12 @@ Per `docs/VERIFICATION_LOG.md`:
 - `pytest tests/integration` without `INTEGRATION_DATABASE_URL` →
   16 skipped (the LTI integration tests will be added in turn N+1
   alongside the launch routes).
+
+### WebSocket protocol (turn N+2)
+
+- `pytest tests/test_websocket.py` → **88 passed**
+  (envelope validation, server message serialisation, delivery service, telemetry event buffer, real testclient WebSocket dispatch).
+- Total unit tests passing on SQLite: 230.
 
 ## 3. What is NOT yet verified
 
@@ -222,11 +229,11 @@ From the spec's "library availability" note:
 1. ~~Alembic / SQLAlchemy integration tests against PostgreSQL in CI.~~ **Done.**
 2. ~~`AdminUser` table — resolve the open admin-identity decision.~~ **Done** (initial schema, no migration needed; regression-tested by `tests/test_migration_chain.py`).
 3. ~~LTI 1.3 launch routes + `process_launch` service + OIDC test double + PostgreSQL integration tests.~~ **Done** (turn N+1).
-4. Authenticated WebSocket event schema, sparse-frame protocol,
-   evidence-buffer upload, kill-switch acknowledgement — **next atomic layer**.
-4. Authenticated WebSocket event schema, sparse-frame protocol,
-   evidence-buffer upload, kill-switch acknowledgement.
-5. Object-storage abstraction with checksums, encryption metadata,
+4. ~~Authenticated WebSocket event schema, sparse-frame protocol,
+   evidence-buffer upload, kill-switch acknowledgement.~~ **Done** (turn N+2).
+5. Preprocessing layer (decode, tiered scheduler, rolling buffer
+   contract) — **next atomic layer**.
+6. Object-storage abstraction with checksums, encryption metadata,
    retention deletion worker, and test doubles.
 6. Async inference job queue + versioned telemetry payload contracts.
 7. Browser client and client-side event capture. Then connect face /
@@ -307,9 +314,9 @@ it to mark progress and to identify the next single atomic layer.
       the initial migration's `Base.metadata.create_all` already emits;
       the `20260719_0003_admin_user.py` migration was deleted as
       redundant and this guard prevents recurrence)
-- [ ] Authenticated WebSocket protocol (envelope, sparse frames,
+- [x] Authenticated WebSocket protocol (envelope, sparse frames,
       kill-switch, ack)
-- [ ] Ingestion layer implementation
+- [x] Ingestion layer implementation
 - [ ] Preprocessing layer (decode, tiered scheduler, rolling buffer
       contract)
 - [ ] Inference modules (face presence, identity, head pose / gaze,

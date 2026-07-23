@@ -36,6 +36,11 @@ from proctoring_engine.lti import (
     get_lti_settings,
 )
 from proctoring_engine.lti.routes import _RouterDeps
+from proctoring_engine.websocket import (
+    TelemetryEventBuffer,
+    build_ws_router,
+)
+from proctoring_engine.websocket.routes import _WsRouterDeps
 
 
 logger = logging.getLogger(__name__)
@@ -116,6 +121,16 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         get_db=_db_session_factory,
     )
     app.include_router(build_lti_router(deps))
+
+    # The TelemetryEventBuffer is process-global for the WebSocket layer
+    # so the HTTP polling endpoints (added later) can read from it.
+    event_buffer = TelemetryEventBuffer(maxlen=4096)
+    ws_deps = _WsRouterDeps(
+        settings=settings,
+        get_db=_db_session_factory,
+        event_buffer=event_buffer,
+    )
+    app.include_router(build_ws_router(ws_deps))
 
     try:
         yield
