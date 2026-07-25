@@ -1,0 +1,1056 @@
+"""Unit tests for the fusion & flagging engine.
+
+Tests all three termination paths, exemption suppression,
+book-detection severity, and boundary cases.  No database access —
+the aggregator is tested in isolation with typed inference results
+and in-memory policy snapshots.
+
+Boundary cases per SKILLS_ALIGNMENT.md §3.5:
+- Frame count at exactly ``second_face_confirmation_frames``
+- Gaze count at exactly ``gaze_warning_limit`` and
+  ``gaze_termination_limit``
+- Accumulated score at exactly ``medium_score_termination_threshold``
+- Window expiry (gaze event ages out)
+- Exemption match / no match / expired / not yet effective
+- Book with ``CLOSED_BOOK`` / ``OPEN_BOOK`` / ``SPECIFIC_LIST``
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from proctoring_engine.inference._types import (
+    BoundingBox,
+    BrowserEventResult,
+    ConfidenceInterval,
+    FacePresenceResult,
+    HeadPoseGazeResult,
+    ObjectDetectionResult,
+)
+from proctoring_engine.fusion._types import FlagDecision, GazeAwayEvent
+from proctoring_engine.fusion.aggregator import (
+    RULE_ACCUMULATED_SCORE,
+    RULE_BROWSER_EVENT,
+    RULE_GAZE_AWAY_FREQUENCY,
+    RULE_OBJECT_DETECTED,
+    RULE_SECOND_PERSON,
+    PolicySnapshot,
+    SessionAggregator,
+    SessionContext,
+)
+from proctoring_engine.fusion.book_severity import (
+    BOOK_FLAG_SEVERITY,
+    BOOK_RULE_CODE,
+    should_flag_book,
+)
+from proctoring_engine.fusion.exemptions import (
+    SUPPRESSED_SEVERITY,
+    ExemptionRecord,
+    find_matching_exemption,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_CI = ConfidenceInterval(lower=0.9, score=0.95, upper=0.99)
+_CI_POINT = ConfidenceInterval(lower=1.0, score=1.0, upper=1.0)
+
+_NOW = datetime(2026, 7, 25, 12, 0, 0, tzinfo=timezone.utc)
+
+_EXAM_REF = "exam-001"
+_PARTICIPANT = uuid.uuid4()
+_POLICY_ID = uuid.uuid4()
+_SESSION_ID = uuid.uuid4()
+
+
+def _default_policy(**overrides: object) -> PolicySnapshot:
+    defaults: dict[str, object] = {
+        "terminate_on_second_face": True,
+        "second_face_confirmation_frames": 3,
+        "gaze_min_duration_ms": 800,
+        "gaze_window_seconds": 300,
+        "gaze_warning_limit": 3,
+        "gaze_termination_limit": 8,
+        "medium_score_termination_threshold": 10.0,
+    }
+    defaults.update(overrides)
+    return PolicySnapshot(**defaults)  # type: ignore[arg-type]
+
+
+def _default_context(
+    *,
+    exemptions: list[ExemptionRecord] | None = None,
+    allowed_reference_materials: str = "closed_book",
+    permitted_material_details: dict | None = None,
+) -> SessionContext:
+    return SessionContext(
+        exam_session_id=_SESSION_ID,
+        participant_id=_PARTICIPANT,
+        exam_reference=_EXAM_REF,
+        policy_config_id=_POLICY_ID,
+        exemptions=exemptions or [],
+        allowed_reference_materials=allowed_reference_materials,
+        permitted_material_details=permitted_material_details or {},
+    )
+
+
+def _make_face_result(face_count: int = 2) -> FacePresenceResult:
+    return FacePresenceResult(
+        modality="face",
+        event_type="second_person" if face_count >= 2 else "one_face",
+        confidence=_CI,
+        face_count=face_count,
+    )
+
+
+def _make_gaze_result(off_screen: bool = True) -> HeadPoseGazeResult:
+    return HeadPoseGazeResult(
+        modality="gaze",
+        event_type="off_screen" if off_screen else "on_screen",
+        confidence=_CI,
+        off_screen=off_screen,
+    )
+
+
+def _make_object_result(detected_class: str = "cell phone") -> ObjectDetectionResult:
+    return ObjectDetectionResult(
+        modality="object",
+        event_type=detected_class,
+        confidence=_CI,
+        bounding_boxes=[BoundingBox(x=0.1, y=0.2, w=0.3, h=0.4)],
+        detected_class=detected_class,
+    )
+
+
+def _make_browser_result(event_type: str = "visibilitychange") -> BrowserEventResult:
+    return BrowserEventResult(
+        modality="browser",
+        event_type=event_type,
+        confidence=_CI_POINT,
+        detail={"hidden": True},
+    )
+
+
+def _make_aggregator(
+    policy: PolicySnapshot | None = None,
+    context: SessionContext | None = None,
+) -> SessionAggregator:
+    return SessionAggregator(
+        policy=policy or _default_policy(),
+        context=context or _default_context(),
+    )
+
+
+# ===================================================================
+# GazeAwayEvent
+# ===================================================================
+
+
+class TestGazeAwayEvent:
+    """Test the GazeAwayEvent data type."""
+
+    def test_construction(self) -> None:
+        ev = GazeAwayEvent(started_at_ms=1000, ended_at_ms=2000)
+        assert ev.started_at_ms == 1000
+        assert ev.ended_at_ms == 2000
+        assert ev.contributing_event_ids == ()
+
+    def test_with_event_ids(self) -> None:
+        ids = (uuid.uuid4(), uuid.uuid4())
+        ev = GazeAwayEvent(
+            started_at_ms=0,
+            ended_at_ms=900,
+            contributing_event_ids=ids,
+        )
+        assert ev.contributing_event_ids == ids
+
+    def test_frozen(self) -> None:
+        ev = GazeAwayEvent(started_at_ms=0, ended_at_ms=100)
+        with pytest.raises(AttributeError):
+            ev.started_at_ms = 999  # type: ignore[misc]
+
+
+# ===================================================================
+# FlagDecision
+# ===================================================================
+
+
+class TestFlagDecision:
+    """Test the FlagDecision data type."""
+
+    def test_defaults(self) -> None:
+        d = FlagDecision(rule_code="test", severity="medium", confidence=_CI)
+        assert d.triggered_termination is False
+        assert d.suppressed_by_exemption_id is None
+        assert d.contributing_event_ids == ()
+        assert d.score_delta == 0.0
+        assert d.detail == {}
+
+    def test_full_construction(self) -> None:
+        eid = uuid.uuid4()
+        exid = uuid.uuid4()
+        d = FlagDecision(
+            rule_code="second_person",
+            severity="critical",
+            confidence=_CI,
+            triggered_termination=True,
+            suppressed_by_exemption_id=exid,
+            detail={"key": "val"},
+            contributing_event_ids=(eid,),
+            score_delta=2.5,
+        )
+        assert d.triggered_termination is True
+        assert d.suppressed_by_exemption_id == exid
+        assert d.score_delta == 2.5
+
+    def test_frozen(self) -> None:
+        d = FlagDecision(rule_code="test", severity="medium", confidence=_CI)
+        with pytest.raises(AttributeError):
+            d.rule_code = "other"  # type: ignore[misc]
+
+
+# ===================================================================
+# PolicySnapshot
+# ===================================================================
+
+
+class TestPolicySnapshot:
+    """Test the PolicySnapshot frozen dataclass."""
+
+    def test_defaults(self) -> None:
+        p = PolicySnapshot()
+        assert p.terminate_on_second_face is True
+        assert p.second_face_confirmation_frames == 3
+        assert p.gaze_min_duration_ms == 800
+        assert p.gaze_window_seconds == 300
+        assert p.gaze_warning_limit == 3
+        assert p.gaze_termination_limit == 8
+        assert p.medium_score_termination_threshold == 10.0
+
+    def test_weight_for_default(self) -> None:
+        p = PolicySnapshot()
+        assert p.weight_for("anything") == 1.0
+
+    def test_weight_for_custom(self) -> None:
+        p = PolicySnapshot(score_weights={"browser_event": 0.5, "gaze_away_frequency": 2.0})
+        assert p.weight_for("browser_event") == 0.5
+        assert p.weight_for("gaze_away_frequency") == 2.0
+        assert p.weight_for("unknown") == 1.0
+
+
+# ===================================================================
+# Path 1: zero-tolerance (second person)
+# ===================================================================
+
+
+class TestSecondPersonPath:
+    """Test the zero-tolerance second-person detection path."""
+
+    def test_single_frame_no_flag(self) -> None:
+        agg = _make_aggregator()
+        result = _make_face_result(face_count=2)
+        decisions = agg.process_face_presence(result, telemetry_event_id=uuid.uuid4())
+        assert decisions == []
+        assert agg.consecutive_second_person_frames == 1
+
+    def test_below_threshold_no_flag(self) -> None:
+        agg = _make_aggregator(policy=_default_policy(second_face_confirmation_frames=3))
+        for _ in range(2):
+            decisions = agg.process_face_presence(
+                _make_face_result(face_count=2),
+                telemetry_event_id=uuid.uuid4(),
+            )
+            assert decisions == []
+        assert agg.consecutive_second_person_frames == 2
+
+    def test_at_threshold_fires(self) -> None:
+        """Fires when count == confirmation_frames (boundary)."""
+        agg = _make_aggregator(policy=_default_policy(second_face_confirmation_frames=3))
+        for i in range(3):
+            decisions = agg.process_face_presence(
+                _make_face_result(face_count=2),
+                telemetry_event_id=uuid.uuid4(),
+            )
+        assert len(decisions) == 1
+        d = decisions[0]
+        assert d.rule_code == RULE_SECOND_PERSON
+        assert d.severity == "critical"
+        assert d.triggered_termination is True
+        assert len(d.contributing_event_ids) == 3
+
+    def test_single_frame_resets_counter(self) -> None:
+        """A single on-screen frame resets the consecutive counter."""
+        agg = _make_aggregator(policy=_default_policy(second_face_confirmation_frames=3))
+        # Two second-person frames
+        for _ in range(2):
+            agg.process_face_presence(
+                _make_face_result(face_count=2),
+                telemetry_event_id=uuid.uuid4(),
+            )
+        assert agg.consecutive_second_person_frames == 2
+        # One normal frame resets
+        agg.process_face_presence(
+            _make_face_result(face_count=1),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert agg.consecutive_second_person_frames == 0
+
+    def test_after_reset_needs_full_count(self) -> None:
+        """After a reset, a new streak must reach the full confirmation count."""
+        agg = _make_aggregator(policy=_default_policy(second_face_confirmation_frames=2))
+        agg.process_face_presence(
+            _make_face_result(face_count=2),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        agg.process_face_presence(
+            _make_face_result(face_count=1),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        # One more second-person frame is not enough (need 2)
+        decisions = agg.process_face_presence(
+            _make_face_result(face_count=2),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert decisions == []
+
+    def test_fires_only_once(self) -> None:
+        """Once fired, subsequent second-person frames produce no flags."""
+        agg = _make_aggregator(policy=_default_policy(second_face_confirmation_frames=1))
+        d1 = agg.process_face_presence(
+            _make_face_result(face_count=2),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert len(d1) == 1
+        d2 = agg.process_face_presence(
+            _make_face_result(face_count=2),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert d2 == []
+
+    def test_disabled_by_policy(self) -> None:
+        """When ``terminate_on_second_face=False``, no flag fires."""
+        agg = _make_aggregator(
+            policy=_default_policy(
+                terminate_on_second_face=False,
+                second_face_confirmation_frames=1,
+            )
+        )
+        decisions = agg.process_face_presence(
+            _make_face_result(face_count=3),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert decisions == []
+
+    def test_zero_faces_no_flag(self) -> None:
+        agg = _make_aggregator()
+        decisions = agg.process_face_presence(
+            _make_face_result(face_count=0),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert decisions == []
+
+    def test_confirmation_frames_1(self) -> None:
+        """Fires on the very first second-person frame when threshold is 1."""
+        agg = _make_aggregator(policy=_default_policy(second_face_confirmation_frames=1))
+        decisions = agg.process_face_presence(
+            _make_face_result(face_count=2),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert len(decisions) == 1
+        assert decisions[0].triggered_termination is True
+
+
+# ===================================================================
+# Path 2: gaze-away frequency ladder
+# ===================================================================
+
+
+class TestGazeAwayPath:
+    """Test the gaze-away frequency escalation ladder."""
+
+    def _send_off_screen_episode(
+        self,
+        agg: SessionAggregator,
+        start_ms: int,
+        duration_ms: int,
+        frames: int = 5,
+    ) -> list[FlagDecision]:
+        """Simulate an off-screen episode spanning ``duration_ms``."""
+        all_decisions: list[FlagDecision] = []
+        step = duration_ms // frames if frames > 0 else 0
+        for i in range(frames):
+            t = start_ms + i * step
+            all_decisions.extend(
+                agg.process_gaze(
+                    _make_gaze_result(off_screen=True),
+                    telemetry_event_id=uuid.uuid4(),
+                    frame_timestamp_ms=t,
+                )
+            )
+        # Return on-screen to close the episode
+        all_decisions.extend(
+            agg.process_gaze(
+                _make_gaze_result(off_screen=False),
+                telemetry_event_id=uuid.uuid4(),
+                frame_timestamp_ms=start_ms + duration_ms,
+            )
+        )
+        return all_decisions
+
+    def test_short_episode_no_gaze_event(self) -> None:
+        """An off-screen streak shorter than ``gaze_min_duration_ms`` is ignored."""
+        agg = _make_aggregator(policy=_default_policy(gaze_min_duration_ms=800))
+        self._send_off_screen_episode(agg, start_ms=0, duration_ms=500)
+        assert agg.gaze_away_count_in_window == 0
+
+    def test_long_episode_creates_gaze_event(self) -> None:
+        """An episode >= ``gaze_min_duration_ms`` creates a GazeAwayEvent."""
+        agg = _make_aggregator(policy=_default_policy(gaze_min_duration_ms=800))
+        self._send_off_screen_episode(agg, start_ms=0, duration_ms=900)
+        assert agg.gaze_away_count_in_window == 1
+
+    def test_exact_min_duration_creates_event(self) -> None:
+        """An episode of exactly ``gaze_min_duration_ms`` creates an event."""
+        agg = _make_aggregator(policy=_default_policy(gaze_min_duration_ms=800))
+        self._send_off_screen_episode(agg, start_ms=0, duration_ms=800)
+        assert agg.gaze_away_count_in_window == 1
+
+    def test_below_warning_limit_no_flag(self) -> None:
+        """Fewer events than ``gaze_warning_limit`` → no flag."""
+        agg = _make_aggregator(
+            policy=_default_policy(
+                gaze_min_duration_ms=100,
+                gaze_warning_limit=3,
+            )
+        )
+        for i in range(2):
+            self._send_off_screen_episode(
+                agg, start_ms=i * 1000, duration_ms=200,
+            )
+        assert agg.gaze_away_count_in_window == 2
+
+    def test_at_warning_limit_fires_medium(self) -> None:
+        """At exactly ``gaze_warning_limit`` → MEDIUM flag (boundary)."""
+        agg = _make_aggregator(
+            policy=_default_policy(
+                gaze_min_duration_ms=100,
+                gaze_warning_limit=3,
+                gaze_termination_limit=8,
+            )
+        )
+        decisions: list[FlagDecision] = []
+        for i in range(3):
+            decisions.extend(
+                self._send_off_screen_episode(
+                    agg, start_ms=i * 1000, duration_ms=200,
+                )
+            )
+        medium_flags = [d for d in decisions if d.severity == "medium"]
+        assert len(medium_flags) == 1
+        assert medium_flags[0].rule_code == RULE_GAZE_AWAY_FREQUENCY
+        assert medium_flags[0].triggered_termination is False
+
+    def test_at_termination_limit_fires_critical(self) -> None:
+        """At exactly ``gaze_termination_limit`` → CRITICAL + termination."""
+        agg = _make_aggregator(
+            policy=_default_policy(
+                gaze_min_duration_ms=100,
+                gaze_warning_limit=3,
+                gaze_termination_limit=5,
+            )
+        )
+        decisions: list[FlagDecision] = []
+        for i in range(5):
+            decisions.extend(
+                self._send_off_screen_episode(
+                    agg, start_ms=i * 1000, duration_ms=200,
+                )
+            )
+        critical_flags = [d for d in decisions if d.severity == "critical"]
+        assert len(critical_flags) >= 1
+        termination_flag = [d for d in critical_flags if d.rule_code == RULE_GAZE_AWAY_FREQUENCY]
+        assert len(termination_flag) == 1
+        assert termination_flag[0].triggered_termination is True
+
+    def test_window_expiry(self) -> None:
+        """Events older than ``gaze_window_seconds`` are expired."""
+        window_s = 10  # 10 seconds
+        agg = _make_aggregator(
+            policy=_default_policy(
+                gaze_min_duration_ms=100,
+                gaze_window_seconds=window_s,
+                gaze_warning_limit=3,
+            )
+        )
+        # 2 events at t=0s
+        for i in range(2):
+            self._send_off_screen_episode(
+                agg, start_ms=i * 500, duration_ms=200,
+            )
+        assert agg.gaze_away_count_in_window == 2
+
+        # Advance past the window (11s later).  Send an on-screen frame
+        # to trigger expiry.
+        agg.process_gaze(
+            _make_gaze_result(off_screen=False),
+            telemetry_event_id=uuid.uuid4(),
+            frame_timestamp_ms=11_000,
+        )
+        assert agg.gaze_away_count_in_window == 0
+
+    def test_after_termination_no_more_flags(self) -> None:
+        """Once gaze termination fires, no more gaze flags are produced."""
+        agg = _make_aggregator(
+            policy=_default_policy(
+                gaze_min_duration_ms=100,
+                gaze_warning_limit=1,
+                gaze_termination_limit=2,
+            )
+        )
+        for i in range(2):
+            self._send_off_screen_episode(
+                agg, start_ms=i * 1000, duration_ms=200,
+            )
+        # Now send more off-screen — should produce nothing
+        extra = self._send_off_screen_episode(
+            agg, start_ms=5000, duration_ms=200,
+        )
+        assert extra == []
+
+    def test_medium_flag_accumulates_score(self) -> None:
+        """A warning-level gaze flag should add to accumulated score."""
+        agg = _make_aggregator(
+            policy=_default_policy(
+                gaze_min_duration_ms=100,
+                gaze_warning_limit=1,
+                gaze_termination_limit=100,  # won't trigger
+                medium_score_termination_threshold=100.0,
+            )
+        )
+        decisions = self._send_off_screen_episode(
+            agg, start_ms=0, duration_ms=200,
+        )
+        medium_flags = [d for d in decisions if d.severity == "medium"]
+        assert len(medium_flags) == 1
+        assert medium_flags[0].score_delta == 1.0  # default weight
+        assert agg.accumulated_score == 1.0
+
+
+# ===================================================================
+# Path 3: accumulated-score termination
+# ===================================================================
+
+
+class TestAccumulatedScorePath:
+    """Test the accumulated-score termination path."""
+
+    def test_below_threshold_no_termination(self) -> None:
+        agg = _make_aggregator(
+            policy=_default_policy(
+                medium_score_termination_threshold=5.0,
+                gaze_min_duration_ms=100,
+                gaze_warning_limit=1,
+                gaze_termination_limit=100,
+            )
+        )
+        # One gaze warning -> +1.0, below threshold
+        for i in range(1):
+            agg.process_gaze(
+                _make_gaze_result(off_screen=True),
+                telemetry_event_id=uuid.uuid4(),
+                frame_timestamp_ms=i * 100,
+            )
+        agg.process_gaze(
+            _make_gaze_result(off_screen=False),
+            telemetry_event_id=uuid.uuid4(),
+            frame_timestamp_ms=200,
+        )
+        assert agg.accumulated_score == 1.0
+
+    def test_at_threshold_fires(self) -> None:
+        """Fires exactly when accumulated score crosses the threshold."""
+        agg = _make_aggregator(
+            policy=_default_policy(
+                medium_score_termination_threshold=2.0,
+                gaze_min_duration_ms=100,
+                gaze_warning_limit=1,
+                gaze_termination_limit=100,
+            )
+        )
+        all_decisions: list[FlagDecision] = []
+        # Two gaze warnings: each adds 1.0, total = 2.0 = threshold
+        for i in range(2):
+            # Off-screen episode
+            agg.process_gaze(
+                _make_gaze_result(off_screen=True),
+                telemetry_event_id=uuid.uuid4(),
+                frame_timestamp_ms=i * 1000,
+            )
+            decisions = agg.process_gaze(
+                _make_gaze_result(off_screen=False),
+                telemetry_event_id=uuid.uuid4(),
+                frame_timestamp_ms=i * 1000 + 200,
+            )
+            all_decisions.extend(decisions)
+
+        acc_flags = [d for d in all_decisions if d.rule_code == RULE_ACCUMULATED_SCORE]
+        assert len(acc_flags) == 1
+        assert acc_flags[0].triggered_termination is True
+        assert acc_flags[0].severity == "critical"
+
+    def test_threshold_zero_disables(self) -> None:
+        """A threshold of 0 disables the accumulated-score path."""
+        agg = _make_aggregator(
+            policy=_default_policy(
+                medium_score_termination_threshold=0.0,
+                gaze_min_duration_ms=100,
+                gaze_warning_limit=1,
+                gaze_termination_limit=100,
+            )
+        )
+        agg.process_gaze(
+            _make_gaze_result(off_screen=True),
+            telemetry_event_id=uuid.uuid4(),
+            frame_timestamp_ms=0,
+        )
+        decisions = agg.process_gaze(
+            _make_gaze_result(off_screen=False),
+            telemetry_event_id=uuid.uuid4(),
+            frame_timestamp_ms=200,
+        )
+        # Should have a medium flag but no accumulated-score termination
+        acc_flags = [d for d in decisions if d.rule_code == RULE_ACCUMULATED_SCORE]
+        assert acc_flags == []
+
+    def test_custom_weights(self) -> None:
+        """Custom weights change the delta per flag."""
+        agg = _make_aggregator(
+            policy=_default_policy(
+                medium_score_termination_threshold=5.0,
+                gaze_min_duration_ms=100,
+                gaze_warning_limit=1,
+                gaze_termination_limit=100,
+                score_weights={"gaze_away_frequency": 3.0},
+            )
+        )
+        # One gaze warning with weight 3.0
+        agg.process_gaze(
+            _make_gaze_result(off_screen=True),
+            telemetry_event_id=uuid.uuid4(),
+            frame_timestamp_ms=0,
+        )
+        agg.process_gaze(
+            _make_gaze_result(off_screen=False),
+            telemetry_event_id=uuid.uuid4(),
+            frame_timestamp_ms=200,
+        )
+        assert agg.accumulated_score == 3.0
+
+    def test_browser_events_accumulate(self) -> None:
+        """Tab-blur browser events accumulate score."""
+        agg = _make_aggregator(
+            policy=_default_policy(medium_score_termination_threshold=3.0)
+        )
+        all_decisions: list[FlagDecision] = []
+        for _ in range(3):
+            decisions = agg.process_browser_event(
+                _make_browser_result(event_type="visibilitychange"),
+                telemetry_event_id=uuid.uuid4(),
+            )
+            all_decisions.extend(decisions)
+        assert agg.accumulated_score == 3.0
+        acc_flags = [d for d in all_decisions if d.rule_code == RULE_ACCUMULATED_SCORE]
+        assert len(acc_flags) == 1
+        assert acc_flags[0].triggered_termination is True
+
+
+# ===================================================================
+# Browser events
+# ===================================================================
+
+
+class TestBrowserEvents:
+    """Test browser event processing."""
+
+    def test_visibilitychange_medium_flag(self) -> None:
+        agg = _make_aggregator()
+        decisions = agg.process_browser_event(
+            _make_browser_result(event_type="visibilitychange"),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert len(decisions) >= 1
+        assert decisions[0].severity == "medium"
+        assert decisions[0].rule_code == RULE_BROWSER_EVENT
+
+    def test_blur_accumulates(self) -> None:
+        agg = _make_aggregator()
+        decisions = agg.process_browser_event(
+            _make_browser_result(event_type="blur"),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert decisions[0].score_delta == 1.0
+        assert agg.accumulated_score == 1.0
+
+    def test_focus_does_not_accumulate(self) -> None:
+        agg = _make_aggregator()
+        decisions = agg.process_browser_event(
+            _make_browser_result(event_type="focus"),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert decisions[0].score_delta == 0.0
+        assert agg.accumulated_score == 0.0
+
+    def test_contextmenu_does_not_accumulate(self) -> None:
+        agg = _make_aggregator()
+        decisions = agg.process_browser_event(
+            _make_browser_result(event_type="contextmenu"),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert decisions[0].score_delta == 0.0
+
+    def test_contributing_event_id_present(self) -> None:
+        eid = uuid.uuid4()
+        agg = _make_aggregator()
+        decisions = agg.process_browser_event(
+            _make_browser_result(event_type="paste"),
+            telemetry_event_id=eid,
+        )
+        assert eid in decisions[0].contributing_event_ids
+
+
+# ===================================================================
+# Object detection
+# ===================================================================
+
+
+class TestObjectDetection:
+    """Test object-detection flag processing."""
+
+    def test_cell_phone_fires_medium(self) -> None:
+        agg = _make_aggregator()
+        decisions = agg.process_object_detection(
+            _make_object_result("cell phone"),
+            telemetry_event_id=uuid.uuid4(),
+            now=_NOW,
+        )
+        assert len(decisions) >= 1
+        assert decisions[0].severity == "medium"
+        assert decisions[0].rule_code == RULE_OBJECT_DETECTED
+
+    def test_laptop_fires_medium(self) -> None:
+        agg = _make_aggregator()
+        decisions = agg.process_object_detection(
+            _make_object_result("laptop"),
+            telemetry_event_id=uuid.uuid4(),
+            now=_NOW,
+        )
+        assert decisions[0].severity == "medium"
+
+    def test_object_accumulates_score(self) -> None:
+        agg = _make_aggregator(
+            policy=_default_policy(medium_score_termination_threshold=100.0)
+        )
+        agg.process_object_detection(
+            _make_object_result("cell phone"),
+            telemetry_event_id=uuid.uuid4(),
+            now=_NOW,
+        )
+        assert agg.accumulated_score == 1.0
+
+    def test_object_triggers_accumulated_termination(self) -> None:
+        agg = _make_aggregator(
+            policy=_default_policy(medium_score_termination_threshold=1.0)
+        )
+        decisions = agg.process_object_detection(
+            _make_object_result("cell phone"),
+            telemetry_event_id=uuid.uuid4(),
+            now=_NOW,
+        )
+        acc_flags = [d for d in decisions if d.rule_code == RULE_ACCUMULATED_SCORE]
+        assert len(acc_flags) == 1
+        assert acc_flags[0].triggered_termination is True
+
+
+# ===================================================================
+# Book-detection severity
+# ===================================================================
+
+
+class TestBookSeverity:
+    """Test book-detection severity resolution."""
+
+    def test_closed_book_flags(self) -> None:
+        assert should_flag_book("closed_book", {}) is True
+
+    def test_open_book_no_flag(self) -> None:
+        assert should_flag_book("open_book", {}) is False
+
+    def test_specific_list_book_allowed(self) -> None:
+        assert should_flag_book(
+            "specific_list",
+            {"allowed_items": ["book", "calculator"]},
+        ) is False
+
+    def test_specific_list_book_not_allowed(self) -> None:
+        assert should_flag_book(
+            "specific_list",
+            {"allowed_items": ["calculator"]},
+        ) is True
+
+    def test_specific_list_empty(self) -> None:
+        assert should_flag_book("specific_list", {}) is True
+
+    def test_unknown_policy_flags(self) -> None:
+        assert should_flag_book("something_unknown", {}) is True
+
+    def test_book_detection_closed_book_session(self) -> None:
+        """End-to-end: book detected in closed-book session → MEDIUM flag."""
+        agg = _make_aggregator(
+            context=_default_context(allowed_reference_materials="closed_book"),
+        )
+        decisions = agg.process_object_detection(
+            _make_object_result("book"),
+            telemetry_event_id=uuid.uuid4(),
+            now=_NOW,
+        )
+        book_flags = [d for d in decisions if d.rule_code == BOOK_RULE_CODE]
+        assert len(book_flags) == 1
+        assert book_flags[0].severity == BOOK_FLAG_SEVERITY
+
+    def test_book_detection_open_book_session(self) -> None:
+        """Book detected in open-book session → no flag."""
+        agg = _make_aggregator(
+            context=_default_context(allowed_reference_materials="open_book"),
+        )
+        decisions = agg.process_object_detection(
+            _make_object_result("book"),
+            telemetry_event_id=uuid.uuid4(),
+            now=_NOW,
+        )
+        assert decisions == []
+
+    def test_book_specific_list_allowed(self) -> None:
+        agg = _make_aggregator(
+            context=_default_context(
+                allowed_reference_materials="specific_list",
+                permitted_material_details={"allowed_items": ["book"]},
+            ),
+        )
+        decisions = agg.process_object_detection(
+            _make_object_result("book"),
+            telemetry_event_id=uuid.uuid4(),
+            now=_NOW,
+        )
+        assert decisions == []
+
+    def test_book_specific_list_not_allowed(self) -> None:
+        agg = _make_aggregator(
+            context=_default_context(
+                allowed_reference_materials="specific_list",
+                permitted_material_details={"allowed_items": ["calculator"]},
+            ),
+        )
+        decisions = agg.process_object_detection(
+            _make_object_result("book"),
+            telemetry_event_id=uuid.uuid4(),
+            now=_NOW,
+        )
+        book_flags = [d for d in decisions if d.rule_code == BOOK_RULE_CODE]
+        assert len(book_flags) == 1
+
+
+# ===================================================================
+# Exemption suppression
+# ===================================================================
+
+
+class TestExemptionSuppression:
+    """Test accommodation-exemption lookup and suppression."""
+
+    def _make_exemption(
+        self,
+        object_class: str = "cell phone",
+        **overrides: object,
+    ) -> ExemptionRecord:
+        defaults: dict[str, object] = {
+            "id": uuid.uuid4(),
+            "participant_id": _PARTICIPANT,
+            "object_class": object_class,
+            "exam_reference": _EXAM_REF,
+            "effective_at": _NOW - timedelta(hours=1),
+            "expires_at": None,
+        }
+        defaults.update(overrides)
+        return ExemptionRecord(**defaults)  # type: ignore[arg-type]
+
+    def test_matching_exemption(self) -> None:
+        ex = self._make_exemption()
+        result = find_matching_exemption(
+            _PARTICIPANT, "cell phone", _EXAM_REF, _NOW, [ex],
+        )
+        assert result is ex
+
+    def test_wrong_participant(self) -> None:
+        ex = self._make_exemption(participant_id=uuid.uuid4())
+        result = find_matching_exemption(
+            _PARTICIPANT, "cell phone", _EXAM_REF, _NOW, [ex],
+        )
+        assert result is None
+
+    def test_wrong_class(self) -> None:
+        ex = self._make_exemption(object_class="laptop")
+        result = find_matching_exemption(
+            _PARTICIPANT, "cell phone", _EXAM_REF, _NOW, [ex],
+        )
+        assert result is None
+
+    def test_wrong_exam(self) -> None:
+        ex = self._make_exemption(exam_reference="other-exam")
+        result = find_matching_exemption(
+            _PARTICIPANT, "cell phone", _EXAM_REF, _NOW, [ex],
+        )
+        assert result is None
+
+    def test_not_yet_effective(self) -> None:
+        ex = self._make_exemption(effective_at=_NOW + timedelta(hours=1))
+        result = find_matching_exemption(
+            _PARTICIPANT, "cell phone", _EXAM_REF, _NOW, [ex],
+        )
+        assert result is None
+
+    def test_expired(self) -> None:
+        ex = self._make_exemption(
+            effective_at=_NOW - timedelta(hours=2),
+            expires_at=_NOW - timedelta(hours=1),
+        )
+        result = find_matching_exemption(
+            _PARTICIPANT, "cell phone", _EXAM_REF, _NOW, [ex],
+        )
+        assert result is None
+
+    def test_expires_at_boundary(self) -> None:
+        """Expires exactly at ``now`` → expired (not active)."""
+        ex = self._make_exemption(
+            effective_at=_NOW - timedelta(hours=1),
+            expires_at=_NOW,
+        )
+        result = find_matching_exemption(
+            _PARTICIPANT, "cell phone", _EXAM_REF, _NOW, [ex],
+        )
+        assert result is None
+
+    def test_no_expiry_stays_active(self) -> None:
+        ex = self._make_exemption(expires_at=None)
+        result = find_matching_exemption(
+            _PARTICIPANT, "cell phone", _EXAM_REF, _NOW, [ex],
+        )
+        assert result is ex
+
+    def test_empty_list(self) -> None:
+        result = find_matching_exemption(
+            _PARTICIPANT, "cell phone", _EXAM_REF, _NOW, [],
+        )
+        assert result is None
+
+    def test_suppressed_flag_has_low_severity(self) -> None:
+        """Object with matching exemption → severity downgraded to LOW."""
+        ex = self._make_exemption(object_class="cell phone")
+        agg = _make_aggregator(
+            context=_default_context(exemptions=[ex]),
+        )
+        decisions = agg.process_object_detection(
+            _make_object_result("cell phone"),
+            telemetry_event_id=uuid.uuid4(),
+            now=_NOW,
+        )
+        assert len(decisions) == 1
+        assert decisions[0].severity == SUPPRESSED_SEVERITY
+        assert decisions[0].suppressed_by_exemption_id == ex.id
+
+    def test_suppressed_flag_does_not_accumulate(self) -> None:
+        """A suppressed (LOW severity) flag does not add to accumulated score."""
+        ex = self._make_exemption(object_class="cell phone")
+        agg = _make_aggregator(
+            context=_default_context(exemptions=[ex]),
+        )
+        agg.process_object_detection(
+            _make_object_result("cell phone"),
+            telemetry_event_id=uuid.uuid4(),
+            now=_NOW,
+        )
+        assert agg.accumulated_score == 0.0
+
+    def test_non_matching_exemption_no_suppression(self) -> None:
+        """Exemption for a different class → normal MEDIUM flag."""
+        ex = self._make_exemption(object_class="laptop")
+        agg = _make_aggregator(
+            context=_default_context(exemptions=[ex]),
+        )
+        decisions = agg.process_object_detection(
+            _make_object_result("cell phone"),
+            telemetry_event_id=uuid.uuid4(),
+            now=_NOW,
+        )
+        assert decisions[0].severity == "medium"
+        assert decisions[0].suppressed_by_exemption_id is None
+
+
+# ===================================================================
+# Package imports
+# ===================================================================
+
+
+class TestPackageExports:
+    """Verify the fusion package re-exports the expected symbols."""
+
+    def test_types_importable(self) -> None:
+        from proctoring_engine.fusion import FlagDecision, GazeAwayEvent
+        assert FlagDecision is not None
+        assert GazeAwayEvent is not None
+
+    def test_aggregator_importable(self) -> None:
+        from proctoring_engine.fusion import (
+            PolicySnapshot,
+            SessionAggregator,
+            SessionContext,
+        )
+        assert PolicySnapshot is not None
+        assert SessionAggregator is not None
+        assert SessionContext is not None
+
+    def test_exemptions_importable(self) -> None:
+        from proctoring_engine.fusion import (
+            ExemptionRecord,
+            find_matching_exemption,
+        )
+        assert ExemptionRecord is not None
+        assert find_matching_exemption is not None
+
+    def test_book_severity_importable(self) -> None:
+        from proctoring_engine.fusion import (
+            BOOK_FLAG_SEVERITY,
+            BOOK_RULE_CODE,
+            should_flag_book,
+        )
+        assert BOOK_FLAG_SEVERITY is not None
+        assert BOOK_RULE_CODE is not None
+        assert should_flag_book is not None
+
+    def test_rule_constants_importable(self) -> None:
+        from proctoring_engine.fusion import (
+            RULE_ACCUMULATED_SCORE,
+            RULE_BROWSER_EVENT,
+            RULE_GAZE_AWAY_FREQUENCY,
+            RULE_OBJECT_DETECTED,
+            RULE_SECOND_PERSON,
+        )
+        assert RULE_SECOND_PERSON == "second_person"
+        assert RULE_GAZE_AWAY_FREQUENCY == "gaze_away_frequency"
+        assert RULE_ACCUMULATED_SCORE == "accumulated_score"
+        assert RULE_OBJECT_DETECTED == "object_detected"
+        assert RULE_BROWSER_EVENT == "browser_event"

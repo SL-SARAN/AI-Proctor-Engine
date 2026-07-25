@@ -6,7 +6,19 @@ One subsection per modality. Each covers: what runs, the exact input/output cont
 
 ## 1. Face presence/count
 
-**Model:** MediaPipe Face Detection (BlazeFace short-range), classic `mp.solutions` API. Runs client-side, every frame.
+**Model:** MediaPipe Tasks API, `mediapipe.tasks.python.vision.FaceDetector` (BlazeFace short-range — the same underlying detector the original `mp.solutions.face_detection` used). Runs client-side, every frame.
+
+> **Correction (2026-07-24):** originally speced against `mp.solutions`,
+> which is no longer present in current `mediapipe` releases (confirmed:
+> 0.10.31+ raises `AttributeError: module 'mediapipe' has no attribute
+> 'solutions'`). The Tasks API `FaceDetector` is the direct replacement —
+> same detector model, different call surface. One load-bearing
+> difference: the model bundle (`.task` file) is downloaded from
+> `storage.googleapis.com` at first run rather than bundled in the pip
+> wheel. For the client-side (browser) case specifically, use the
+> `@mediapipe/tasks-vision` NPM package's JS/WASM build, which has the
+> equivalent contract — don't assume the Python package applies
+> unmodified to the browser runtime.
 
 **Contract:** input is a single video frame; output is a list of detected faces, each with a bounding box and a detection confidence score.
 
@@ -32,7 +44,7 @@ One subsection per modality. Each covers: what runs, the exact input/output cont
 
 Already fully speced in the original document (§3.1) — restating the module contract here for completeness rather than re-deriving it:
 
-**Input:** MediaPipe Face Mesh landmarks (478 points, iris-refined) from a heavy-check frame.
+**Input:** MediaPipe Tasks API `FaceLandmarker` output (478 points, iris-refined, via `output_face_blendshapes=True`) from a heavy-check frame — confirmed the same landmark count and iris refinement the original `mp.solutions.face_mesh` spec assumed; see the correction note in §1 above for why this is `FaceLandmarker` rather than `face_mesh`.
 
 **Three derived signals:** (a) head pose (yaw/pitch/roll) via OpenCV `solvePnP` against the landmark set; (b) Eye Aspect Ratio from eye landmark points, to exclude blinks; (c) iris-position offset relative to eye-corner landmarks.
 
@@ -54,7 +66,15 @@ Also fully speced (§3.2) — module contract:
 
 ## 5. Audio (voice activity / multiple speakers)
 
-**Model:** `webrtcvad` for speech/silence detection — no external download, ships with the package.
+**Model:** `webrtcvad-wheels` for speech/silence detection — a MIT-licensed fork of `webrtcvad` with an identical `import webrtcvad` API, ships prebuilt wheels for Windows/macOS/Linux across Python 3.6–3.13.
+
+> **Correction (2026-07-24):** base `webrtcvad` has no Windows wheel on
+> PyPI and fails to build there without MSVC Build Tools (a long-standing,
+> well-documented limitation — confirmed via multiple GitHub issues going
+> back to 2019, not something new or sandbox-specific). `webrtcvad-wheels`
+> is a drop-in replacement: same module name (`webrtcvad`), same class
+> (`webrtcvad.Vad`), same `is_speech()` call shape — no code changes
+> needed beyond the `pyproject.toml` dependency line.
 
 **Input:** a preprocessed audio chunk at an accepted sample rate, split into accepted frame durations (see preprocessing doc).
 

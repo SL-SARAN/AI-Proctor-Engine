@@ -218,15 +218,16 @@ These are unresolved per `docs/00-index-and-architecture-flow.md`
 and `docs/01-data-models-design.md`. A turn that resolves any of
 them silently is non-conformant.
 
-1. **Admin / reviewer identity** — the next atomic layer is to add
-   an `AdminUser` table and migrate the three string references
-   (`AccommodationExemption.approved_by`, `PolicyConfig.created_by`,
-   `ProctorReview.reviewer_reference`) to FKs.
-2. **Accumulated-score termination path** — `MEDIUM` flags adding
-   to a weighted `accumulated_medium_score` with a termination
-   threshold vs. keeping `MEDIUM` purely advisory. The schema is
-   now ready; the fusion-engine implementation and the user
-   confirmation are still open.
+1. **Admin / reviewer identity** — **Resolved.** `AdminUser` table
+   is part of the initial schema. FK columns `created_by_id`,
+   `approved_by_admin_id`, `reviewer_admin_id` alongside original
+   string fields for backward compatibility.
+2. **Accumulated-score termination path** — **Resolved (2026-07-25,
+   turn N+5).** Path is wanted. Single running accumulator across
+   all `MEDIUM` flags via `ExamSession.accumulated_medium_score`.
+   Threshold in `PolicyConfig.medium_score_termination_threshold`;
+   `0` is the documented disable sentinel. Implemented by
+   `SessionAggregator` in `src/proctoring_engine/fusion/aggregator.py`.
 3. **Embedding storage** — `pgvector` extension vs. application-
    computed float array. Settled for v1 as JSONB float array;
    revisitable if a "search across many embeddings" use case
@@ -234,15 +235,28 @@ them silently is non-conformant.
 
 ## 8. Library / model availability — what is verified to exist
 
+> **Correction (2026-07-24):** the `mp.solutions` row below was marked
+> "Yes" (verified) in error. Confirmed via multiple live GitHub issues
+> that `mediapipe` 0.10.31+ no longer ships `mp.solutions` at all —
+> `AttributeError: module 'mediapipe' has no attribute 'solutions'`.
+> This was a package-version removal, not a Python-version or
+> sandbox-specific issue; pinning Python does not restore it. The Tasks
+> API replacement (`FaceDetector` / `FaceLandmarker`) is now the v1
+> choice, not deferred to "not in v1" as the table previously said.
+> `webrtcvad` is also corrected below: base `webrtcvad` has no Windows
+> wheel and requires MSVC Build Tools to compile there; `webrtcvad-wheels`
+> (identical API, MIT-licensed fork) is the corrected v1 choice.
+
 | Component | Source | Verified here? |
 |---|---|---|
-| MediaPipe `mp.solutions` (Face Detection, Face Mesh) | pip package, weights bundled | Yes |
-| `webrtcvad` | pip package, no external download | Yes |
+| MediaPipe Tasks API — `FaceDetector`, `FaceLandmarker` (w/ blendshapes) | pip package `mediapipe`; model bundle (`.task` file) downloaded from `storage.googleapis.com` at first run, **not** bundled in the wheel | Yes — API surface and 478-landmark/blendshape output confirmed against current Google documentation; bake the `.task` file into the build rather than relying on a runtime fetch |
+| ~~MediaPipe `mp.solutions`~~ | ~~pip package, weights bundled~~ | **No longer exists in current `mediapipe` releases (0.10.31+) — do not use** |
+| `webrtcvad-wheels` | pip package, prebuilt wheels (Windows/macOS/Linux, Python 3.6–3.13), no external download | Yes |
+| ~~`webrtcvad` (base)~~ | ~~pip package, no external download~~ | **No Windows wheel; needs MSVC Build Tools to compile there — use `webrtcvad-wheels` instead** |
 | YOLOv8 (Ultralytics) | weights auto-download from GitHub Releases at first run | Yes |
 | `face_recognition` (dlib ResNet) | pip-installable, weights ship with dlib | Implementation choice pending |
 | `DeepFace` | weights download from GitHub release assets | Implementation choice pending |
 | `pgvector` | Postgres extension | **Not used in v1** |
-| MediaPipe Tasks API (newer) | model bundles fetched from external host | Not in v1 |
 | `pyannote.audio` | Hugging Face-hosted, license-gated | **Explicitly out of v1** |
 | Cloudflare R2 | S3-compatible | Production storage backend |
 | MinIO | S3-compatible, self-hosted | Local dev stand-in for R2 |

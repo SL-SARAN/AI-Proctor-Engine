@@ -112,13 +112,40 @@ is non-conformant under `SKILLS_ALIGNMENT.md` §7.
    has been removed; `tests/test_migration_chain.py` enforces the
    invariant that no post-initial migration may re-add anything the
    initial migration already emits.
-2. **Accumulated-score termination path** — `MEDIUM` flags adding
-   weighted increments to `ExamSession.accumulated_medium_score`,
-   with a `medium_score_termination_threshold` that triggers a
-   `CRITICAL` flag. The schema is now ready (both fields exist);
-   the fusion-engine implementation and the user-confirmation that
-   the path is wanted at all are still open.
-3. **Embedding storage mechanism** — `pgvector` extension vs.
+2. **Accumulated-score termination path** — **Resolved
+   (2026-07-25, turn N+5).** Path is wanted; single running
+   accumulator across all `MEDIUM` flags on
+   `ExamSession.accumulated_medium_score`. Threshold set by
+   `PolicyConfig.medium_score_termination_threshold` before the
+   exam starts as part of the versioned `PolicyConfig` snapshot
+   (not adjustable mid-session). Threshold of 0 is the documented
+   disable sentinel (`ck_policy_medium_score_threshold_nonnegative`
+   permits 0). Weight per `rule_code` is supplied via the
+   `PolicySnapshot.score_weights` constructor argument (production
+   builds load this from `PolicyConfig.extra_rules` JSONB via the
+   orchestration layer, not yet built); default 1.0 per `MEDIUM`
+   flag. The `SessionAggregator` implements Path 3
+   (`docs/05-fusion-flagging-engine-design.md`).
+3. **Resume / reinstatement after termination** — **Resolved
+   (2026-07-25, turn N+5): explicitly out of v1.** The engine is a
+   proctoring sidecar; the LMS owns and delivers the quiz. The
+   engine terminates the proctoring session (lock capture client,
+   seal evidence, LTI AGS score submission). The instructor uses
+   the LMS's native tools (e.g. Canvas "Moderate Quiz") to reopen
+   attempts or adjust grades, informed by the engine's evidence
+   dashboard. This avoids per-LMS proprietary integration for
+   capability the LMS already has natively.
+4. **Browser client capture architecture** — **Resolved (2026-07-25,
+   turn N+5): LTI launch → capture client as the active browser
+   tab.** The LMS quiz runs inside an iframe (or as a separate URL
+   navigated to after proctoring setup). Capture client captures
+   webcam/mic via `getUserMedia` and browser events on its own
+   document (`visibilitychange`, `blur`, `fullscreenchange`,
+   `copy`/`paste`/`contextmenu`). Browser-extension and companion-
+   window approaches were rejected: extensions are a deployment
+   barrier (per-LMS installation), can be disabled by the student,
+   and break the "LTI is the integration contract" boundary.
+5. **Embedding storage mechanism** — `pgvector` extension vs.
    application-computed float array. Settled for v1 as JSONB float
    array. Revisitable if a "search across many embeddings" use case
    appears.
@@ -237,60 +264,53 @@ the `ON DELETE RESTRICT` behavior on `flags.policy_config_id`.
 
 ## 9. The shape of the next session
 
-The **LTI 1.3 ingestion layer** is now complete (turns N + N+1).
-Turn N landed the foundation (`LtiSettings`, claim parsing, role
-mapping, `LaunchStateStore`, the HS256 session token, OIDC
-discovery, and JWKS fetchers). Turn N+1 landed the launch routes
-(`GET /lti/login` and `POST /lti/launch`), the `process_launch`
-service, the OIDC test double, and 9 PostgreSQL integration
-tests. The launch is a single atomic transaction; the route
-commits after `process_launch` returns. A closed error-code
-enumeration (`signature_invalid`, `claims_invalid`,
-`policy_not_found`, `state_unknown`, `state_expired`,
-`nonce_mismatch`, `audience_invalid`, `issuer_invalid`,
-`discovery_error`) maps each failure to a deterministic HTTP
-status. `LaunchStateStore.consume` now returns a
-`(redirect_uri, lti_issuer)` tuple; a new `LaunchStateStore.peek`
-lets the route validate the `iss` claim against the
-state-registered issuer before the OIDC discovery fetch
-(rejects cross-issuer state-reuse without an outbound HTTP
-call). 134 unit tests + 9 PostgreSQL integration tests pass.
+The **fusion & flagging engine** is now complete (turn N+5). The
+**evidence & audit store** is the next atomic layer.
 
-The next layer is the **authenticated WebSocket protocol** —
-the `docs/02-ingestion-layer-design.md` §2–§4 envelope (the
-JSON envelope that wraps every inbound and outbound frame),
-sparse-frame handling, the kill-switch, and the per-frame ack.
-The WebSocket is the transport the exam client uses to push
-sparse telemetry frames after the launch redirect lands the
-learner on the exam client. The session token issued at launch
-is the auth credential for the WebSocket handshake; the same
-HS256 secret signs it. The session token is verified at the
-handshake; per-frame authentication is by the same token in the
-envelope (or by a short-lived ack token derived from it). The
-WebSocket is also the channel through which the server sends
-the `kill-switch` and the per-frame `ack`. The next-turn
-deliverables are described in detail in
-`docs/02-ingestion-layer-design.md` §2–§4.
+### What is built (turns N through N+5)
 
-Specifically, the next layer delivers:
+| Turn | Layer | Tests |
+|---|---|---|
+| N | LTI 1.3 foundation (`LtiSettings`, claims, roles, `LaunchStateStore`, session token, OIDC discovery, JWKS) | 70 unit |
+| N+1 | LTI 1.3 launch routes + `process_launch` service + OIDC test double + PostgreSQL integration | 134 unit + 9 integration |
+| N+2 | Authenticated WebSocket protocol (envelope, sparse frames, kill-switch, ack) | 88 unit |
+| N+3 | Preprocessing (frame decode, audio pipeline, tiered scheduler, rolling buffer contract) | 127 unit |
+| N+4 | Inference modules (face presence, identity match, head pose/gaze, object detection, audio VAD, browser events) | 79 unit |
+| N+5 | Fusion & flagging engine (3 termination paths + exemption suppression + book severity) | 68 unit |
 
-- A `WebSocketEnvelope` Pydantic model for the frame envelope
-  (sparse, typed, with the `provenance` field that ties every
-  inbound frame to the `TelemetryEvent` it will create).
-- A `frame_router` (or equivalent) that decodes the envelope,
-  dispatches to the preprocessing layer, and emits the
-  `ack` per frame.
-- A `kill_switch` channel — server-initiated, with a
-  non-`2xx` close code that the client treats as
-  "terminate the session immediately."
-- A `consume_session_token` step at the WebSocket handshake
-  (the same HS256 token issued at launch; one-shot — the token
-  is consumed at the handshake and the WS layer uses a derived
-  ack token for per-frame authentication).
-- Integration tests against a real PostgreSQL engine that verify
-  the WebSocket layer's persistence invariants (the
-  `TelemetryEvent` is created with the right
-  `provenance`; the `Flag` (if any) carries the structural
-  proof path; the `EvidenceArtifact` checksum is set; the
-  rolling buffer is **never** transmitted during normal
-  operation — flush only on a confirmed flag).
+**Total: 504 unit tests passing, 16 PostgreSQL integration tests passing.**
+
+### Library availability (2026-07-24 corrections applied)
+
+- **MediaPipe Tasks API** — `FaceDetector`, `FaceLandmarker` (478 iris-refined landmarks, blendshapes). Bundle (`.task`) path via `MP_FACE_DETECTOR_BUNDLE` / `MP_FACE_LANDMARKER_BUNDLE` env vars.
+- **`webrtcvad-wheels`** — prebuilt wheels, Windows-friendly.
+- **YOLOv8 (Ultralytics)** — weights via `YOLO_WEIGHTS_PATH` env var.
+- **`face_recognition` (dlib ResNet, 128-d)** — env-var contract; Windows tests `importorskip`-gated.
+
+### Open decisions (do not silently resolve)
+
+Per `SKILLS_ALIGNMENT.md` §7, these still require explicit user choice:
+
+1. **WebSocket affinity / gateway architecture** — at "thousands of sessions" scale, the sticky-LB approach breaks down past ~10 replicas. Choose: (a) stateful WebSocket gateway, or (b) managed WebSocket product (Cloudflare Durable Objects / Ably / Pusher).
+2. **Redis-backed `LaunchStateStore`** — the process-local store is incorrect at the documented initial sizing of 2 API replicas. Needs Redis-backed implementation before multi-replica deployment.
+
+### Resolved this turn (turn N+5)
+
+- **Accumulated-score termination path** — single running `accumulated_medium_score` across all `MEDIUM` flags; threshold set pre-exam via `PolicyConfig.medium_score_termination_threshold`; `0` is the documented disable sentinel. Per-`rule_code` weight is supplied to the aggregator via `PolicySnapshot.score_weights` (default 1.0); production builds load this from `PolicyConfig.extra_rules` JSONB via the orchestration layer.
+- **Resume / reinstatement** — explicitly out of v1. Engine is a proctoring sidecar; LMS handles attempt lifecycle through its own tools.
+- **Browser client capture architecture** — LTI launch → capture client as the active browser tab; LMS quiz in iframe. Browser-extension and companion-window approaches rejected.
+
+### Resolved this turn (turn N+4)
+
+- Identity-match library: `face_recognition` (dlib).
+- MediaPipe bundle path: env var.
+- YOLO weights path: env var.
+
+### The next atomic layer
+
+**Evidence & audit store** — the S3-compatible evidence-storage
+adapter (R2 in production, MinIO locally), checksum verification,
+retention-deletion job, and the orchestrator-side wiring of the
+`EvidenceArtifact` row. See `docs/06-evidence-audit-store-design.md`.
+This is what backs the "sealed evidence bundle" the fusion engine's
+`triggered_termination` decision ultimately produces.

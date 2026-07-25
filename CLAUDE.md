@@ -118,13 +118,19 @@ touching code.
   134 unit tests pass on SQLite; 9 PostgreSQL integration tests cover
   the JSONB-column preservation, the `consent_recorded_at` /
   `started_at` invariants, and the upsert semantics.
+- Authenticated WebSocket protocol (turn N+2): envelope types,
+  discriminated-union dispatch, sparse-frame ingestion, kill-switch
+  delivery with ack/retry grace, telemetry event buffer, FastAPI
+  `/ws` endpoint. 88 unit tests pass.
+- Preprocessing layer (turn N+3): frame decode (`cv2.imdecode` +
+  BGR→RGB for MediaPipe, pass-through for YOLOv8), audio decode
+  (PCM-16 LE/BE → int16 numpy, resample, VAD-frame split, RMS
+  dBFS), stateless modality scheduler, server-side rolling-buffer
+  contract. 127 unit tests pass. Dependencies:
+  `opencv-python-headless`, `numpy`, `Pillow`.
 
 ## What is **not** built today (the unchecked items on the checklist)
 
-- Authenticated WebSocket protocol (envelope, sparse frames,
-  kill-switch, ack).
-- Preprocessing layer (decode, tiered scheduler, rolling buffer
-  contract).
 - Inference modules (6 modalities).
 - Fusion & flagging engine (3 paths + exemption suppression).
 - Evidence store (S3-compatible adapter, checksums, retention
@@ -188,8 +194,8 @@ of truth for each layer's contract. The locked spec at
 requirements. `docs/DEPLOYMENT.md` is the source of truth for the
 deployment topology, sizing, and secrets model.
 
-The next atomic layer is the **authenticated WebSocket
-protocol** — the envelope, sparse-frame handling, kill-switch,
-and per-frame ack that the exam client uses to push sparse
-telemetry frames after the launch redirect lands the learner on
-the exam client.
+The next atomic layer is the **inference modules** — the six
+server-side modalities (face presence, identity match, head
+pose / gaze, object detection, audio VAD, browser events) that
+consume the decoded, normalised output of the preprocessing
+layer.  See `docs/04-inference-modules-design.md`.

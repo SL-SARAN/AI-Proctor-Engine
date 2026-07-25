@@ -13,11 +13,29 @@ Status: pre-implementation. This is the locked plan the Data Models layer (next 
 | LMS integration | LTI 1.3 (OAuth2/JWT) | Industry-standard protocol supported by Canvas, Moodle, Blackboard, etc. — implementable as FastAPI routes, independent of the ML stack |
 | Transport | WebSocket, tiered sampling | Client-side lightweight checks send only results (never raw frames); server-side heavy checks receive a downsampled frame every 2–3s (configurable), not full webcam rate. Same connection carries the kill-switch command back down. Chosen over WebRTC since v1 is fully automated checks, not live human-proctor video viewing — reopen WebRTC if that becomes a requirement, since it needs real STUN/TURN/SFU infrastructure this doesn't. |
 | Persistence | Postgres (session/event/flag metadata) + S3-compatible object storage (evidence blobs) | Relational integrity + ACID transactions for the audit trail; object storage's lifecycle policies tie directly into `retention_expires_at` |
-| Scale | Moderate concurrency (tens–low hundreds of simultaneous sessions), async worker pool, horizontally scalable later | Confirmed — heavy inference gets decoupled from request-handling via a task queue so a burst of frames doesn't block the event loop; horizontally scalable app servers behind a load balancer |
+| Scale | **Thousands of concurrent sessions**, async worker pool, horizontally scalable via Kubernetes | Revised 2026-07-24 per explicit user confirmation — originally locked as "moderate concurrency (tens–low hundreds)"; heavy inference is still decoupled from request-handling via a task queue so a burst of frames doesn't block the event loop, but worker-pool and GPU sizing for the inference layer must now be planned against thousands of sessions, not low hundreds — this changes the batching/autoscaling design for the not-yet-built inference layer, and raises the priority of the WebSocket ingress-affinity limit already noted in `docs/DEPLOYMENT.md` |
 | Compliance jurisdiction | **Not assumed** | I'm not a lawyer and won't hardcode retention/consent rules to a specific law. Data model will have generic `consent_recorded_at`, `retention_expires_at` fields you configure per your jurisdiction's requirements. |
 | Termination policy | **Auto-terminate on zero-tolerance violation (v1)**, severity-threshold **configurable** in a policy table, not hardcoded | Per your instruction — changeable in later versions without a schema/code rewrite |
 
-A note on library availability: some of what follows (MediaPipe's newer Tasks API, some diarization models) fetch model weight bundles from hosts outside my dev sandbox's allowlist. That's a constraint on *my ability to test-run code in this conversation* — it is not necessarily a constraint on your production server, which will have normal internet access. I'll flag per-modality below which approach ships weights inside the pip package (verifiable here) versus needs a runtime download (verify in your own environment before relying on it).
+> **Amendment (2026-07-24):** Rows 1, 3, and 5 of §2 below were originally
+> written against `mp.solutions` (legacy MediaPipe) and base `webrtcvad`.
+> Both assumptions were invalidated during implementation and have been
+> corrected here rather than left silently wrong in a "locked" document:
+> - `mp.solutions` (Face Detection, Face Mesh) has been progressively
+>   stripped from the `mediapipe` PyPI package since Google's 2023
+>   deprecation announcement; confirmed via multiple live GitHub issues
+>   that `mediapipe` 0.10.31+ raises `AttributeError: module 'mediapipe'
+>   has no attribute 'solutions'`. This is a package-version issue, not a
+>   Python-version issue — pinning to Python 3.11 does not restore it.
+> - Base `webrtcvad` has no Windows wheel on PyPI and requires MSVC Build
+>   Tools to compile from source on Windows — a long-standing, well-documented
+>   limitation, not new.
+> - Rows 1, 3, and 5 below now name the corrected libraries. The
+>   underlying contracts (478 iris-refined landmarks, BlazeFace short-range
+>   detection, EAR-based blink filtering, the VAD API shape) are unchanged
+>   — only the library surface is corrected.
+
+A note on library availability: model weight/bundle provenance differs by modality below. I'll flag per-modality which approach ships weights inside the pip package (verifiable in my dev sandbox) versus needs a runtime download from an external host (not on my sandbox's allowlist — verify reachability from your actual deployment environment, e.g. egress from your Kubernetes cluster to `storage.googleapis.com`, or bake the model file into the container image at build time instead of relying on a runtime fetch).
 
 ---
 
@@ -25,11 +43,11 @@ A note on library availability: some of what follows (MediaPipe's newer Tasks AP
 
 | # | Modality | Method | Runs | Model source | Output |
 |---|---|---|---|---|---|
-| 1 | Face presence/count | MediaPipe Face Detection (BlazeFace short-range), classic `mp.solutions` API | Client, every frame | Weights bundled in pip package — verifiable | face count, confidence, bounding box(es) |
+| 1 | Face presence/count | MediaPipe Tasks API, `mediapipe.tasks.python.vision.FaceDetector` (BlazeFace short-range — same underlying detector `mp.solutions` used) | Client, every frame | Model bundle (`.task` file) downloaded from `storage.googleapis.com` at first run, **not** bundled in the pip wheel — bake it into the client/container build rather than fetching at runtime | face count, confidence, bounding box(es) |
 | 2 | Identity match vs enrollment | Face embedding + cosine similarity against enrollment photo | Server, every N seconds | **Needs a distinct library** — MediaPipe's own documentation is explicit that iris/face-mesh tracking "does not... provide any form of identity recognition." Candidates: `face_recognition` (dlib ResNet embeddings, pip-installable, weights ship with dlib) or `DeepFace` (wraps FaceNet/ArcFace, downloads weights from GitHub release assets at first run — verify in your environment). I'll confirm the exact choice at implementation time rather than assume. | similarity score (0–1), confidence interval |
-| 3 | Head pose / "gaze" | MediaPipe Face Mesh w/ iris refinement (478 landmarks) + OpenCV `solvePnP` for head pose; iris-position-relative-to-eye-corner as a coarse looking-away heuristic | Client (head pose) + server (fused with other signals) | Weights bundled in pip package | pitch/yaw/roll angles, on-screen/off-screen classification, confidence |
+| 3 | Head pose / "gaze" | MediaPipe Tasks API, `mediapipe.tasks.python.vision.FaceLandmarker` with `output_face_blendshapes=True` (confirmed: same 478 iris-refined landmarks `mp.solutions.face_mesh` produced) + OpenCV `solvePnP` for head pose; iris-position-relative-to-eye-corner as a coarse looking-away heuristic | Client (head pose) + server (fused with other signals) | Same `.task` model bundle as row 1's detector family — downloaded from `storage.googleapis.com` at first run, not bundled in the pip wheel | pitch/yaw/roll angles, on-screen/off-screen classification, confidence |
 | 4 | Object detection — denylist (phone, laptop, 2nd screen; book conditional) | YOLOv8 (Ultralytics), pretrained on COCO — see 3.2 for scope and rationale | Server, every N seconds | Ultralytics YOLOv8 weights auto-download from GitHub Releases at first run — this host is on my sandbox's allowlist, unlike MediaPipe's newer Tasks-API bundles, so this is verifiable here | object class, confidence, bounding box |
-| 5 | Audio (voice activity / multiple speakers) | `webrtcvad` for speech/silence detection (no external download, tiny footprint); full multi-speaker diarization (e.g. `pyannote.audio`) needs Hugging Face-hosted models with license gating — **not proposed for v1** in favor of a simpler ambient-noise + voice-activity-above-baseline heuristic | Server, rolling audio chunks | VAD: bundled. Diarization: flagged as a v2 candidate requiring separate verification | speech/silence flag, decibel level, (v2: speaker count) |
+| 5 | Audio (voice activity / multiple speakers) | `webrtcvad-wheels` (MIT-licensed fork of `webrtcvad`, identical `import webrtcvad` API) for speech/silence detection — base `webrtcvad` has no Windows wheel on PyPI and requires MSVC Build Tools to compile there; the fork ships prebuilt wheels for Windows/macOS/Linux across Python 3.6–3.13. Full multi-speaker diarization (e.g. `pyannote.audio`) needs Hugging Face-hosted models with license gating — **not proposed for v1** in favor of a simpler ambient-noise + voice-activity-above-baseline heuristic | Server, rolling audio chunks | VAD: bundled, prebuilt wheel, no compiler needed on any target OS. Diarization: flagged as a v2 candidate requiring separate verification | speech/silence flag, decibel level, (v2: speaker count) |
 | 6 | Browser events (tab blur, fullscreen exit) | Native DOM events: `visibilitychange`, `blur`/`focus`, `fullscreenchange`, `copy`/`paste`/`contextmenu` | Client, event-driven (no polling) | No ML — plain JS listeners | event type, timestamp |
 
 ---

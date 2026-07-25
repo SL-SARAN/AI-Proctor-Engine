@@ -81,6 +81,45 @@ behavior the CI workflow relies on.
 
 ## 3. Sizing for "a few thousand users, easily scalable larger"
 
+> **⚠ Two issues found reviewing this table against §6 below (2026-07-24),
+> now that "thousands of concurrent sessions" is the confirmed — not
+> aspirational — scale target (see `SYSTEM_STATE.md` §4):**
+>
+> 1. **This table's own starting point already contradicts §6.2.** §6.2
+>    says the process-local `LaunchStateStore` "is fine while the API
+>    tier is pinned to one replica (the v1 default)" and "becomes a
+>    correctness issue the moment a second API replica is added." But
+>    this table's *initial* sizing is 2 API replicas, not 1. That's not
+>    a future risk — as currently speced, an OIDC `state`/`nonce` value
+>    created by one replica is invisible to the other, so some fraction
+>    of LTI launches fail nonce/state validation from day one. The
+>    Redis-backed `LaunchStateStore` (§6.2's stated fix) needs to move
+>    from "future work" to "blocking, before this sizing table is
+>    trustworthy" — it isn't gated on scale growth, it's gated on this
+>    table's own replica count.
+> 2. **The HPA ceiling of 10 replicas sits exactly at the affinity limit
+>    §6.1 warns about**, for a target this document's own title now
+>    states as "thousands." §6.1's "Neither is needed yet" no longer
+>    holds — at confirmed thousands-of-sessions scale, hitting 10
+>    replicas isn't a someday scenario, it's close to how this system
+>    is sized to run. The gateway/session-routing fix in §6.1 needs the
+>    same escalation: from "scaling story for later" to "needed before
+>    this topology can actually carry its stated target."
+>
+> Neither issue is resolved by this table alone — see the escalated
+> framing in §6.1 and §6.2 below.
+>
+> **Also unverified:** no per-pod WebSocket connection capacity figure
+> is stated anywhere in this document. The table asserts "2 replicas
+> (HPA up to 10)" is sufficient sizing for a "few thousand" concurrent
+> sessions, but without a stated (or measured) connections-per-pod
+> number, there's no arithmetic connecting replica count to session
+> count — it's an assertion, not a derivation. Either document the
+> assumed per-pod capacity and its source, or mark this table
+> provisional pending a WebSocket load test, consistent with
+> `SYSTEM_STATE.md` §3's own "not yet verified: live load testing"
+> entry (which currently only covers Postgres, not the WebSocket tier).
+
 For a workload in the few-thousand-concurrent-session range, the
 following sizing is sufficient. It is the **floor**, not the ceiling —
 the autoscalers in `k8s/08-hpa-api.yaml` and `k8s/09-hpa-worker.yaml`
@@ -185,22 +224,38 @@ the property that lets the next round of scaling happen without
 redesign:
 
 1. **WebSocket affinity breaks down** past ~10 API replicas on a
-   single ingress. The fix is to either (a) move to a stateful
-   WebSocket gateway that routes by session ID, or (b) move the
-   WebSocket layer to a managed product (Cloudflare Durable Objects,
-   Ably, Pusher). Neither is needed yet.
+   single ingress. **Escalated (2026-07-24):** with "thousands of
+   concurrent sessions" now the confirmed scale target and this
+   document's own HPA ceiling set at exactly 10 replicas, this is no
+   longer a someday concern — it needs resolving before the WebSocket
+   layer can be considered production-ready at its stated target, not
+   deferred to "when you outgrow the small cluster." The two options
+   below are both real fixes; which one is the right call is an open
+   architectural decision, not something to default into silently:
+   - **(a) Stateful WebSocket gateway that routes by session ID** —
+     keeps the existing Kubernetes/self-hosted topology, adds an
+     explicit routing layer instead of relying on LB sticky sessions.
+     More infrastructure to own; no new vendor dependency.
+   - **(b) Managed WebSocket product** (Cloudflare Durable Objects,
+     Ably, Pusher) — since Cloudflare is already in the topology for
+     TLS/DDoS and R2, Durable Objects in particular would avoid adding
+     a new vendor, at the cost of coupling the session-routing layer
+     to Cloudflare-specific primitives.
+   This needs a decision, not an assumption, before it's implemented.
 2. **The LTI launch-state store is process-local.** v1's
    `LaunchStateStore` lives in the API pod's memory (see
    `src/proctoring_engine/lti/state.py`). The launch routes are
    single-shot, so a pending `state`/`nonce` value is only ever
-   read by the same replica that issued it. This is fine while
-   the API tier is pinned to one replica (the v1 default; the
-   WebSocket affinity in §6.1 is the larger constraint), but
-   becomes a correctness issue the moment a second API replica
-   is added. The fix is a Redis-backed implementation of the
-   same interface — a configuration swap, not a code rewrite,
-   because the route handler and the launch service depend on
-   the abstract store.
+   read by the same replica that issued it. **Escalated (2026-07-24):**
+   this was framed as "fine while the API tier is pinned to one
+   replica," but §3's own sizing table starts at 2 API replicas, not
+   1 — so this is not a future correctness issue contingent on scaling
+   up, it's a live bug in the topology as currently speced. The fix
+   (a Redis-backed implementation of the same `LaunchStateStore`
+   interface — a configuration swap, not a code rewrite, since the
+   route handler and launch service depend on the abstract interface)
+   needs to land before this deployment topology is trustworthy at
+   its own stated starting sizing, let alone at thousands of sessions.
 3. **Postgres becomes the bottleneck** past ~10k concurrent sessions
    with the current write pattern (heavy at flag time, light
    otherwise). The mitigations, in order: (a) add a read replica for

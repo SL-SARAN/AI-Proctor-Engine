@@ -15,9 +15,12 @@ Server → client envelope shape (``docs/02-ingestion-layer-design.md`` §4)::
 **Design choices:**
 
 - The kill-switch message carries the ``flag_id`` so the client can
-  echo it in the acknowledgement.  The server matches the ack to
-  the correct ``TerminationRecord`` and sets
-  ``TerminationRecord.kill_switch_ack_at``.
+  echo it in the acknowledgement. The server matches the ack to
+  the correct ``TerminationRecord`` via the delivery service
+  state machine; the orchestration layer is the one that writes
+  ``TerminationRecord.client_acknowledged_at`` (the actual column
+  name on the ORM model — the docs/06 narrative uses
+  ``kill_switch_ack_at`` as a conceptual shorthand).
 - Acknowledgements are per-frame: every ingested envelope gets a
   monotonically-increasing ``seq`` back so the client can detect
   missed acks and re-send.  This is belt-and-suspenders alongside the

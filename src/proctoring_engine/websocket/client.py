@@ -31,8 +31,10 @@ envelope.
   intentional: it makes envelope-level logs self-describing even
   without the connection context.
 - Audio payloads carry the ``sample_rate_hz`` and ``duration_ms``
-  fields because ``webrtcvad`` requires exact frame sizes
-  (10 / 20 / 30 ms at 8000 / 16000 / 32000 / 48000 Hz).
+  fields because ``webrtcvad-wheels`` (the MIT-licensed fork of
+  ``webrtcvad`` with an identical ``import webrtcvad`` API, ships
+  prebuilt wheels for Windows/macOS/Linux) requires exact frame
+  sizes (10 / 20 / 30 ms at 8000 / 16000 / 32000 / 48000 Hz).
   The client is responsible for chunking to one of those
   combinations; the server rejects non-compliant frames.
 """
@@ -68,10 +70,13 @@ class EnvelopeValidationError(ExamClientError):
 # Shared constants
 # ---------------------------------------------------------------------------
 
-# Valid sample rates for ``webrtcvad`` (all in Hz).
+# Valid sample rates for ``webrtcvad-wheels`` (the v1 VAD library;
+# identical API to base ``webrtcvad`` which it replaces for the
+# prebuilt-Windows-wheel reason — see spec amendment 2026-07-24).
+# All values in Hz.
 VALID_SAMPLE_RATES: frozenset[int] = frozenset({8000, 16000, 32000, 48000})
 
-# Valid frame durations for ``webrtcvad`` (all in ms).
+# Valid frame durations for ``webrtcvad-wheels``. All values in ms.
 VALID_FRAME_DURATIONS: frozenset[int] = frozenset({10, 20, 30})
 
 # Browser events the client may report (DOM-level, event-driven, no polling).
@@ -194,9 +199,9 @@ class TelemetryAudioChunkPayload(BaseModel):
     """A VAD-ready audio chunk for server-side voice activity detection.
 
     The client must resample / chunk to one of the exact combinations
-    ``webrtcvad`` accepts:  sample rate ∈ {8000, 16000, 32000, 48000} Hz
-    and frame duration ∈ {10, 20, 30} ms.  The server rejects
-    non-compliant frames.
+    ``webrtcvad-wheels`` accepts (identical API to ``webrtcvad``):
+    sample rate ∈ {8000, 16000, 32000, 48000} Hz and frame duration
+    ∈ {10, 20, 30} ms. The server rejects non-compliant frames.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -220,7 +225,7 @@ class TelemetryAudioChunkPayload(BaseModel):
     def _rate_valid(cls, v: int) -> int:
         if v not in VALID_SAMPLE_RATES:
             raise ValueError(
-                f"Sample rate {v} Hz is not supported by webrtcvad; "
+                f"Sample rate {v} Hz is not supported by webrtcvad-wheels; "
                 f"use one of {sorted(VALID_SAMPLE_RATES)}."
             )
         return v
@@ -230,7 +235,7 @@ class TelemetryAudioChunkPayload(BaseModel):
     def _duration_valid(cls, v: int) -> int:
         if v not in VALID_FRAME_DURATIONS:
             raise ValueError(
-                f"Frame duration {v} ms is not supported by webrtcvad; "
+                f"Frame duration {v} ms is not supported by webrtcvad-wheels; "
                 f"use one of {sorted(VALID_FRAME_DURATIONS)}."
             )
         return v

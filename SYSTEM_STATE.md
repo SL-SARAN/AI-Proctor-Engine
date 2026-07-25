@@ -1,6 +1,6 @@
 # System State
 
-Last updated: 2026-07-23 (turn N+2: WebSocket protocol layer)
+Last updated: 2026-07-25 (turn N+5: Fusion & flagging engine)
 
 This file is the single source of truth for "where the AI Proctoring
 Engine is right now." Read this first at the start of every session
@@ -36,9 +36,9 @@ design docs but is not built.
 | LTI 1.3 foundation (config, claims, roles, state store, session token, OIDC discovery, JWKS fetcher) | **Implemented (turn N, 70 unit tests)** | `src/proctoring_engine/lti/` |
 | LTI 1.3 launch routes + `process_launch` service + OIDC test double + PostgreSQL integration tests | **Implemented (turn N+1, 134 unit + 9 integration tests)** | `src/proctoring_engine/lti/routes.py`, `src/proctoring_engine/lti/service.py`, `tests/integration/test_lti_launch.py` |
 | Authenticated WebSocket protocol (envelope, sparse frames, kill-switch, ack) | **Implemented (turn N+2, 88 unit tests)** | `src/proctoring_engine/websocket/` |
-| Preprocessing (frame decode, tiered scheduler, rolling buffer) | Not started | `docs/03-preprocessing-layer-design.md` |
-| Inference modules (6 modalities) | Not started | `docs/04-inference-modules-design.md` |
-| Fusion & flagging engine (3 termination paths) | Not started | `docs/05-fusion-flagging-engine-design.md` |
+| Preprocessing (frame decode, audio pipeline, tiered scheduler, rolling buffer) | **Implemented (turn N+3, 127 unit tests)** | `src/proctoring_engine/preprocessing/`, `docs/03-preprocessing-layer-design.md` |
+| Inference modules (6 modalities) | **Implemented (turn N+4, 79 unit tests)** | `src/proctoring_engine/inference/`, `docs/04-inference-modules-design.md` |
+| Fusion & flagging engine (3 termination paths + exemption suppression) | **Implemented (turn N+5, 68 unit tests)** | `src/proctoring_engine/fusion/`, `docs/05-fusion-flagging-engine-design.md` |
 | Evidence & audit store (S3, retention job) | Not started | `docs/06-evidence-audit-store-design.md` |
 | API & orchestration (full route surface, state machine) | Not started | `docs/07-api-orchestration-design.md` |
 | Browser client | Not started | n/a |
@@ -103,6 +103,85 @@ Per `docs/VERIFICATION_LOG.md`:
   (envelope validation, server message serialisation, delivery service, telemetry event buffer, real testclient WebSocket dispatch).
 - Total unit tests passing on SQLite: 230.
 
+### Preprocessing (turn N+3)
+
+- `pytest tests/test_preprocessing.py` → **127 passed**
+  (frame decode, BGR→RGB swap, BGRA→RGB alpha strip, YOLO
+  pass-through, PCM-16 LE/BE decode, VAD-rate resample,
+  frame-splitting with tail pad, RMS dBFS calculation, modality
+  scheduler default/custom/validation, rolling-buffer config/entry
+  validation, eviction, `NullRollingBuffer`, `RollingBuffer`
+  protocol, `_approx_decoded_size`, package-level export surface).
+- Found and fixed a defect in `scheduler.py`: the `_Default`
+  slotted-dataclass's class-level attributes are descriptors, not
+  int values — replaced with plain `Final[int]` module constants.
+- Dependencies added: `numpy>=1.26,<3`, `opencv-python-headless>=4.10,<5`,
+  `Pillow>=10.4,<12`.
+- Total unit tests passing on SQLite: **357**.
+
+### Inference modules (turn N+4)
+
+- `pytest tests/test_inference.py` → **79 passed, 1 skipped**
+  (ConfidenceInterval boundary validation, BoundingBox boundary
+  validation, InferenceResult base + 5 modality subclasses, face
+  presence env-var / missing-file guards, identity cosine similarity
+  including orthogonal / identical / near-match / anti-correlated /
+  zero-vector / unequal-length / empty / 128-d, IdentityBackend ABC
+  instantiation guard, IdentityMatchRunner with stub backend covering
+  match / mismatch / exact-threshold / invalid-threshold,
+  FaceRecognitionBackend import-skip, EAR formula at open / closed /
+  degenerate, iris-offset at centred / off-centre / zero-width,
+  solvePnP head-pose synthetic, FaceLandmarkerRunner env-var /
+  missing-file guards, denylist constants + COCO class IDs,
+  filter_denylist_detections at empty / no-match / single-match /
+  mixed, ObjectDetectorRunner env-var / missing-file guards, VAD
+  silence / speech / elevated-rms / empty / aggressiveness 0-3 /
+  invalid 4, browser events for all 7 valid types / invalid / empty
+  detail / detail with data / None detail).
+- The skip is the `face_recognition` (dlib) backend import test —
+  `dlib` requires MSVC Build Tools on Windows, so it's
+  `pytest.importorskip` gated.
+- Dependencies added: `webrtcvad-wheels>=2.0,<3`,
+  `face-recognition>=1.3,<2` (Linux k8s deployable; Windows skip
+  via `importorskip`).
+- Total unit tests passing on SQLite: **436**.
+
+### User decisions resolved this turn (turn N+4)
+
+| Question | Answer |
+|---|---|
+| Identity-match library | `face_recognition` (dlib) |
+| MediaPipe model bundles | `MP_FACE_DETECTOR_BUNDLE` + `MP_FACE_LANDMARKER_BUNDLE` env vars |
+| YOLO weights | `YOLO_WEIGHTS_PATH` env var |
+| Layer scope | All six modalities in one atomic turn |
+
+### Fusion & flagging engine (turn N+5)
+
+- `pytest tests/test_fusion.py` → **68 passed** (zero-tolerance
+  path boundaries, gaze-away ladder at all four limits, accumulated
+  score at exactly the threshold, window expiry, exemption
+  suppression with all mismatch modes, book severity across all three
+  `ReferenceMaterialPolicy` values, browser event accumulation).
+- New `src/proctoring_engine/fusion/` package:
+  - `_types.py` — `GazeAwayEvent` + `FlagDecision` dataclasses
+  - `aggregator.py` — `PolicySnapshot`, `SessionContext`,
+    `SessionAggregator` (three termination paths in one class)
+  - `exemptions.py` — `ExemptionRecord` +
+    `find_matching_exemption` pure function
+  - `book_severity.py` — `should_flag_book` pure function
+- All thresholds live in `PolicySnapshot` (never hardcoded).
+- Accumulated-score path uses `medium_score_termination_threshold = 0`
+  as the documented "disable" sentinel — schema constraint
+  `ck_policy_medium_score_threshold_nonnegative` permits 0.
+- User resolved the accumulated-score open decision this turn:
+  single accumulator across all MEDIUM signals, weights in
+  `PolicyConfig`, threshold set pre-exam as part of the versioned
+  snapshot, not adjustable mid-session.
+- Resume/reinstatement: **explicitly out of v1.** Termination is
+  final from the engine's perspective; the LMS handles attempt
+  lifecycle through its own tools.
+- Total unit tests passing on SQLite: **504** (436 prior + 68 new).
+
 ## 3. What is NOT yet verified
 
 - The Kubernetes manifest set has not been applied to a live
@@ -131,6 +210,27 @@ From `docs/proctoring-engine-v1-spec.md` §1 and the design docs:
   object storage for evidence blobs.
 - **Scale target:** thousands of concurrent users, scaling to larger
   numbers with documented k8s sizing.
+
+  > **✅ Resolved (2026-07-24):** user confirmed "thousands" directly.
+  > `docs/proctoring-engine-v1-spec.md` §1 has been updated to match —
+  > it previously locked "moderate concurrency (tens–low hundreds)" and
+  > that figure is now superseded, not just contradicted. Two downstream
+  > consequences to carry into the next atomic layer (inference modules)
+  > and beyond:
+  > 1. **Worker-pool / GPU sizing for inference.** YOLOv8 (torch) and the
+  >    MediaPipe Tasks API models are the heavy per-frame cost in this
+  >    system. A design that was fine for "low hundreds" of sessions on
+  >    a modest worker pool needs real batching/autoscaling analysis at
+  >    thousands — this should be an explicit section in
+  >    `docs/04-inference-modules-design.md`, not assumed to fall out of
+  >    "horizontally scalable" for free.
+  > 2. **WebSocket ingress affinity.** Already logged in §10 below as a
+  >    risk ("breaks down past ~10 API replicas on a single ingress") —
+  >    at "low hundreds" that limit was distant; at "thousands" it's
+  >    close to immediately binding. The gateway migration path in
+  >    `docs/DEPLOYMENT.md` §6 moves from "document for later" to
+  >    "needed before the WebSocket layer can actually carry this load,"
+  >    and should be revisited before treating that layer as done.
 - **Deployment:** **Kubernetes** (per the answer to the deployment
   question) with **managed Postgres** (RDS / Cloud SQL / Neon) and
   **Cloudflare R2** for S3-compatible object storage. Local dev uses
@@ -168,28 +268,65 @@ From `docs/proctoring-engine-v1-spec.md` §1 and the design docs:
    has been removed; `tests/test_migration_chain.py` enforces the
    invariant that no post-initial migration may re-add anything the
    initial migration already emits.
-2. **Accumulated-score termination path** — proposed in
-   `docs/05-fusion-flagging-engine-design.md` Path 3. The schema is
-   now ready for it (`ExamSession.accumulated_medium_score` and
-   `PolicyConfig.medium_score_termination_threshold`), but the
-   fusion-engine implementation and the user-confirmation that the
-   path is wanted at all are still open.
-3. **Embedding storage mechanism** — JSONB float array (current) vs.
+2. **Identity-match library** — **Resolved (2026-07-24, turn N+4).**
+   `face_recognition` (dlib ResNet, 128-d embeddings). Installable
+   on the Linux k8s target; Windows tests `pytest.importorskip` the
+   backend. The library is wired in via the `IdentityBackend` ABC
+   so a future swap to ArcFace / DeepFace is a single-class change.
+3. **MediaPipe model bundle (`.task`) distribution** — **Resolved
+   (2026-07-24, turn N+4).** `MP_FACE_DETECTOR_BUNDLE` and
+   `MP_FACE_LANDMARKER_BUNDLE` environment variables point to
+   pre-baked bundle files in the container image. Constructors
+   raise `EnvironmentError` if unset; unit tests run without the
+   bundles, exercising only the env-var and file-existence guards.
+4. **YOLOv8 weights distribution** — **Resolved (2026-07-24, turn
+   N+4).** `YOLO_WEIGHTS_PATH` env var. `ObjectDetectorRunner` raises
+   `EnvironmentError` if unset.
+5. **Accumulated-score termination path** — **Resolved (2026-07-25,
+   turn N+5).** Path is wanted. Single running accumulator across
+   all `MEDIUM` flags on `ExamSession.accumulated_medium_score`
+   (Numeric(10,4), default 0). Weight per `rule_code` is supplied
+   to the `PolicySnapshot.score_weights` dataclass at session
+   start; in production it will be loaded from the
+   `PolicyConfig.extra_rules` JSONB column by the orchestration
+   layer (not yet built). Default weight is `1.0` per
+   `MEDIUM` flag regardless of rule code. Threshold set by
+   `PolicyConfig.medium_score_termination_threshold`; `0` is the
+   documented disable sentinel (the
+   `ck_policy_medium_score_threshold_nonnegative` check permits 0).
+   Implemented by `SessionAggregator._check_accumulated_threshold`
+   in `src/proctoring_engine/fusion/aggregator.py`. Threshold is
+   set before the exam starts as part of the versioned
+   `PolicyConfig` snapshot — not adjustable mid-session.
+6. **Embedding storage mechanism** — JSONB float array (current) vs.
    `pgvector` (alternative). Settled for v1 as JSONB; revisitable if
    a "search across many embeddings" use case appears.
 
 ## 6. Library / model availability constraints (sandbox-side)
 
-From the spec's "library availability" note:
+> **Correction (2026-07-24):** the two bundled-and-verifiable claims below
+> for `mp.solutions` and `webrtcvad` were wrong. `mp.solutions` no longer
+> exists in current `mediapipe` releases (0.10.31+); `webrtcvad` has no
+> Windows wheel. Both are corrected below — this is a planning-level fix,
+> not an inference-modules-layer implementation detail, since the choice
+> of library is a prerequisite the inference layer's design doc depends on.
 
-- MediaPipe `mp.solutions` (Face Detection, Face Mesh): weights
-  bundled in pip package. **Verifiable here.**
-- `webrtcvad`: bundled, no external download. **Verifiable here.**
+- MediaPipe Tasks API (`FaceDetector`, `FaceLandmarker` w/ blendshapes):
+  **this is now the v1 choice**, not a deferred "not in v1" item. Model
+  bundle (`.task` file) downloaded from `storage.googleapis.com` at first
+  run — **not** bundled in the pip wheel. Bake it into the container
+  image at build time rather than fetching at runtime, given the k8s
+  deployment target.
+- ~~MediaPipe `mp.solutions`~~: removed from current `mediapipe` releases;
+  do not use.
+- `webrtcvad-wheels` (MIT fork of `webrtcvad`, identical API): prebuilt
+  wheels for Windows/macOS/Linux, Python 3.6–3.13. **Verifiable here.**
+- ~~`webrtcvad` (base)~~: no Windows wheel; needs MSVC Build Tools to
+  compile there.
 - YOLOv8 (Ultralytics): weights auto-download from GitHub Releases
   at first run. **Verifiable here.**
 - `face_recognition` (dlib ResNet) vs. `DeepFace`: choice pending.
 - `pgvector`: not used in v1; the JSONB approach is documented.
-- MediaPipe Tasks API (newer): not in v1.
 - `pyannote.audio` (diarization): **explicitly out of v1**.
 
 ## 7. Key entities and where they live
@@ -231,8 +368,9 @@ From the spec's "library availability" note:
 3. ~~LTI 1.3 launch routes + `process_launch` service + OIDC test double + PostgreSQL integration tests.~~ **Done** (turn N+1).
 4. ~~Authenticated WebSocket event schema, sparse-frame protocol,
    evidence-buffer upload, kill-switch acknowledgement.~~ **Done** (turn N+2).
-5. Preprocessing layer (decode, tiered scheduler, rolling buffer
-   contract) — **next atomic layer**.
+5. ~~Preprocessing layer (decode, tiered scheduler, rolling buffer
+   contract).~~ **Done** (turn N+3).
+6. Inference modules (6 modalities) — **next atomic layer**.
 6. Object-storage abstraction with checksums, encryption metadata,
    retention deletion worker, and test doubles.
 6. Async inference job queue + versioned telemetry payload contracts.
@@ -256,9 +394,13 @@ From the spec's "library availability" note:
   database superuser / DDL rights remain a trust boundary. Production
   audit hardening needs restricted roles and immutable / off-site
   log export.
-- WebSocket affinity breaks down past ~10 API replicas on a single
-  ingress; document the gateway migration path in `docs/DEPLOYMENT.md`
-  §6 before the workload grows there.
+- **WebSocket affinity breaks down past ~10 API replicas on a single
+  ingress.** Was framed as a future concern when scale was undecided;
+  now that thousands of concurrent sessions is confirmed (§4), ~10
+  replicas is nowhere near enough capacity, so this is a near-term
+  blocker for the WebSocket layer actually carrying production load,
+  not a someday item. Document and implement the gateway migration
+  path in `docs/DEPLOYMENT.md` §6 before treating that layer as done.
 
 ## 11. Files of immediate interest
 
@@ -317,13 +459,15 @@ it to mark progress and to identify the next single atomic layer.
 - [x] Authenticated WebSocket protocol (envelope, sparse frames,
       kill-switch, ack)
 - [x] Ingestion layer implementation
-- [ ] Preprocessing layer (decode, tiered scheduler, rolling buffer
-      contract)
-- [ ] Inference modules (face presence, identity, head pose / gaze,
-      object, audio VAD, browser events)
-- [ ] Fusion & flagging engine (3 paths + exemption suppression)
+- [x] Preprocessing layer (decode, tiered scheduler, rolling buffer
+      contract) — 127 unit tests passing (turn N+3)
+- [x] Inference modules (face presence, identity, head pose / gaze,
+      object, audio VAD, browser events) — 79 unit tests passing
+      (turn N+4)
+- [x] Fusion & flagging engine (3 paths + exemption suppression +
+      book severity) — 68 unit tests passing (turn N+5)
 - [ ] Evidence store (S3-compatible adapter, checksums, retention
-      deletion job)
+      deletion job) — **next atomic layer**
 - [ ] API / orchestration (full route surface, state machine,
       authorization)
 - [ ] Browser client + capture
