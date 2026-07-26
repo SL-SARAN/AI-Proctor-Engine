@@ -89,7 +89,7 @@ design doc, and code anchor is enumerated; the checklist mirrors
 | 13 | Preprocessing layer | Pending | `docs/03-preprocessing-layer-design.md` | — |
 | 14 | Inference modules (6 modalities) | Pending | `docs/04-inference-modules-design.md` | — |
 | 15 | Fusion & flagging engine | Pending | `docs/05-fusion-flagging-engine-design.md` | — |
-| 16 | Evidence store | Pending | `docs/06-evidence-audit-store-design.md` | — |
+| 16 | Evidence store | **Implemented (turn N+6, 58 unit tests)** | `docs/06-evidence-audit-store-design.md` | `src/proctoring_engine/evidence/` |
 | 17 | API & orchestration | Pending | `docs/07-api-orchestration-design.md` | — |
 | 18 | Browser client + capture | Pending | n/a | — |
 | 19 | Live cluster provisioning + e2e smoke | Pending | `docs/DEPLOYMENT.md` | — |
@@ -274,6 +274,23 @@ which layer is being implemented:
 - **No resume / reinstatement after termination.** Per the turn N+5
   open-decision resolution: the engine is a proctoring sidecar; the
   LMS handles attempt lifecycle through its own tools.
+- **No scheduler for the retention-deletion job.** The
+  ``run_retention_deletion`` worker is a pure function callable
+  by any scheduler (APScheduler, Celery beat, Kubernetes
+  CronJob). Wiring it into the deployment is the orchestration
+  layer's responsibility.
+- **No FastAPI route triggering evidence flush.** Today the
+  ``seal_evidence`` service is callable but no
+  ``POST /sessions/{id}/flags/{flag_id}/evidence`` route exists
+  to drive it. That wiring is part of the API / orchestration
+  layer (turn N+7).
+- **No envelope encryption / KMS.** The
+  ``EvidenceArtifact.encryption_key_reference`` field exists but
+  the production encryption wrapper is a deployment concern; the
+  evidence store treats blobs as opaque content. Adding
+  envelope encryption is a non-code-deployable change to
+  ``S3EvidenceStore.upload`` (``server_side_encryption`` + KMS
+  key ID parameters).
 
 ## 8. Iteration policy (how this file changes)
 
@@ -295,13 +312,13 @@ audit trail for those changes.
 
 ## 9. Next single atomic layer (per `SKILLS_ALIGNMENT.md` §5 and `SYSTEM_STATE.md` §12)
 
-**Evidence & audit store** (turn N+6).  The S3-compatible
-evidence-storage adapter (R2 in production, MinIO locally),
-checksum verification, the `EvidenceArtifact` row wired to
-`Flag`, and the retention-deletion job.  This is what backs the
-"sealed evidence bundle" the fusion engine's `triggered_termination`
-decision ultimately produces.  See
-`docs/06-evidence-audit-store-design.md`.
+**API / orchestration layer** (turn N+7). The full FastAPI
+route surface, the session-lifecycle state machine in
+`docs/07-api-orchestration-design.md` §2, and the
+LTI-role-derived authorization model in §3. The fusion engine
+calls `/sessions/{id}/terminate` via the
+`INTERNAL_TERMINATE_TOKEN`, not an LTI token — enforced in
+tests. See `docs/07-api-orchestration-design.md`.
 
 ## 10. Deployment topology (locked)
 
@@ -340,3 +357,4 @@ Full topology, sizing, and the secrets model are in
 | 2026-07-24 | **Spec alignment pass (library corrections + scale escalation).** User edited `SKILLS_ALIGNMENT.md` §8, `docs/04-inference-modules-design.md`, `docs/proctoring-engine-v1-spec.md`, `docs/DEPLOYMENT.md`, and `SYSTEM_STATE.md` to correct library availability (MediaPipe Tasks API replaces `mp.solutions`; `webrtcvad-wheels` replaces `webrtcvad`) and lock scale target as "thousands of concurrent sessions." Two deployment escalations surfaced as **open decisions** per SKILLS §7: (1) WebSocket affinity/gateway architecture needed before ~10 replicas; (2) Redis-backed `LaunchStateStore` needed before multi-replica deployment. `CONTEXT.md` §9 updated to reflect actual next layer (inference modules). No code changes required — preprocessing layer uses no ML libraries; WebSocket/LTI layers are already marked complete. 357 unit tests verified passing. | Claude |
 | 2026-07-24 | **Inference modules layer landed (turn N+4).** New `src/proctoring_engine/inference/` package with seven modules: `_types.py` (`ConfidenceInterval` triple validated in `[0,1]` with `lower≤score≤upper`, `BoundingBox` validated in `[0,1]`, `InferenceResult` base + six modality-specific subclasses); `face_presence.py` (MediaPipe `FaceDetector` runner, `MP_FACE_DETECTOR_BUNDLE` env var, no-face / one-face / second-person event types); `identity_match.py` (`IdentityBackend` ABC + `FaceRecognitionBackend` dlib 128-d, `compute_cosine_similarity` pure numpy, runner takes threshold as argument — never hardcoded); `head_pose_gaze.py` (`FaceLandmarker` runner, `MP_FACE_LANDMARKER_BUNDLE` env var, `compute_ear` / `compute_iris_offset` / `compute_head_pose` pure helpers using landmark indices 1/152/33/263/61/291 for solvePnP, EAR < blink-threshold suppresses off-screen); `object_detection.py` (YOLOv8, `YOLO_WEIGHTS_PATH` env var, `COCO_DENYLIST_IDS = {62: tv, 63: laptop, 67: cell phone, 73: book}`, `filter_denylist_detections` is a pure function unit-testable with mock boxes); `audio_vad.py` (`webrtcvad-wheels` `Vad` with aggressiveness 0–3 boundary, `AudioVadRunner.run` returns `silence` / `speech_detected` / `elevated_rms` based on VAD ratio + RMS dBFS vs `noise_floor_dbfs`); `browser_events.py` (deterministic passthrough, `confidence: (1.0, 1.0, 1.0)`, validates against `VALID_BROWSER_EVENTS` from the WebSocket client envelope layer). All runners are stateless per-frame classifiers; multi-frame confidence intervals are explicitly the fusion engine's job. 79 new unit tests pass on SQLite (436 total). `pyproject.toml` adds `webrtcvad-wheels>=2.0,<3` and `face-recognition>=1.3,<2` (Linux k8s; Windows tests `importorskip`-gated). Three open decisions resolved (identity-match library, MediaPipe bundle, YOLO weights); two deployment escalations remain open. Next layer: fusion & flagging engine (`docs/05-fusion-flagging-engine-design.md`). | Claude |
 | 2026-07-25 | **Fusion & flagging engine landed (turn N+5).** New `src/proctoring_engine/fusion/` package with four modules: `_types.py` (`GazeAwayEvent` Stage-2 working-state aggregate, `FlagDecision` frozen output carrying `rule_code` / `severity` / `confidence` / `triggered_termination` / `suppressed_by_exemption_id` / `contributing_event_ids` / `score_delta`); `aggregator.py` (`PolicySnapshot` frozen dataclass holding every `PolicyConfig` threshold + per-rule weights, `SessionContext` denormalised session metadata + pre-loaded `ExemptionRecord`s, `SessionAggregator` per-session stateful engine with `process_face_presence` / `process_gaze` / `process_object_detection` / `process_browser_event` methods emitting `list[FlagDecision]`); `exemptions.py` (`ExemptionRecord` dataclass + pure `find_matching_exemption` lookup with `effective_at`/`expires_at` window checks + `SUPPRESSED_SEVERITY = "low"`); `book_severity.py` (pure `should_flag_book` resolution across `CLOSED_BOOK` / `OPEN_BOOK` / `SPECIFIC_LIST` policies). All three termination paths implemented in one class: Path 1 (consecutive-frame confirmation counter, noise-filter not leniency), Path 2 (consecutive off-screen frames → `GazeAwayEvent` only when `>= gaze_min_duration_ms`, rolling-window counter in `gaze_window_seconds`, warning at `gaze_warning_limit` → MEDIUM, termination at `gaze_termination_limit` → CRITICAL), Path 3 (`accumulated_medium_score` with per-rule weights from `PolicyConfig.score_weights`, threshold from `ck_policy_medium_score_threshold_nonnegative`, `0` is the documented disable sentinel). Accommodation exemption suppression: `find_matching_exemption` then downgrade to `LOW` severity + set `suppressed_by_exemption_id` — never silent drop. Book detection always logged; severity decided by `reference_material_policy` + `permitted_material_details`. Three open decisions resolved this turn: (1) **accumulated-score path is wanted** — single running accumulator across all MEDIUM flags, weights in `PolicyConfig`, threshold pre-exam; (2) **resume / reinstatement explicitly out of v1** — engine is a proctoring sidecar, LMS handles attempt lifecycle through its own tools (Canvas "Moderate Quiz", etc.); (3) **browser client capture architecture** — LTI launch opens capture client as active browser tab, LMS quiz in iframe; extension and companion-window approaches rejected. 68 new unit tests pass on SQLite (504 total). Test count: 504 unit + 16 PostgreSQL integration. Next layer: evidence & audit store (`docs/06-evidence-audit-store-design.md`). | Claude |
+| 2026-07-26 | **Evidence & audit store landed (turn N+6).** New `src/proctoring_engine/evidence/` package with seven modules: `_settings.py` (`EvidenceStoreSettings` frozen slots dataclass + `get_evidence_store_settings` env loader, all required vars validated, optional timeouts with default 5s/30s); `_protocol.py` (`EvidenceStore` runtime-checkable Protocol with `upload` / `download` / `delete` / `exists` / `compute_checksum`, plus `EvidenceStoreError` / `EvidenceNotFoundError`); `_checksum.py` (`compute_sha256` with `validate_sha256_hex` boundary tests at exactly 64 chars and non-hex rejection, `verify_checksum` case-insensitive); `_storage_key.py` (`build_storage_key` / `parse_storage_key` round-trip for all four artifact types — `frame`→`.jpg`, `clip`→`.webm`, `audio`→`.webm`, `event_export`→`.json` — with extension-mismatch rejection); `_s3.py` (`S3EvidenceStore` production boto3 adapter with create-on-first-use bucket ensure, configurable connect/read timeouts, retry standard mode, `InMemoryEvidenceStore` thread-safe test double with `list_keys` / `get_blob_count` helpers); `service.py` (`seal_evidence` blob-first row-second pipeline: build key → compute local checksum → upload → re-verify remote checksum → on mismatch delete the corrupt blob and raise; `SealEvidenceRequest` / `SealEvidenceResult` with `to_orm_kwargs` mapping); `retention.py` (`run_retention_deletion` batched with explicit `failed_artifact_ids` set so a persistently failing blob cannot infinite-loop the worker, blob-first row-second ordering matches `docs/06` §3, idempotent on missing blob, leaves row in place on storage error). New S3 env vars: `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET`, `S3_REGION`, `S3_CONNECT_TIMEOUT_SECONDS`, `S3_READ_TIMEOUT_SECONDS` (matching the existing `docker-compose.yml` + k8s ConfigMap variables). `pyproject.toml` adds `boto3>=1.34,<2`. 58 new unit tests pass on SQLite (562 total). One **inconsistency surfaced and documented** in `SYSTEM_STATE.md` §5 open-decision #7: `docs/06` §3 mentions a `TelemetryEvent.retention_expires_at` query path that the v1 ORM does not implement (telemetry retention is governed by parent `ExamSession.retention_expires_at` via `cascade="all, delete-orphan"`). The retention worker therefore scopes to `EvidenceArtifact` only in v1; revisit in v2 if per-event retention becomes a requirement. Three new deliberate-gap entries in §7: no scheduler wires the retention worker; no FastAPI route triggers the evidence flush; envelope encryption is a deployment concern not yet implemented. Next layer: API / orchestration (`docs/07-api-orchestration-design.md`). | Claude |

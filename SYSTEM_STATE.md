@@ -1,6 +1,6 @@
 # System State
 
-Last updated: 2026-07-25 (turn N+5: Fusion & flagging engine)
+Last updated: 2026-07-26 (turn N+6: Evidence & audit store)
 
 This file is the single source of truth for "where the AI Proctoring
 Engine is right now." Read this first at the start of every session
@@ -39,7 +39,7 @@ design docs but is not built.
 | Preprocessing (frame decode, audio pipeline, tiered scheduler, rolling buffer) | **Implemented (turn N+3, 127 unit tests)** | `src/proctoring_engine/preprocessing/`, `docs/03-preprocessing-layer-design.md` |
 | Inference modules (6 modalities) | **Implemented (turn N+4, 79 unit tests)** | `src/proctoring_engine/inference/`, `docs/04-inference-modules-design.md` |
 | Fusion & flagging engine (3 termination paths + exemption suppression) | **Implemented (turn N+5, 68 unit tests)** | `src/proctoring_engine/fusion/`, `docs/05-fusion-flagging-engine-design.md` |
-| Evidence & audit store (S3, retention job) | Not started | `docs/06-evidence-audit-store-design.md` |
+| Evidence & audit store (S3, retention job) | **Implemented (turn N+6, 58 unit tests)** | `src/proctoring_engine/evidence/`, `docs/06-evidence-audit-store-design.md` |
 | API & orchestration (full route surface, state machine) | Not started | `docs/07-api-orchestration-design.md` |
 | Browser client | Not started | n/a |
 
@@ -182,6 +182,55 @@ Per `docs/VERIFICATION_LOG.md`:
   lifecycle through its own tools.
 - Total unit tests passing on SQLite: **504** (436 prior + 68 new).
 
+### Evidence & audit store (turn N+6)
+
+- `pytest tests/test_evidence.py` → **58 passed** (settings loading
+  with all required and optional vars, SHA-256 checksum boundaries,
+  storage key building/parsing across all four artifact types,
+  `InMemoryEvidenceStore` upload/download/delete/exists/checksum,
+  `seal_evidence` happy path / invalid type / upload failure /
+  checksum mismatch / frame / event_export, retention deletion with
+  expired-only / unexpired-untouched / multiple-expired / empty-DB /
+  blob-already-missing / storage-error-leaves-row, protocol
+  compliance, package exports).
+- New `src/proctoring_engine/evidence/` package:
+  - `_settings.py` — `EvidenceStoreSettings` (frozen, slots) +
+    `get_evidence_store_settings` from process env
+  - `_protocol.py` — `EvidenceStore` runtime-checkable Protocol +
+    `EvidenceStoreError` + `EvidenceNotFoundError`
+  - `_checksum.py` — `compute_sha256`, `validate_sha256_hex`,
+    `verify_checksum`
+  - `_storage_key.py` — `build_storage_key`, `parse_storage_key`,
+    `get_artifact_extension` (all four artifact types: frame,
+    clip, audio, event_export)
+  - `_s3.py` — `S3EvidenceStore` (production boto3 adapter with
+    create-on-first-use, retry, bucket ensure) +
+    `InMemoryEvidenceStore` (test double, thread-safe)
+  - `service.py` — `SealEvidenceRequest` +
+    `SealEvidenceResult` + `seal_evidence` (blob-first,
+    row-second; verify remote checksum after upload; deletes
+    blob on mismatch)
+  - `retention.py` — `run_retention_deletion` + `RetentionDeletionResult`
+    with `failed_artifact_ids` set to prevent infinite-loop on
+    persistently failing blob deletion
+- Storage key shape: `evidence/{session_id}/{flag_id}/{type}.{ext}`
+  (mirrors `docs/06` §1).
+- Retention ordering: blob-first, row-second; "blob-already-missing"
+  is idempotent and continues to row deletion; "storage error"
+  logs and skips without deleting the row.
+- The `TelemetryEvent.retention_expires_at` query path appears in
+  the design doc §3 but the ORM doesn't have that column on
+  `TelemetryEvent` (the `ExamSession.cascade="all, delete-orphan"`
+  relationship handles telemetry retention at the parent
+  session's `retention_expires_at`). The retention worker
+  therefore scopes to `EvidenceArtifact` only in v1.
+- `boto3>=1.34,<2` added to `pyproject.toml`; new S3 env vars
+  (`S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`,
+  `S3_BUCKET`, `S3_REGION`, `S3_CONNECT_TIMEOUT_SECONDS`,
+  `S3_READ_TIMEOUT_SECONDS`) added to `.env.example` (matching
+  the docker-compose.yml + k8s ConfigMap variables).
+- Total unit tests passing on SQLite: **562** (504 prior + 58 new).
+
 ## 3. What is NOT yet verified
 
 - The Kubernetes manifest set has not been applied to a live
@@ -301,6 +350,18 @@ From `docs/proctoring-engine-v1-spec.md` §1 and the design docs:
 6. **Embedding storage mechanism** — JSONB float array (current) vs.
    `pgvector` (alternative). Settled for v1 as JSONB; revisitable if
    a "search across many embeddings" use case appears.
+7. **TelemetryEvent retention column** — `docs/06-evidence-audit-store-design.md`
+   §3 says retention deletion "queries for `EvidenceArtifact` and
+   `TelemetryEvent` rows where `retention_expires_at < now()`,"
+   but the v1 ORM does not put a `retention_expires_at` column on
+   `TelemetryEvent` — telemetry retention is governed by the
+   parent `ExamSession.retention_expires_at` (the
+   `cascade="all, delete-orphan"` relationship on
+   `ExamSession.telemetry_events` cascades deletion when the
+   session itself expires). The retention worker therefore
+   scopes to `EvidenceArtifact` only. Flagging here as a
+   design-doc/schema inconsistency to revisit in v2 if per-event
+   retention tuples become a requirement.
 
 ## 6. Library / model availability constraints (sandbox-side)
 
@@ -370,9 +431,9 @@ From `docs/proctoring-engine-v1-spec.md` §1 and the design docs:
    evidence-buffer upload, kill-switch acknowledgement.~~ **Done** (turn N+2).
 5. ~~Preprocessing layer (decode, tiered scheduler, rolling buffer
    contract).~~ **Done** (turn N+3).
-6. Inference modules (6 modalities) — **next atomic layer**.
-6. Object-storage abstraction with checksums, encryption metadata,
-   retention deletion worker, and test doubles.
+6. ~~Inference modules (6 modalities).~~ **Done** (turn N+4).
+6. ~~Object-storage abstraction with checksums, encryption metadata,
+   retention deletion worker, and test doubles.~~ **Done** (turn N+6).
 6. Async inference job queue + versioned telemetry payload contracts.
 7. Browser client and client-side event capture. Then connect face /
    gaze / object / audio models.
@@ -466,10 +527,10 @@ it to mark progress and to identify the next single atomic layer.
       (turn N+4)
 - [x] Fusion & flagging engine (3 paths + exemption suppression +
       book severity) — 68 unit tests passing (turn N+5)
-- [ ] Evidence store (S3-compatible adapter, checksums, retention
-      deletion job) — **next atomic layer**
+- [x] Evidence store (S3-compatible adapter, checksums, retention
+      deletion job) — 58 unit tests passing (turn N+6)
 - [ ] API / orchestration (full route surface, state machine,
-      authorization)
+      authorization) — **next atomic layer**
 - [ ] Browser client + capture
 - [ ] Production deployment (k8s cluster provisioned, end-to-end
       smoke test on a live cluster)

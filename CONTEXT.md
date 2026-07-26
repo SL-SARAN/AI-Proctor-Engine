@@ -264,10 +264,10 @@ the `ON DELETE RESTRICT` behavior on `flags.policy_config_id`.
 
 ## 9. The shape of the next session
 
-The **fusion & flagging engine** is now complete (turn N+5). The
-**evidence & audit store** is the next atomic layer.
+The **evidence & audit store** is now complete (turn N+6). The
+**API / orchestration layer** is the next atomic layer.
 
-### What is built (turns N through N+5)
+### What is built (turns N through N+6)
 
 | Turn | Layer | Tests |
 |---|---|---|
@@ -277,8 +277,9 @@ The **fusion & flagging engine** is now complete (turn N+5). The
 | N+3 | Preprocessing (frame decode, audio pipeline, tiered scheduler, rolling buffer contract) | 127 unit |
 | N+4 | Inference modules (face presence, identity match, head pose/gaze, object detection, audio VAD, browser events) | 79 unit |
 | N+5 | Fusion & flagging engine (3 termination paths + exemption suppression + book severity) | 68 unit |
+| N+6 | Evidence & audit store (S3-compatible adapter, checksums, retention deletion job) | 58 unit |
 
-**Total: 504 unit tests passing, 16 PostgreSQL integration tests passing.**
+**Total: 562 unit tests passing, 16 PostgreSQL integration tests passing.**
 
 ### Library availability (2026-07-24 corrections applied)
 
@@ -299,6 +300,7 @@ Per `SKILLS_ALIGNMENT.md` §7, these still require explicit user choice:
 - **Accumulated-score termination path** — single running `accumulated_medium_score` across all `MEDIUM` flags; threshold set pre-exam via `PolicyConfig.medium_score_termination_threshold`; `0` is the documented disable sentinel. Per-`rule_code` weight is supplied to the aggregator via `PolicySnapshot.score_weights` (default 1.0); production builds load this from `PolicyConfig.extra_rules` JSONB via the orchestration layer.
 - **Resume / reinstatement** — explicitly out of v1. Engine is a proctoring sidecar; LMS handles attempt lifecycle through its own tools.
 - **Browser client capture architecture** — LTI launch → capture client as the active browser tab; LMS quiz in iframe. Browser-extension and companion-window approaches rejected.
+- **Evidence-retention telemetry mismatch** (surfaced turn N+6) — `docs/06` §3 mentions a `TelemetryEvent.retention_expires_at` query, but the v1 ORM does not put that column on `TelemetryEvent`. Telemetry retention cascades off the parent `ExamSession.retention_expires_at` (`cascade="all, delete-orphan"`). The retention worker therefore scopes to `EvidenceArtifact` only in v1; the design doc has a minor inconsistency to revisit if per-event retention tuples become a requirement.
 
 ### Resolved this turn (turn N+4)
 
@@ -308,9 +310,15 @@ Per `SKILLS_ALIGNMENT.md` §7, these still require explicit user choice:
 
 ### The next atomic layer
 
-**Evidence & audit store** — the S3-compatible evidence-storage
-adapter (R2 in production, MinIO locally), checksum verification,
-retention-deletion job, and the orchestrator-side wiring of the
-`EvidenceArtifact` row. See `docs/06-evidence-audit-store-design.md`.
-This is what backs the "sealed evidence bundle" the fusion engine's
-`triggered_termination` decision ultimately produces.
+**API / orchestration layer** — the full FastAPI route surface
+covering `/lti/login`, `/lti/launch`, `/ws/session/{session_id}`,
+`/sessions/{id}/terminate` (internal-only),
+`/sessions/{id}/status`, plus the admin surface
+(`/admin/policy-config`, `/admin/accommodation-exemptions`,
+`/admin/flags/{session_id}`,
+`/admin/flags/{flag_id}/review`). Implements the session
+lifecycle state machine in `docs/07-api-orchestration-design.md` §2
+and the LTI-role-derived authorization model in §3. The fusion
+engine calls `/sessions/{id}/terminate` via the
+`INTERNAL_TERMINATE_TOKEN`, not an LTI token — enforced in tests.
+See `docs/07-api-orchestration-design.md`.
