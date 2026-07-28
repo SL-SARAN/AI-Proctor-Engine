@@ -90,7 +90,7 @@ design doc, and code anchor is enumerated; the checklist mirrors
 | 14 | Inference modules (6 modalities) | Pending | `docs/04-inference-modules-design.md` | — |
 | 15 | Fusion & flagging engine | Pending | `docs/05-fusion-flagging-engine-design.md` | — |
 | 16 | Evidence store | **Implemented (turn N+6, 58 unit tests)** | `docs/06-evidence-audit-store-design.md` | `src/proctoring_engine/evidence/` |
-| 17 | API & orchestration | Pending | `docs/07-api-orchestration-design.md` | — |
+| 17 | API & orchestration | **Implemented (turn N+7, 73 unit tests)** | `docs/07-api-orchestration-design.md` | `src/proctoring_engine/orchestration/` |
 | 18 | Browser client + capture | Pending | n/a | — |
 | 19 | Live cluster provisioning + e2e smoke | Pending | `docs/DEPLOYMENT.md` | — |
 
@@ -279,11 +279,6 @@ which layer is being implemented:
   by any scheduler (APScheduler, Celery beat, Kubernetes
   CronJob). Wiring it into the deployment is the orchestration
   layer's responsibility.
-- **No FastAPI route triggering evidence flush.** Today the
-  ``seal_evidence`` service is callable but no
-  ``POST /sessions/{id}/flags/{flag_id}/evidence`` route exists
-  to drive it. That wiring is part of the API / orchestration
-  layer (turn N+7).
 - **No envelope encryption / KMS.** The
   ``EvidenceArtifact.encryption_key_reference`` field exists but
   the production encryption wrapper is a deployment concern; the
@@ -291,6 +286,28 @@ which layer is being implemented:
   envelope encryption is a non-code-deployable change to
   ``S3EvidenceStore.upload`` (``server_side_encryption`` + KMS
   key ID parameters).
+- **No async worker that drives ``SessionAggregator`` end-to-end.**
+  The aggregator class is built and tested; the orchestration
+  layer persists its ``FlagDecision`` outputs
+  (``persist_flag_decision``); but the glue that takes inbound
+  ``TelemetryEvent`` rows, runs the inference, feeds the
+  aggregator, and persists the resulting ``Flag`` is the next
+  layer (an async worker pool) or, more pragmatically, runs
+  inside the WebSocket handler (turn N+2 already buffers events
+  to ``TelemetryEventBuffer``; the consumer of that buffer is not
+  yet built).
+- **No LTI AGS (Assignment and Grade Services) grade passback.**
+  The engine's role stops at creating the immutable
+  ``TerminationRecord``; the LMS-side grade update is a separate
+  integration that the v1 design doc does not include.
+- **``PolicyConfig.name`` uniqueness vs. versioning** — schema
+  constraint ``unique=True`` on ``name`` blocks two POSTs with
+  the same name even when the first is retired via
+  ``retire_previous=True``.  Surfaced as a new open decision in
+  ``SYSTEM_STATE.md`` §5 (turn N+7); the v2 fix is a partial
+  unique constraint on ``(name, is_active=True,
+  retired_at IS NULL)``.  Until then, callers must give each
+  version a distinct name.
 
 ## 8. Iteration policy (how this file changes)
 
@@ -312,13 +329,14 @@ audit trail for those changes.
 
 ## 9. Next single atomic layer (per `SKILLS_ALIGNMENT.md` §5 and `SYSTEM_STATE.md` §12)
 
-**API / orchestration layer** (turn N+7). The full FastAPI
-route surface, the session-lifecycle state machine in
-`docs/07-api-orchestration-design.md` §2, and the
-LTI-role-derived authorization model in §3. The fusion engine
-calls `/sessions/{id}/terminate` via the
-`INTERNAL_TERMINATE_TOKEN`, not an LTI token — enforced in
-tests. See `docs/07-api-orchestration-design.md`.
+**Browser client + capture** (turn N+8).  The LTI launch routes
+the learner to a capture client (the active browser tab; LMS
+quiz in iframe, per the turn N+5 decision).  The client runs
+face presence + head pose inference client-side, opens a
+WebSocket on `/ws`, sends sparse heavy frames every 2–3 s, and
+emits the six browser events (`visibilitychange`, `blur`/`focus`,
+`fullscreenchange`, `copy`/`paste`, `contextmenu`).  See
+`docs/02-ingestion-layer-design.md` §3-§4.
 
 ## 10. Deployment topology (locked)
 
@@ -358,3 +376,4 @@ Full topology, sizing, and the secrets model are in
 | 2026-07-24 | **Inference modules layer landed (turn N+4).** New `src/proctoring_engine/inference/` package with seven modules: `_types.py` (`ConfidenceInterval` triple validated in `[0,1]` with `lower≤score≤upper`, `BoundingBox` validated in `[0,1]`, `InferenceResult` base + six modality-specific subclasses); `face_presence.py` (MediaPipe `FaceDetector` runner, `MP_FACE_DETECTOR_BUNDLE` env var, no-face / one-face / second-person event types); `identity_match.py` (`IdentityBackend` ABC + `FaceRecognitionBackend` dlib 128-d, `compute_cosine_similarity` pure numpy, runner takes threshold as argument — never hardcoded); `head_pose_gaze.py` (`FaceLandmarker` runner, `MP_FACE_LANDMARKER_BUNDLE` env var, `compute_ear` / `compute_iris_offset` / `compute_head_pose` pure helpers using landmark indices 1/152/33/263/61/291 for solvePnP, EAR < blink-threshold suppresses off-screen); `object_detection.py` (YOLOv8, `YOLO_WEIGHTS_PATH` env var, `COCO_DENYLIST_IDS = {62: tv, 63: laptop, 67: cell phone, 73: book}`, `filter_denylist_detections` is a pure function unit-testable with mock boxes); `audio_vad.py` (`webrtcvad-wheels` `Vad` with aggressiveness 0–3 boundary, `AudioVadRunner.run` returns `silence` / `speech_detected` / `elevated_rms` based on VAD ratio + RMS dBFS vs `noise_floor_dbfs`); `browser_events.py` (deterministic passthrough, `confidence: (1.0, 1.0, 1.0)`, validates against `VALID_BROWSER_EVENTS` from the WebSocket client envelope layer). All runners are stateless per-frame classifiers; multi-frame confidence intervals are explicitly the fusion engine's job. 79 new unit tests pass on SQLite (436 total). `pyproject.toml` adds `webrtcvad-wheels>=2.0,<3` and `face-recognition>=1.3,<2` (Linux k8s; Windows tests `importorskip`-gated). Three open decisions resolved (identity-match library, MediaPipe bundle, YOLO weights); two deployment escalations remain open. Next layer: fusion & flagging engine (`docs/05-fusion-flagging-engine-design.md`). | Claude |
 | 2026-07-25 | **Fusion & flagging engine landed (turn N+5).** New `src/proctoring_engine/fusion/` package with four modules: `_types.py` (`GazeAwayEvent` Stage-2 working-state aggregate, `FlagDecision` frozen output carrying `rule_code` / `severity` / `confidence` / `triggered_termination` / `suppressed_by_exemption_id` / `contributing_event_ids` / `score_delta`); `aggregator.py` (`PolicySnapshot` frozen dataclass holding every `PolicyConfig` threshold + per-rule weights, `SessionContext` denormalised session metadata + pre-loaded `ExemptionRecord`s, `SessionAggregator` per-session stateful engine with `process_face_presence` / `process_gaze` / `process_object_detection` / `process_browser_event` methods emitting `list[FlagDecision]`); `exemptions.py` (`ExemptionRecord` dataclass + pure `find_matching_exemption` lookup with `effective_at`/`expires_at` window checks + `SUPPRESSED_SEVERITY = "low"`); `book_severity.py` (pure `should_flag_book` resolution across `CLOSED_BOOK` / `OPEN_BOOK` / `SPECIFIC_LIST` policies). All three termination paths implemented in one class: Path 1 (consecutive-frame confirmation counter, noise-filter not leniency), Path 2 (consecutive off-screen frames → `GazeAwayEvent` only when `>= gaze_min_duration_ms`, rolling-window counter in `gaze_window_seconds`, warning at `gaze_warning_limit` → MEDIUM, termination at `gaze_termination_limit` → CRITICAL), Path 3 (`accumulated_medium_score` with per-rule weights from `PolicyConfig.score_weights`, threshold from `ck_policy_medium_score_threshold_nonnegative`, `0` is the documented disable sentinel). Accommodation exemption suppression: `find_matching_exemption` then downgrade to `LOW` severity + set `suppressed_by_exemption_id` — never silent drop. Book detection always logged; severity decided by `reference_material_policy` + `permitted_material_details`. Three open decisions resolved this turn: (1) **accumulated-score path is wanted** — single running accumulator across all MEDIUM flags, weights in `PolicyConfig`, threshold pre-exam; (2) **resume / reinstatement explicitly out of v1** — engine is a proctoring sidecar, LMS handles attempt lifecycle through its own tools (Canvas "Moderate Quiz", etc.); (3) **browser client capture architecture** — LTI launch opens capture client as active browser tab, LMS quiz in iframe; extension and companion-window approaches rejected. 68 new unit tests pass on SQLite (504 total). Test count: 504 unit + 16 PostgreSQL integration. Next layer: evidence & audit store (`docs/06-evidence-audit-store-design.md`). | Claude |
 | 2026-07-26 | **Evidence & audit store landed (turn N+6).** New `src/proctoring_engine/evidence/` package with seven modules: `_settings.py` (`EvidenceStoreSettings` frozen slots dataclass + `get_evidence_store_settings` env loader, all required vars validated, optional timeouts with default 5s/30s); `_protocol.py` (`EvidenceStore` runtime-checkable Protocol with `upload` / `download` / `delete` / `exists` / `compute_checksum`, plus `EvidenceStoreError` / `EvidenceNotFoundError`); `_checksum.py` (`compute_sha256` with `validate_sha256_hex` boundary tests at exactly 64 chars and non-hex rejection, `verify_checksum` case-insensitive); `_storage_key.py` (`build_storage_key` / `parse_storage_key` round-trip for all four artifact types — `frame`→`.jpg`, `clip`→`.webm`, `audio`→`.webm`, `event_export`→`.json` — with extension-mismatch rejection); `_s3.py` (`S3EvidenceStore` production boto3 adapter with create-on-first-use bucket ensure, configurable connect/read timeouts, retry standard mode, `InMemoryEvidenceStore` thread-safe test double with `list_keys` / `get_blob_count` helpers); `service.py` (`seal_evidence` blob-first row-second pipeline: build key → compute local checksum → upload → re-verify remote checksum → on mismatch delete the corrupt blob and raise; `SealEvidenceRequest` / `SealEvidenceResult` with `to_orm_kwargs` mapping); `retention.py` (`run_retention_deletion` batched with explicit `failed_artifact_ids` set so a persistently failing blob cannot infinite-loop the worker, blob-first row-second ordering matches `docs/06` §3, idempotent on missing blob, leaves row in place on storage error). New S3 env vars: `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET`, `S3_REGION`, `S3_CONNECT_TIMEOUT_SECONDS`, `S3_READ_TIMEOUT_SECONDS` (matching the existing `docker-compose.yml` + k8s ConfigMap variables). `pyproject.toml` adds `boto3>=1.34,<2`. 58 new unit tests pass on SQLite (562 total). One **inconsistency surfaced and documented** in `SYSTEM_STATE.md` §5 open-decision #7: `docs/06` §3 mentions a `TelemetryEvent.retention_expires_at` query path that the v1 ORM does not implement (telemetry retention is governed by parent `ExamSession.retention_expires_at` via `cascade="all, delete-orphan"`). The retention worker therefore scopes to `EvidenceArtifact` only in v1; revisit in v2 if per-event retention becomes a requirement. Three new deliberate-gap entries in §7: no scheduler wires the retention worker; no FastAPI route triggers the evidence flush; envelope encryption is a deployment concern not yet implemented. Next layer: API / orchestration (`docs/07-api-orchestration-design.md`). | Claude |
+| 2026-07-26 | **API / orchestration layer landed (turn N+7).** New `src/proctoring_engine/orchestration/` package with nine modules: `_settings.py` (`OrchestrationSettings` frozen slots dataclass — `INTERNAL_TERMINATE_TOKEN` min 32 bytes enforced at startup, `retention_default_seconds` defaulted to 90 days — plus `get_orchestration_settings` env loader with `set_*`/`reset_*` test seams); `_errors.py` (closed error-code → HTTP status mapping — `internal_token_required → 401`, `internal_token_invalid → 403`, `invalid_session_transition → 409`, `evidence_already_sealed → 409`, `evidence_blob_too_large → 413`, `evidence_seal_failed → 500` — shared between auth and routes layers so the two can't drift); `_state_machine.py` (closed transition table — PENDING → {ACTIVE, TERMINATED}, ACTIVE → {COMPLETED, TERMINATED, UNDER_REVIEW}, COMPLETED → {UNDER_REVIEW}, TERMINATED → {UNDER_REVIEW}, UNDER_REVIEW → terminal — `can_transition` / `assert_transition` / `apply_transition`); `_auth.py` (`require_internal_terminate_token` Bearer parser + `hmac.compare_digest` constant-time compare, `require_admin_role` joins through Participant row to find the AdminUser's `lms_user_reference` mirroring the production `process_launch` upsert, `require_session_owner_or_admin` for `/sessions/{id}/status`); `_flag_persistence.py` (`persist_flag_decision` translates a `FlagDecision` into immutable `Flag` + `FlagTelemetryEvent` rows in a single transaction; append-only invariant preserved via the existing `flag_immutable` PostgreSQL trigger; ORM validator enforces `accumulated_medium_score >= 0`); `_admin_service.py` (`create_policy_version` validates threshold invariants at the service layer (mirroring SQL checks so the route returns a 422 not an `IntegrityError`), `create_exemption`, `list_flags_for_session` with `selectinload` to avoid N+1, `record_proctor_review` INSERTs append-only + transitions ACTIVE/TERMINATED/COMPLETED → UNDER_REVIEW on UPHELD only); `_evidence_service.py` (`seal_evidence_for_flag` wraps `seal_evidence` with a blob-first / row-second transaction, 50 MiB blob cap mapped to 413, unique-constraint violation on `uq_evidence_artifacts_one_per_flag` mapped to 409); `_schemas.py` (Pydantic v2 with `frozen=True, extra="forbid"`, ORM-default thresholds mirror `PolicyConfig`); `_routes.py` (`build_orchestration_router(deps)` mounts the seven routes from `docs/07` §1 plus the deferred-gap `POST /sessions/{id}/flags/{flag_id}/evidence`, closed error envelope `{"code": ..., "message": ...}` on every failure path). `src/proctoring_engine/api.py` lifespan extended to construct and mount the orchestration router when settings are configured; same fail-closed pattern as LTI + WebSocket. New seam `install_evidence_store` exposes the `EvidenceStore` for the lifespan to install; falls back to in-memory store when evidence-store env vars are missing (dev-mode). New env vars: `INTERNAL_TERMINATE_TOKEN`, `ORCHESTRATION_RETENTION_DEFAULT_SECONDS`. 73 new unit tests pass on SQLite (635 total). One **new open decision surfaced** in `SYSTEM_STATE.md` §5 open-decision #8: `PolicyConfig.name` is `unique=True` column-level, blocking two POSTs with the same name even when the first is retired via `retire_previous=True`. v2 fix: drop `unique=True` and add a partial unique constraint on `(name, is_active=True, retired_at IS NULL)`. Until then, callers must give each version a distinct name. Next layer: browser client + capture (turn N+8). | Claude |

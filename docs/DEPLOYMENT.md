@@ -178,12 +178,16 @@ with `REPLACE_ME` placeholders. In production:
   is fine). Rotated quarterly; on rotation, all live sessions
   are invalidated (the WebSocket client re-launches from the
   LMS, which is the documented recovery path).
-- **Internal terminate-token** — a shared secret between the API and
-  the worker, used only for the internal `/sessions/{id}/terminate`
-  call. Rotated quarterly. This is the one credential that is not
-  derived from an external system; it exists because the
-  fusion-engine-to-orchestration call is service-to-service and must
-  not be reachable via an LTI-derived token.
+- **Internal terminate-token** (`INTERNAL_TERMINATE_TOKEN`) — a
+  shared secret between the API and the worker, attached as
+  `Authorization: Bearer <INTERNAL_TERMINATE_TOKEN>` to the
+  internal `POST /sessions/{id}/terminate` route. Must be at
+  least 32 bytes of cryptographically random material; rotated
+  quarterly. This is the one credential that is not derived
+  from an external system; it exists because the
+  fusion-engine-to-orchestration call is service-to-service and
+  must not be reachable via an LTI-derived token (enforced in
+  `tests/test_orchestration.py`).
 - **Exam client URL** (`EXAM_CLIENT_URL`) — the URL the launch
   handler 302-redirects a learner to, with `?session_token=...`.
   Defaults to `http://localhost:5173/exam` for local dev;

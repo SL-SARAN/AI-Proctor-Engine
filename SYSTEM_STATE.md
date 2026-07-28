@@ -1,6 +1,6 @@
 # System State
 
-Last updated: 2026-07-26 (turn N+6: Evidence & audit store)
+Last updated: 2026-07-26 (turn N+7: API / orchestration layer)
 
 This file is the single source of truth for "where the AI Proctoring
 Engine is right now." Read this first at the start of every session
@@ -40,7 +40,7 @@ design docs but is not built.
 | Inference modules (6 modalities) | **Implemented (turn N+4, 79 unit tests)** | `src/proctoring_engine/inference/`, `docs/04-inference-modules-design.md` |
 | Fusion & flagging engine (3 termination paths + exemption suppression) | **Implemented (turn N+5, 68 unit tests)** | `src/proctoring_engine/fusion/`, `docs/05-fusion-flagging-engine-design.md` |
 | Evidence & audit store (S3, retention job) | **Implemented (turn N+6, 58 unit tests)** | `src/proctoring_engine/evidence/`, `docs/06-evidence-audit-store-design.md` |
-| API & orchestration (full route surface, state machine) | Not started | `docs/07-api-orchestration-design.md` |
+| API & orchestration (full route surface, state machine) | **Implemented (turn N+7, 73 unit tests)** | `src/proctoring_engine/orchestration/`, `docs/07-api-orchestration-design.md` |
 | Browser client | Not started | n/a |
 
 `docs/COMPLETION_STATUS.md` and `docs/CLAUDE_HANDOFF.md` describe the
@@ -230,6 +230,74 @@ Per `docs/VERIFICATION_LOG.md`:
   `S3_READ_TIMEOUT_SECONDS`) added to `.env.example` (matching
   the docker-compose.yml + k8s ConfigMap variables).
 - Total unit tests passing on SQLite: **562** (504 prior + 58 new).
+
+### API / orchestration layer (turn N+7)
+
+- `pytest tests/test_orchestration.py` → **73 passed** (settings
+  loading with min-32-byte bound, full state-machine transition table
+  for all 5 × 5 status pairs, internal terminate token parsing +
+  constant-time compare, learner / instructor / proctor / admin
+  auth at the dependency level, all four admin route surfaces,
+  session-status ownership rule, evidence-flush blob-first
+  row-second route, flag-row persistence service with append-only
+  invariant).
+- New `src/proctoring_engine/orchestration/` package:
+  - `_settings.py` — `OrchestrationSettings` (frozen, slots)
+    with `INTERNAL_TERMINATE_TOKEN` (min 32 bytes,
+    `hmac.compare_digest`) and `retention_default_seconds`.
+  - `_state_machine.py` — `can_transition` / `assert_transition` /
+    `apply_transition` over the closed SessionStatus transition
+    table; `PENDING→ACTIVE` remains owned by the WebSocket
+    handshake (no circular dependency).
+  - `_auth.py` — `require_internal_terminate_token` (Bearer parser +
+    closed error envelope), `require_admin_role` (joins through
+    the participant row to the AdminUser's
+    `lms_user_reference`, mirroring `process_launch`),
+    `require_session_owner_or_admin` for `/sessions/{id}/status`.
+  - `_flag_persistence.py` — `persist_flag_decision` translates a
+    `FlagDecision` into immutable `Flag` + `FlagTelemetryEvent`
+    rows in a single transaction; append-only invariant preserved
+    via the existing `flag_immutable` PostgreSQL trigger.
+  - `_admin_service.py` — `create_policy_version`,
+    `create_exemption`, `list_flags_for_session`,
+    `record_proctor_review`, plus typed errors mapped to
+    404/409/422 by the routes layer.
+  - `_evidence_service.py` — `seal_evidence_for_flag` wraps
+    `seal_evidence` with a blob-first / row-second transaction
+    and the deferred-gap evidence-flush route
+    (`POST /sessions/{id}/flags/{flag_id}/evidence`).
+  - `_schemas.py` — Pydantic v2 request / response models;
+    `extra="forbid"` locks the wire shape.
+  - `_routes.py` — `build_orchestration_router(deps)` mounts the
+    seven routes from `docs/07` §1 + the evidence flush route;
+    closed error-code envelope (`{"code": ..., "message": ...}`)
+    is the contract for every failure path.
+  - `_errors.py` — the closed code-to-HTTP-status mapping
+    (`internal_token_required → 401`, etc.); shared between auth
+    and routes so the two layers can't drift.
+- `src/proctoring_engine/api.py` lifespan extended to construct
+  and mount the orchestration router when settings are configured;
+  same fail-closed pattern as the LTI + WebSocket layers.  A
+  new `install_evidence_store` seam exposes the `EvidenceStore`
+  for the lifespan to install.  If the evidence-store env vars
+  are missing, the lifespan falls back to an in-memory store
+  (non-persistent, dev-mode).
+- New env vars: `INTERNAL_TERMINATE_TOKEN`,
+  `ORCHESTRATION_RETENTION_DEFAULT_SECONDS`.
+- Total unit tests passing on SQLite: **635** (562 prior + 73 new).
+
+**New open decision surfaced this turn:**
+
+8. **`PolicyConfig.name` uniqueness vs. versioning.** The v1 spec
+   promises "name uniquely identifies a family of versions"
+   (`docs/01-data-models-design.md`), but the v1 schema enforces
+   `name` as a column-level `unique=True`.  Two POSTs with the
+   same `name` collide, even when the first is retired via
+   `retire_previous=True`.  Surfaced here so the v2 fix can be a
+   schema migration: drop `unique=True` and replace with a
+   partial unique constraint on `(name, is_active=True,
+   retired_at IS NULL)`.  Until then, callers must give each
+   version a distinct `name`.
 
 ## 3. What is NOT yet verified
 
@@ -529,8 +597,8 @@ it to mark progress and to identify the next single atomic layer.
       book severity) — 68 unit tests passing (turn N+5)
 - [x] Evidence store (S3-compatible adapter, checksums, retention
       deletion job) — 58 unit tests passing (turn N+6)
-- [ ] API / orchestration (full route surface, state machine,
-      authorization) — **next atomic layer**
+- [x] API / orchestration (full route surface, state machine,
+      authorization) — 73 unit tests passing (turn N+7)
 - [ ] Browser client + capture
 - [ ] Production deployment (k8s cluster provisioned, end-to-end
       smoke test on a live cluster)

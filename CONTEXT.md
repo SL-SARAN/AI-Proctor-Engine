@@ -172,6 +172,8 @@ is non-conformant under `SKILLS_ALIGNMENT.md` §7.
 | Read the handoff to the next implementer | `docs/CLAUDE_HANDOFF.md` |
 | Read the LTI 1.3 foundation (turn N) | `src/proctoring_engine/lti/` (`config.py`, `claims.py`, `roles.py`, `state.py`, `session_token.py`, `discovery.py`, `jwks.py`) |
 | Read the LTI 1.3 foundation tests (turn N) | `tests/test_lti_*.py` (71 unit cases) |
+| Read the API / orchestration layer (turn N+7) | `src/proctoring_engine/orchestration/` (`_settings.py`, `_state_machine.py`, `_auth.py`, `_flag_persistence.py`, `_admin_service.py`, `_evidence_service.py`, `_schemas.py`, `_errors.py`, `_routes.py`) |
+| Read the API / orchestration tests (turn N+7) | `tests/test_orchestration.py` (73 unit cases) |
 | Run the project locally | `README.md`, `pyproject.toml`, `.env.example`, `alembic.ini`, `Dockerfile`, `docker-compose.yml` |
 | Deploy to production | `docs/DEPLOYMENT.md`, `k8s/` |
 
@@ -278,8 +280,9 @@ The **evidence & audit store** is now complete (turn N+6). The
 | N+4 | Inference modules (face presence, identity match, head pose/gaze, object detection, audio VAD, browser events) | 79 unit |
 | N+5 | Fusion & flagging engine (3 termination paths + exemption suppression + book severity) | 68 unit |
 | N+6 | Evidence & audit store (S3-compatible adapter, checksums, retention deletion job) | 58 unit |
+| N+7 | API / orchestration (full route surface, session state machine, internal `INTERNAL_TERMINATE_TOKEN`, admin CRUD, evidence flush) | 73 unit |
 
-**Total: 562 unit tests passing, 16 PostgreSQL integration tests passing.**
+**Total: 635 unit tests passing, 16 PostgreSQL integration tests passing.**
 
 ### Library availability (2026-07-24 corrections applied)
 
@@ -310,15 +313,42 @@ Per `SKILLS_ALIGNMENT.md` §7, these still require explicit user choice:
 
 ### The next atomic layer
 
-**API / orchestration layer** — the full FastAPI route surface
-covering `/lti/login`, `/lti/launch`, `/ws/session/{session_id}`,
-`/sessions/{id}/terminate` (internal-only),
-`/sessions/{id}/status`, plus the admin surface
-(`/admin/policy-config`, `/admin/accommodation-exemptions`,
-`/admin/flags/{session_id}`,
-`/admin/flags/{flag_id}/review`). Implements the session
-lifecycle state machine in `docs/07-api-orchestration-design.md` §2
-and the LTI-role-derived authorization model in §3. The fusion
-engine calls `/sessions/{id}/terminate` via the
-`INTERNAL_TERMINATE_TOKEN`, not an LTI token — enforced in tests.
-See `docs/07-api-orchestration-design.md`.
+### Resolved this turn (turn N+7)
+
+- **API / orchestration layer landed.** The full FastAPI route surface
+  covers `GET /sessions/{id}/status`, `POST /sessions/{id}/terminate`
+  (internal-only via `Authorization: Bearer <INTERNAL_TERMINATE_TOKEN>`),
+  `POST/GET /admin/policy-config`, `POST/GET /admin/accommodation-exemptions`,
+  `GET /admin/flags/{session_id}`, `POST /admin/flags/{flag_id}/review`,
+  and the deferred-gap `POST /sessions/{id}/flags/{flag_id}/evidence`.
+  Implements the session lifecycle state machine from
+  `docs/07-api-orchestration-design.md` §2 and the LTI-role-derived
+  authorization model in §3 (the internal terminate route is the
+  single exception; rejected by tests when called with a learner or
+  instructor session token). 73 unit tests passing on SQLite; no
+  schema changes (the existing `flag_immutable` / `termination_record_immutable`
+  triggers already enforce the append-only invariant).
+
+### Newly surfaced this turn (turn N+7)
+
+- **`PolicyConfig.name` uniqueness vs. versioning** — the v1 spec
+  promises "name uniquely identifies a family of versions"
+  (`docs/01-data-models-design.md`), but the v1 schema enforces
+  `name` as a column-level `unique=True`.  Two POSTs with the same
+  `name` collide even when the first is retired via
+  `retire_previous=True`.  The v2 fix is a schema migration: drop
+  `unique=True` and add a partial unique constraint on
+  `(name, is_active=True, retired_at IS NULL)`.  Until then,
+  callers must give each version a distinct `name` (or rely on
+  the document default "use `cs101-default-v2` style naming").
+
+### The next atomic layer
+
+**Browser client + capture** — the LTI launch routes the learner
+to a capture client that runs face presence + head pose inference
+client-side, opens a WebSocket on `/ws`, sends sparse heavy frames
+every 2–3 s, and emits the six browser events (`visibilitychange`,
+`blur`/`focus`, `fullscreenchange`, `copy`/`paste`,
+`contextmenu`). See `docs/02-ingestion-layer-design.md` §3-§4 for
+the browser contract and `docs/04-inference-modules-design.md` for
+the client-side inference shape.
