@@ -36,13 +36,48 @@ Also from the spec (§3.1), restated as control flow:
 
 ---
 
-## Path 3: accumulated-score termination — proposed here, not previously confirmed
+## Path 3: accumulated-score termination — resolved
 
-The spec established that `MEDIUM` signals (tab-blur, gaze-warning-level) "accumulate a score rather than auto-terminating on their own" — but never specified what happens once that score gets large. Leaving it as pure accumulation with no ceiling means a student who trips a lot of low-level signals over a long exam can never reach termination through that path, no matter how many `MEDIUM` flags stack up, which seems unlikely to be the actual intent.
+**Resolved: this path is wanted.** Single running accumulator across
+all MEDIUM-severity signals (not a separate counter per modality) —
+`ExamSession.accumulated_medium_score`. Each `MEDIUM` `Flag` adds a
+weighted increment (weight per `flag_type`, configurable in
+`PolicyConfig`). `PolicyConfig.medium_score_termination_threshold` is
+set by whoever holds the proctor/admin role for that policy, ahead of
+the exam, as part of the versioned snapshot — not adjustable
+mid-session.
 
-**Proposed mechanism:** each `MEDIUM` `Flag` adds a weighted increment to `ExamSession.accumulated_medium_score` (weight per `flag_type`, configurable in `PolicyConfig` — a tab-blur might weigh less than a gaze-warning, for instance). If that running total crosses `PolicyConfig.medium_score_termination_threshold`, the aggregator emits a `Flag(severity=CRITICAL, flag_type=accumulated_score, triggered_termination=true)` — same kill-switch flow as the other two paths.
+**What happens on crossing the threshold — `PolicyConfig.medium_score_action`:**
+an admin-configured default, `auto_terminate` or `flag_for_review`.
+On crossing, the configured default fires **immediately** through the
+existing kill-switch mechanism — no new "pending termination" hold
+state. A live proctor can fast-track an **undo** via the existing
+`ProctorReview` overturn path (a new decision consequence: reinstate a
+session, not a new mechanism). `ExamSession.status` gains `reinstated`
+for this — deliberately not just reset to `active`, so a session with
+an unusual lifecycle is readable from its own status column.
 
-This is a genuinely new design decision introduced while writing this doc, not something you'd confirmed earlier — flagging it explicitly rather than treating it as settled. Worth deciding: do you want this third termination path at all, or should `MEDIUM` signals stay purely advisory for human review with no automatic ceiling?
+> **Correction — this overrides a conflicting decision made
+> independently at turn N+5.** That turn recorded "Resume/reinstatement:
+> explicitly out of v1. Termination is final from the engine's
+> perspective; the LMS handles attempt lifecycle through its own
+> tools" (`SYSTEM_STATE.md` §2). That conclusion was reached without
+> visibility into the fuller design worked through separately: the
+> live-proctor-override requirement specifically needs an undo
+> mechanism to fast-track, or "act immediately per default" has no
+> undo to fast-track at all. Explicitly confirmed to stand as the
+> resolution: **the "termination is final" call is overridden for
+> this specific path.** It does *not* touch the separate,
+> genuinely-still-open question of whether the *LMS's own* attempt
+> lifecycle (grades, reopening a native-quiz attempt) can be resumed
+> — that depends on the still-unresolved own-client-vs.-embedded-quiz
+> architectural question, and is unaffected by this engine-side
+> reinstatement.
+>
+> `TerminationRecord` gains no new column for this — "was this
+> reinstated" stays a derived fact (a `ProctorReview` with
+> `decision=overturned` against the triggering flag exists), per the
+> already-locked append-only rule.
 
 ---
 

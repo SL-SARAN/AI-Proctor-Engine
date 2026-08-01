@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Proctoring Session</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, -apple-system, sans-serif; background: #f4f4f5; }
+    #status-bar { padding: 0.75rem 1.5rem; background: #18181b; color: #fafafa; font-size: 0.875rem; }
+    #status-bar .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 0.5rem; }
+    #status-bar .dot.connecting { background: #facc15; }
+    #status-bar .dot.connected  { background: #22c55e; }
+    #status-bar .dot.reconnecting { background: #f97316; }
+    #status-bar .dot.disconnected_terminal { background: #ef4444; }
+    #main-content { max-width: 640px; margin: 2rem auto; padding: 1.5rem; background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    #error-display { color: #dc2626; padding: 1rem; display: none; }
+  </style>
+</head>
+<body>
+  <div id="status-bar">
+    <span class="dot connecting" id="status-dot"></span>
+    <span id="status-text">Connecting…</span>
+  </div>
+  <div id="main-content">
+    <p>Proctoring session is active. Please do not leave or minimize this page.</p>
+  </div>
+  <div id="error-display"></div>
+  <script type="module" src="/client/src/main.ts"></script>
+</body>
+</html>

@@ -17,6 +17,7 @@ The FastAPI route surface, the session lifecycle state machine, and how authoriz
 | `/admin/accommodation-exemptions` | GET/POST | Admin/instructor role | The pre-approval workflow — create/list exemptions before an exam starts |
 | `/admin/flags/{session_id}` | GET | Admin/instructor role | Review queue — lists `Flag`s for a session, with linked `EvidenceArtifact` |
 | `/admin/flags/{flag_id}/review` | POST | Admin/instructor role | Creates a `ProctorReview` |
+| `/admin/identity-override-requests` | GET/POST | Admin/`HEAD` role | New (designed, not yet built) — the identity-match break-glass workflow. POST creates a request (any admin); the approval action requires the `HEAD` role for that department and `approved_by_admin_id != requested_by_admin_id`, enforced server-side, not just at the schema level. |
 
 ---
 
@@ -26,6 +27,11 @@ The FastAPI route surface, the session lifecycle state machine, and how authoriz
 pending → active → completed
                  → terminated   (via automatic kill-switch or manual /terminate)
                  → under_review (set when a ProctorReview is pending on any of its flags)
+                 → reinstated   (accumulated-score fast-track undo — a ProctorReview
+                                  with decision=overturned against the triggering flag;
+                                  see docs/05 Path 3. Distinct from re-activating back to
+                                  `active` so the session's own status column shows an
+                                  unusual lifecycle without cross-referencing ProctorReview.)
 ```
 
 **Transitions worth being explicit about:**

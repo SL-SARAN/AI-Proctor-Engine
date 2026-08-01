@@ -106,8 +106,10 @@ behavior the CI workflow relies on.
 >    same escalation: from "scaling story for later" to "needed before
 >    this topology can actually carry its stated target."
 >
-> Neither issue is resolved by this table alone — see the escalated
-> framing in §6.1 and §6.2 below.
+> Neither issue was resolved by this table alone. **Update:** item 1
+> (WebSocket gateway) is now resolved — Cloudflare Durable Objects, see
+> the updated §6.1 below — but not yet implemented in code. Item 2
+> (`LaunchStateStore`) remains a live, unfixed bug — see §6.2.
 >
 > **Also unverified:** no per-pod WebSocket connection capacity figure
 > is stated anywhere in this document. The table asserts "2 replicas
@@ -189,13 +191,15 @@ with `REPLACE_ME` placeholders. In production:
   must not be reachable via an LTI-derived token (enforced in
   `tests/test_orchestration.py`).
 - **Exam client URL** (`EXAM_CLIENT_URL`) — the URL the launch
-  handler 302-redirects a learner to, with `?session_token=...`.
-  Defaults to `http://localhost:5173/exam` for local dev;
-  overridden per environment. **Must be HTTPS in production.**
+  handler 302-redirects a learner to. The redirect carries the token
+  in the URL fragment (`#session_token=...&session_id=...`). Defaults
+  to `http://localhost:5173/client/` or `http://localhost:8000/client/`
+  depending on dev-server or Docker-compose flow; overridden per
+  environment. **Must be HTTPS in production.**
 - **Admin surface URL** (`ADMIN_SURFACE_URL`) — the URL the
   launch handler 302-redirects a non-learner
-  (instructor / admin / proctor) to, with `?session_token=...`.
-  Defaults to `http://localhost:5173/admin` for local dev;
+  (instructor / admin / proctor) to, carrying the same fragment
+  variables. Defaults to `http://localhost:5173/admin` for local dev;
   overridden per environment. **Must be HTTPS in production.**
 - **OIDC HTTP timeout** (`OIDC_HTTP_TIMEOUT_SECONDS`) — the
   timeout the production `httpx.AsyncClient` uses for OIDC
@@ -228,24 +232,16 @@ the property that lets the next round of scaling happen without
 redesign:
 
 1. **WebSocket affinity breaks down** past ~10 API replicas on a
-   single ingress. **Escalated (2026-07-24):** with "thousands of
-   concurrent sessions" now the confirmed scale target and this
-   document's own HPA ceiling set at exactly 10 replicas, this is no
-   longer a someday concern — it needs resolving before the WebSocket
-   layer can be considered production-ready at its stated target, not
-   deferred to "when you outgrow the small cluster." The two options
-   below are both real fixes; which one is the right call is an open
-   architectural decision, not something to default into silently:
-   - **(a) Stateful WebSocket gateway that routes by session ID** —
-     keeps the existing Kubernetes/self-hosted topology, adds an
-     explicit routing layer instead of relying on LB sticky sessions.
-     More infrastructure to own; no new vendor dependency.
-   - **(b) Managed WebSocket product** (Cloudflare Durable Objects,
-     Ably, Pusher) — since Cloudflare is already in the topology for
-     TLS/DDoS and R2, Durable Objects in particular would avoid adding
-     a new vendor, at the cost of coupling the session-routing layer
-     to Cloudflare-specific primitives.
-   This needs a decision, not an assumption, before it's implemented.
+   single ingress. **Resolved (2026-07-25): Cloudflare Durable
+   Objects**, not a hand-built stateful gateway. Reuses the Cloudflare
+   dependency already in the topology (TLS/DDoS, R2) rather than
+   adding a new vendor, and avoids owning bespoke
+   health-check/failover/routing-table code for a problem that has
+   nothing to do with this project's actual proctoring logic.
+   Unverified: current Durable Objects pricing and regional-latency
+   characteristics against the real user base — check before
+   committing budget, not assumed from this decision alone. Not yet
+   implemented in code.
 2. **The LTI launch-state store is process-local.** v1's
    `LaunchStateStore` lives in the API pod's memory (see
    `src/proctoring_engine/lti/state.py`). The launch routes are

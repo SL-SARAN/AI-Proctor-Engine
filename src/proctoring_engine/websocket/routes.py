@@ -7,7 +7,16 @@ LTI 1.3 launch.
 
 **Connection lifecycle:**
 
-1. Client opens ``ws://<host>/ws?token=<session_token>``.
+1. Client opens ``ws://<host>/ws`` carrying the session token in the
+   ``Sec-WebSocket-Protocol`` subprotocol header.  The header takes
+   the form ``proctoring-v1.<jwt>`` — the leading ``proctoring-v1.``
+   prefix is a fixed protocol discriminator that scopes the token to
+   this engine and stops an arbitrary ``Authorization``-shaped string
+   being misinterpreted as a token on a different service.  The token
+   is **never** accepted via a query parameter: a query parameter
+   lands in reverse-proxy and load-balancer access logs the same way
+   the LTI redirect's token did, and the same fix applies at this
+   layer (RFC 6455 ``Sec-WebSocket-Protocol``).
 2. Server validates the token, verifies the session exists and is in
    an acceptable status (``PENDING`` or ``ACTIVE``), transitions
    ``PENDING → ACTIVE``, and starts the heartbeat ticker.
@@ -161,6 +170,70 @@ def _activate_session(db: Session, exam_session: ExamSession) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Subprotocol token extraction
+# ---------------------------------------------------------------------------
+
+# The fixed prefix that scopes the subprotocol to this engine.  The
+# token arrives as ``proctoring-v1.<jwt>``.  Any other subprotocol value
+# (including the absence of one, or an unrelated value the client
+# offers for compatibility with a generic WS endpoint) is rejected.
+_SUBPROTOCOL_PREFIX = "proctoring-v1."
+
+
+def _extract_token_from_subprotocol(websocket: WebSocket) -> str | None:
+    """Pull the JWT out of the ``Sec-WebSocket-Protocol`` header.
+
+    Returns the JWT string if exactly one offered subprotocol has the
+    :data:`_SUBPROTOCOL_PREFIX` prefix, ``None`` otherwise.  Per RFC
+    6455 §4.1, the client may offer multiple subprotocols in a
+    comma-separated list; we accept the first one that matches our
+    prefix.  A header that is missing entirely, carries only
+    non-matching values, or carries multiple matching values is
+    treated as malformed.
+    """
+
+    # Starlette / FastAPI exposes the parsed header values as a
+    # comma-separated list of strings (the wire format from RFC
+    # 6455 §1.9).  ``websocket.headers.get("sec-websocket-protocol")``
+    # returns the raw string, which is the shape we want to split.
+    raw = websocket.headers.get("sec-websocket-protocol")
+    if not raw:
+        return None
+
+    offered = [segment.strip() for segment in raw.split(",") if segment.strip()]
+    matching = [
+        value for value in offered if value.startswith(_SUBPROTOCOL_PREFIX)
+    ]
+    if len(matching) != 1:
+        return None
+
+    return matching[0][len(_SUBPROTOCOL_PREFIX):]
+
+
+def _echo_subprotocol(websocket: WebSocket) -> str | None:
+    """Return the subprotocol value to echo on ``accept()``.
+
+    Per RFC 6455 §4.2.2, when the client offers a subprotocol the
+    server must echo exactly one of the offered values (or none, in
+    which case no ``Sec-WebSocket-Protocol`` header is sent on the
+    101 Switching Protocols response).  We echo the single matching
+    value so the client can correlate its offered list with the
+    server's acceptance.
+    """
+
+    raw = websocket.headers.get("sec-websocket-protocol")
+    if not raw:
+        return None
+    offered = [segment.strip() for segment in raw.split(",") if segment.strip()]
+    matching = [
+        value for value in offered if value.startswith(_SUBPROTOCOL_PREFIX)
+    ]
+    if len(matching) == 1:
+        return matching[0]
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Router factory
 # ---------------------------------------------------------------------------
 
@@ -177,10 +250,30 @@ def build_ws_router(deps: _WsRouterDeps) -> APIRouter:
     async def websocket_endpoint(websocket: WebSocket) -> None:
         # ------------------------------------------------------------------
         # 1. Extract and validate the session token
+        #
+        # The token arrives in the ``Sec-WebSocket-Protocol`` subprotocol
+        # header, never as a query parameter.  The header value is
+        # ``proctoring-v1.<jwt>`` — the ``proctoring-v1.`` prefix is a
+        # fixed protocol discriminator that scopes the token to this
+        # engine; without it, an arbitrary token-shaped string from a
+        # different service could be misinterpreted as ours.
+        #
+        # A query-parameter fallback is deliberately **not** supported.
+        # A query parameter on the wss:// URL lands in reverse-proxy and
+        # load-balancer access logs the same way the LTI redirect's
+        # ``?session_token=...`` did, and the fix at that layer (URL
+        # fragment) does not apply here — fragments are never sent to
+        # the server, so the server cannot authenticate against them.
+        # The Sec-WebSocket-Protocol header is the RFC 6455 mechanism
+        # for passing a credential on the WS handshake without it
+        # touching the URL, and it is the only mechanism we accept.
         # ------------------------------------------------------------------
-        token = websocket.query_params.get("token")
-        if not token:
-            await websocket.close(code=WS_CLOSE_AUTH_FAILED, reason="Missing token.")
+        token = _extract_token_from_subprotocol(websocket)
+        if token is None:
+            await websocket.close(
+                code=WS_CLOSE_AUTH_FAILED,
+                reason="Missing or malformed Sec-WebSocket-Protocol token.",
+            )
             return
 
         try:
@@ -224,7 +317,13 @@ def build_ws_router(deps: _WsRouterDeps) -> APIRouter:
         # ------------------------------------------------------------------
         # 3. Accept the WebSocket and start the message loop
         # ------------------------------------------------------------------
-        await websocket.accept()
+        # Echo the selected subprotocol back to the client (RFC 6455
+        # §4.2.2 — the server may accept at most one of the client's
+        # offered subprotocols, or none).  Echoing is not required for
+        # the auth flow but it lets the client confirm the server
+        # actually validated the token rather than silently accepting
+        # the connection.
+        await websocket.accept(subprotocol=_echo_subprotocol(websocket))
 
         delivery = DeliveryService(
             ack_grace_seconds=deps.heartbeat_timeout_seconds,

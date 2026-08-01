@@ -368,10 +368,23 @@ class TestIdentityMatchRunner:
 
 
 class TestFaceRecognitionBackendImport:
-    """Guard test: FaceRecognitionBackend requires face_recognition."""
+    """Guard test: FaceRecognitionBackend requires face_recognition.
+
+    Previously this test used ``pytest.importorskip("face_recognition")`` to
+    skip on Windows where dlib does not build. That is no longer correct:
+    the verified install sequence (Dockerfile builder stage + CI install
+    step) ships ``dlib-bin`` prebuilt wheels for every platform including
+    Windows, plus the maintained ``face-recognition-models-ng`` fork pinned
+    to commit ``35fd7aea15bfa1aa35532b102f7b408ab238b03d``. So this test
+    now runs unconditionally on every platform — a regression in the
+    dependency chain will fail CI, not silently skip.
+
+    See the "Validate face_recognition end-to-end" steps in CI for a second
+    independent check that the *library call path* works, not just the
+    install.
+    """
 
     def test_import_skip(self) -> None:
-        fr = pytest.importorskip("face_recognition")
         from proctoring_engine.inference.identity_match import FaceRecognitionBackend
         backend = FaceRecognitionBackend()
         assert backend.embedding_dim == 128

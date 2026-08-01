@@ -25,7 +25,22 @@ dependencies = [
     "SQLAlchemy>=2.0,<3",
     "uvicorn[standard]>=0.30,<1",
     "webrtcvad-wheels>=2.0,<3",
-    "face-recognition>=1.3,<2; python_version>='3.11'",
+    # NOTE: face-recognition is intentionally NOT listed here. The naive
+    # `face-recognition>=1.3` entry breaks under setuptools>=82 because
+    # pip resolves the dependency by distribution name and pulls the broken
+    # PyPI `face-recognition-models` package, which uses the removed
+    # `pkg_resources` API. The verified install sequence is in the Dockerfile
+    # and CI workflow: pip install face_recognition --no-deps, then install
+    # the maintained fork face-recognition-models-ng from git pinned to a
+    # specific commit hash. See Dockerfile builder stage and CI unit job for
+    # the exact commands.
+    #
+    # Temporary stopgap: keep setuptools pinned below 82 so the
+    # face-recognition-models fork's *new* importlib.resources code path
+    # isn't blocked by stale wheel metadata in any dev environment that
+    # hasn't yet adopted the new install sequence. Remove this once the
+    # Docker-first install path is universal.
+    "setuptools<82",
 ]
 
 [project.optional-dependencies]

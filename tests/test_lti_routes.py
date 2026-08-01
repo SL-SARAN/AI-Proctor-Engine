@@ -313,10 +313,18 @@ def test_launch_happy_path_learner(
     location = response.headers["location"]
     assert location.startswith(settings.exam_client_url)
     assert "session_token=" in location
+    assert "session_id=" in location
 
-    # The session token round-trips.
-    from urllib.parse import parse_qs, urlparse
-    token = parse_qs(urlparse(location).query)["session_token"][0]
+    # The session token travels in the URL fragment, not the query
+    # string. Fragments are not transmitted in the HTTP request and
+    # so are never logged by reverse proxies or leaked via Referer.
+    from urllib.parse import urlparse
+
+    parsed = urlparse(location)
+    assert parsed.query == ""
+    fragment = parsed.fragment
+    fragment_params = dict(p.split("=", 1) for p in fragment.split("&"))
+    token = fragment_params["session_token"]
     decoded = decode_session_token(token, settings=settings)
     assert decoded.role == AppRole.LEARNER
 

@@ -105,6 +105,18 @@ def _envelope(
     }
 
 
+def _subprotocol_for(token: str) -> str:
+    """Build the ``Sec-WebSocket-Protocol`` header value for a token.
+
+    The header takes the form ``proctoring-v1.<jwt>`` — the leading
+    ``proctoring-v1.`` prefix is a fixed protocol discriminator that
+    scopes the token to this engine.  See
+    :mod:`proctoring_engine.websocket.routes` for the matching
+    extraction logic.
+    """
+    return f"proctoring-v1.{token}"
+
+
 @pytest.fixture()
 def settings() -> LtiSettings:
     return LtiSettings(
@@ -804,14 +816,46 @@ class TestTelemetryEventBuffer:
 class TestWebSocketAuth:
     """Authentication at the WebSocket handshake."""
 
-    def test_missing_token_closes_4001(self, ws_client):
+    def test_missing_subprotocol_closes_4001(self, ws_client):
+        """A handshake with no ``Sec-WebSocket-Protocol`` header at all
+        is rejected — the server requires the token in the subprotocol,
+        not in a query parameter, not in any other header.
+        """
         with pytest.raises(Exception):
             with ws_client.websocket_connect("/ws"):
                 pass  # Should never reach here.
 
-    def test_invalid_token_closes_4001(self, ws_client):
+    def test_unprefixed_subprotocol_closes_4001(self, ws_client):
+        """A subprotocol value without the ``proctoring-v1.`` prefix
+        is rejected — the prefix scopes the token to this engine so
+        an arbitrary token-shaped string from a different service
+        cannot be misinterpreted as ours.
+        """
         with pytest.raises(Exception):
-            with ws_client.websocket_connect("/ws?token=garbage"):
+            with ws_client.websocket_connect(
+                "/ws", subprotocols=["garbage"]
+            ):
+                pass
+
+    def test_query_param_token_not_accepted(self, ws_client, learner_token):
+        """A query-parameter token is **rejected**, not silently
+        treated as a fallback.  The server accepts the token via the
+        ``Sec-WebSocket-Protocol`` header only; a query parameter
+        would land in reverse-proxy and load-balancer access logs the
+        same way the LTI redirect's ``?session_token=...`` did, and
+        the fix at this layer is to not accept that path at all.
+        """
+        with pytest.raises(Exception):
+            with ws_client.websocket_connect(f"/ws?token={learner_token}"):
+                pass
+
+    def test_invalid_token_closes_4001(self, ws_client):
+        """A subprotocol with the right prefix but a garbage JWT
+        payload is rejected with the auth-failed close code."""
+        with pytest.raises(Exception):
+            with ws_client.websocket_connect(
+                "/ws", subprotocols=[_subprotocol_for("garbage")]
+            ):
                 pass
 
     def test_expired_token_closes_4002(self, ws_client, settings, participant, exam_session):
@@ -823,12 +867,12 @@ class TestWebSocketAuth:
             now=NOW - timedelta(hours=5),  # Expired (TTL is 4 h).
         )
         with pytest.raises(Exception):
-            with ws_client.websocket_connect(f"/ws?token={expired}"):
+            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(expired)]):
                 pass
 
     def test_instructor_token_rejected(self, ws_client, instructor_token):
         with pytest.raises(Exception):
-            with ws_client.websocket_connect(f"/ws?token={instructor_token}"):
+            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(instructor_token)]):
                 pass
 
 
@@ -846,7 +890,7 @@ class TestWebSocketSession:
             now=NOW,
         )
         with pytest.raises(Exception):
-            with ws_client.websocket_connect(f"/ws?token={token}"):
+            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(token)]):
                 pass
 
     def test_terminated_session_rejected(
@@ -863,7 +907,7 @@ class TestWebSocketSession:
             now=NOW,
         )
         with pytest.raises(Exception):
-            with ws_client.websocket_connect(f"/ws?token={token}"):
+            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(token)]):
                 pass
 
     def test_pending_session_transitions_to_active(
@@ -871,7 +915,7 @@ class TestWebSocketSession:
     ):
         """First connect transitions PENDING → ACTIVE."""
         assert exam_session.status == SessionStatus.PENDING
-        with ws_client.websocket_connect(f"/ws?token={learner_token}") as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
             # Send a message to confirm the connection is working.
             ws.send_json(_envelope(
                 "telemetry_light",
@@ -905,7 +949,7 @@ class TestWebSocketSession:
             settings=settings,
             now=NOW,
         )
-        with ws_client.websocket_connect(f"/ws?token={token}") as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(token)]) as ws:
             ws.send_json(_envelope(
                 "browser_event",
                 {"event_type": "focus"},
@@ -926,7 +970,7 @@ class TestWebSocketMessageDispatch:
     """Message ingestion over the WebSocket."""
 
     def test_telemetry_light_acked(self, ws_client, learner_token, exam_session):
-        with ws_client.websocket_connect(f"/ws?token={learner_token}") as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
             ws.send_json(_envelope(
                 "telemetry_light",
                 {
@@ -941,7 +985,7 @@ class TestWebSocketMessageDispatch:
             assert ack["payload"]["seq"] == 0
 
     def test_heavy_frame_acked(self, ws_client, learner_token, exam_session):
-        with ws_client.websocket_connect(f"/ws?token={learner_token}") as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
             ws.send_json(_envelope(
                 "telemetry_heavy_frame",
                 {
@@ -956,7 +1000,7 @@ class TestWebSocketMessageDispatch:
             assert ack["payload"]["seq"] == 0
 
     def test_audio_chunk_acked(self, ws_client, learner_token, exam_session):
-        with ws_client.websocket_connect(f"/ws?token={learner_token}") as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
             ws.send_json(_envelope(
                 "audio_chunk",
                 {
@@ -970,7 +1014,7 @@ class TestWebSocketMessageDispatch:
             assert ack["type"] == "ack"
 
     def test_browser_event_acked(self, ws_client, learner_token, exam_session):
-        with ws_client.websocket_connect(f"/ws?token={learner_token}") as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
             ws.send_json(_envelope(
                 "browser_event",
                 {"event_type": "blur"},
@@ -980,7 +1024,7 @@ class TestWebSocketMessageDispatch:
             assert ack["type"] == "ack"
 
     def test_seq_increments_across_messages(self, ws_client, learner_token, exam_session):
-        with ws_client.websocket_connect(f"/ws?token={learner_token}") as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
             for i in range(3):
                 ws.send_json(_envelope(
                     "browser_event",
@@ -992,7 +1036,7 @@ class TestWebSocketMessageDispatch:
 
     def test_session_id_mismatch_closes_4004(self, ws_client, learner_token, exam_session):
         with pytest.raises(Exception):
-            with ws_client.websocket_connect(f"/ws?token={learner_token}") as ws:
+            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
                 ws.send_json(_envelope(
                     "browser_event",
                     {"event_type": "focus"},
@@ -1002,13 +1046,13 @@ class TestWebSocketMessageDispatch:
 
     def test_invalid_json_closes_4006(self, ws_client, learner_token, exam_session):
         with pytest.raises(Exception):
-            with ws_client.websocket_connect(f"/ws?token={learner_token}") as ws:
+            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
                 ws.send_text("not json at all {{{")
                 ws.receive_json()
 
     def test_unknown_message_type_closes_4006(self, ws_client, learner_token, exam_session):
         with pytest.raises(Exception):
-            with ws_client.websocket_connect(f"/ws?token={learner_token}") as ws:
+            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
                 ws.send_json(_envelope(
                     "unknown_type",
                     {},
@@ -1018,7 +1062,7 @@ class TestWebSocketMessageDispatch:
 
     def test_pong_is_silently_ignored(self, ws_client, learner_token, exam_session):
         """A ``pong`` message from the client doesn't produce an ack."""
-        with ws_client.websocket_connect(f"/ws?token={learner_token}") as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
             ws.send_json({"type": "pong"})
             # Send a real message; its ack should be seq=0 (pong didn't increment).
             ws.send_json(_envelope(
@@ -1032,7 +1076,7 @@ class TestWebSocketMessageDispatch:
     def test_events_buffered(
         self, ws_client, learner_token, exam_session, event_buffer
     ):
-        with ws_client.websocket_connect(f"/ws?token={learner_token}") as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
             ws.send_json(_envelope(
                 "telemetry_light",
                 {
@@ -1055,7 +1099,7 @@ class TestWebSocketKillSwitchAckFlow:
     def test_kill_switch_ack_is_acked(self, ws_client, learner_token, exam_session):
         """The client can send a kill_switch_ack and receive an ack back."""
         flag_id = str(uuid.uuid4())
-        with ws_client.websocket_connect(f"/ws?token={learner_token}") as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
             ws.send_json(_envelope(
                 "kill_switch_ack",
                 {"flag_id": flag_id},

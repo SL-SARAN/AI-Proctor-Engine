@@ -61,7 +61,7 @@ embeddings" use case appears.
 | `lti_context_id` | string | Course/context reference from the LTI launch. |
 | `lti_resource_link_id` | string | The specific exam/assessment in the LMS. |
 | `attempt_reference` | string | Unique per attempt. |
-| `status` | enum: `pending`, `active`, `completed`, `terminated`, `under_review` | See `docs/07` §2 for the state machine. |
+| `status` | enum: `pending`, `active`, `completed`, `terminated`, `under_review`, `reinstated` | See `docs/07` §2 for the state machine. `reinstated` is distinct from re-activating back to `active` — a session with an unusual lifecycle should be readable from its own status column without cross-referencing `ProctorReview`, per the accumulated-score fast-track-undo design in `05-fusion-flagging-engine-design.md`. |
 | `allowed_reference_materials` | enum: `closed_book`, `open_book`, `specific_list` | Governs whether a detected book escalates severity. |
 | `permitted_material_details` | nullable JSON | Only populated when the above is `specific_list`. |
 | `consent_recorded_at` | nullable timestamp | Compliance field — no telemetry may be persisted before this is set. |
@@ -158,6 +158,7 @@ that sits alongside the original flag.
 | `gaze_warning_limit` | integer | MEDIUM flag threshold. |
 | `gaze_termination_limit` | integer | CRITICAL flag threshold. |
 | `medium_score_termination_threshold` | numeric | The accumulated-score path's threshold. |
+| `medium_score_action` | enum: `auto_terminate`, `flag_for_review` | Admin-configured default for what happens when the threshold is crossed. Fires immediately through the existing kill-switch — no new "pending termination" hold state. A live proctor can fast-track an undo via the existing `ProctorReview` overturn path (see `05-fusion-flagging-engine-design.md`), which supersedes turn N+5's separate "termination is final" call. |
 | `extra_rules` | JSONB | Forward-compatible extension point. |
 | `created_at`, `retired_at` | timestamp | `retired_at` is set when a new version supersedes this one. |
 | `created_by` | string | Admin reference; the `AdminUser` table lands in the next layer. |
@@ -199,15 +200,52 @@ the `termination_record_immutable` trigger; the ORM-level listener in
 
 ---
 
-## Open decision: admin / reviewer identity (still open)
+## Resolved: admin / reviewer identity
 
-`AccommodationExemption.approved_by`, `PolicyConfig.created_by`, and
-`ProctorReview.reviewer_reference` all reference an "admin" of some
-kind. The current schema stores these as free-form strings; the
-`AdminUser` table is the next atomic layer and will tighten the
-references to a structured identity. Until that lands, the strings
-carry whatever the launch validates (LTI `sub` claim for the platform,
-or a manually-entered reference for back-office work).
+**Resolved.** `AdminUser` is part of the initial schema (see
+`SYSTEM_STATE.md` §1). `AccommodationExemption.approved_by`,
+`PolicyConfig.created_by`, and `ProctorReview.reviewer_reference`
+remain as string fields for backward compatibility, alongside the
+structured FK columns (`approved_by_admin_id`, `created_by_id`,
+`reviewer_admin_id`).
+
+## New entity: IdentityVerificationOverrideRequest (designed, not yet built)
+
+Needed for the identity-match fail-closed default (see
+`04-inference-modules-design.md` §2): if the identity-match backend
+can't construct, the exam session blocks entirely by default. The
+only escape hatch is a scoped, time-bounded, two-person-approved
+admin override, resolved ahead of the exam (not a live/real-time
+flow).
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | UUID, PK | |
+| `exam_session_id` | FK → ExamSession | |
+| `requested_by_admin_id` | FK → AdminUser | The professor/admin requesting the override. |
+| `department` | string | See `AdminUser.department` below. |
+| `reason` | text, required | Why the override is being requested. |
+| `status` | enum: `pending`, `approved`, `rejected`, `expired` | |
+| `approved_by_admin_id` | nullable FK → AdminUser | Must hold the `HEAD` role for `department`; enforced `!= requested_by_admin_id`. |
+| `valid_from`, `valid_until` | timestamp | The time-bounded window the approval applies to. |
+| `decided_at` | nullable timestamp | |
+| `created_at` | timestamp | |
+
+Unapproved requests should auto-expire rather than sit in the queue
+indefinitely. The override lifts the session block only — it never
+suppresses `ExamSession.identity_verification_status` or the
+mandatory-review `Flag` that still gets raised.
+
+**`AdminUser` gains two fields for this:** a `department` string
+(kept deliberately light — not a full `Department` entity with its
+own lifecycle, since nothing else in the system needs that structure
+yet), and a new `HEAD` value in the admin-role enum, alongside the
+existing `ADMIN`/`INSTRUCTOR`/`PROCTOR` tiers.
+
+**`ExamSession` gains:** `identity_verification_status` — enum
+(`verified`, `unavailable`, `failed_to_match`), deliberately distinct
+from ordinary `Flag` severity, so "we couldn't check" never reads as
+a variant of "this looks suspicious."
 
 ---
 

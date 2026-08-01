@@ -22,6 +22,23 @@ This follows the standard LTI Advantage / OIDC third-party-initiated login flow 
 
 **Endpoint pattern:** one connection per exam session, established after the LTI launch using the session token issued in step 5 above for authentication (passed as a query param or subprotocol header at connect time — the WebSocket handshake itself is a plain HTTP request, so the token travels the same way a normal auth header would).
 
+> **Flagged, not yet resolved:** the LTI launch redirect
+> (`redirect_url = f"{settings.exam_client_url}?session_token={token}"`,
+> per turn N+1's `process_launch` implementation) puts the session
+> token in a plain URL query parameter. This is a real, known
+> anti-pattern — query params get logged by reverse proxies/CDNs
+> along the path, leak via `Referer` headers on any outbound link,
+> and persist in browser history. The standard fix is a URL
+> **fragment** (`#session_token=...`) instead — fragments never get
+> sent to the server or logged by intermediate infrastructure, and
+> resolve entirely client-side, so the browser client reads it the
+> same way. This already has 134 unit + 9 integration tests built
+> around the query-param behavior (turn N+1) — worth a deliberate
+> decision on whether to fix now (touching tested code) or accept as
+> known debt, not something to silently carry forward into the
+> browser-client layer that's about to consume this same redirect
+> URL.
+
 **Heartbeat:** a ping/pong every ~15s. No pong within a grace window (proposed: 30s) doesn't mean instant termination — it means a `connection_lost` `MEDIUM` flag, since a dropped connection could be a network blip, not misconduct. This is a real design fork worth flagging: silence isn't evidence of a violation, and treating it as one would punish students with bad Wi-Fi. Escalation from repeated drops to something more serious should go through the same accumulated-score path as other `MEDIUM` signals, not a special case.
 
 **Reconnect:** the client should be able to reconnect with the same session token and resume the same `ExamSession` row rather than creating a new one, as long as the session hasn't already reached a terminal `status`.

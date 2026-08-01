@@ -1,6 +1,6 @@
 # System State
 
-Last updated: 2026-07-26 (turn N+7: API / orchestration layer)
+Last updated: 2026-08-01 (turn N+8: browser client + capture skeleton)
 
 This file is the single source of truth for "where the AI Proctoring
 Engine is right now." Read this first at the start of every session
@@ -41,7 +41,8 @@ design docs but is not built.
 | Fusion & flagging engine (3 termination paths + exemption suppression) | **Implemented (turn N+5, 68 unit tests)** | `src/proctoring_engine/fusion/`, `docs/05-fusion-flagging-engine-design.md` |
 | Evidence & audit store (S3, retention job) | **Implemented (turn N+6, 58 unit tests)** | `src/proctoring_engine/evidence/`, `docs/06-evidence-audit-store-design.md` |
 | API & orchestration (full route surface, state machine) | **Implemented (turn N+7, 73 unit tests)** | `src/proctoring_engine/orchestration/`, `docs/07-api-orchestration-design.md` |
-| Browser client | Not started | n/a |
+| Browser client skeleton (WS client, browser events, rolling buffer, kill-switch UI) | **Implemented (turn N+8, 63 Vitest tests)** | `client/`, `docs/02-ingestion-layer-design.md` |
+| Client-side inference (FaceDetector, FaceLandmarker) | Not started | n/a |
 
 `docs/COMPLETION_STATUS.md` and `docs/CLAUDE_HANDOFF.md` describe the
 *original* data-model layer only; this file is the up-to-date record
@@ -177,9 +178,21 @@ Per `docs/VERIFICATION_LOG.md`:
   single accumulator across all MEDIUM signals, weights in
   `PolicyConfig`, threshold set pre-exam as part of the versioned
   snapshot, not adjustable mid-session.
-- Resume/reinstatement: **explicitly out of v1.** Termination is
-  final from the engine's perspective; the LMS handles attempt
-  lifecycle through its own tools.
+- Resume/reinstatement: **superseded (2026-07-25) — see correction
+  below.** This turn's original call was "explicitly out of v1;
+  termination is final from the engine's perspective." That was
+  reached without visibility into the fuller live-proctor-override
+  design worked through separately, which specifically requires an
+  engine-side undo mechanism for the accumulated-score
+  act-immediately/fast-track-undo path to mean anything.
+  **Corrected resolution: the fast-track undo via the existing
+  `ProctorReview` overturn path stands** — `ExamSession.status` gains
+  `reinstated`. This does not reopen the separate,
+  still-genuinely-open question of whether the *LMS's own* attempt/grade
+  lifecycle can be resumed (depends on the unresolved
+  own-client-vs.-embedded-native-quiz architecture) — only the
+  engine-side session state. See `05-fusion-flagging-engine-design.md`
+  Path 3 for the full design.
 - Total unit tests passing on SQLite: **504** (436 prior + 68 new).
 
 ### Evidence & audit store (turn N+6)
@@ -306,10 +319,10 @@ Per `docs/VERIFICATION_LOG.md`:
   environment to provision.
 - LTI 1.3 launch / WebSocket transport / inference / fusion / storage
   — all the upper layers. None are built.
-- Live load testing on a real Postgres instance. The schema is
-  designed for moderate concurrency (tens–low hundreds of
-  concurrent sessions, scaling to thousands with the documented
-  k8s sizing); a load test is the next environment to provision
+- Live load testing on a real Postgres instance. The schema targets
+  thousands of concurrent sessions (revised 2026-07-24 from the
+  original "moderate, tens–low hundreds" figure) with the documented
+  k8s sizing; a load test is the next environment to provision
   after the LTI layer is in.
 
 ## 4. Locked architecture decisions (do not re-litigate without user sign-off)
@@ -524,12 +537,9 @@ From `docs/proctoring-engine-v1-spec.md` §1 and the design docs:
   audit hardening needs restricted roles and immutable / off-site
   log export.
 - **WebSocket affinity breaks down past ~10 API replicas on a single
-  ingress.** Was framed as a future concern when scale was undecided;
-  now that thousands of concurrent sessions is confirmed (§4), ~10
-  replicas is nowhere near enough capacity, so this is a near-term
-  blocker for the WebSocket layer actually carrying production load,
-  not a someday item. Document and implement the gateway migration
-  path in `docs/DEPLOYMENT.md` §6 before treating that layer as done.
+  ingress.** **Resolved (2026-07-25): Cloudflare Durable Objects** —
+  not yet implemented in code. Pricing/regional-latency still needs a
+  real check before committing budget.
 
 ## 11. Files of immediate interest
 
@@ -599,6 +609,14 @@ it to mark progress and to identify the next single atomic layer.
       deletion job) — 58 unit tests passing (turn N+6)
 - [x] API / orchestration (full route surface, state machine,
       authorization) — 73 unit tests passing (turn N+7)
-- [ ] Browser client + capture
+- [x] Browser client + capture (skeleton, WebSocket, browser events,
+      rolling buffer, kill-switch UI) — 63 Vitest client tests + 4
+      updated Python tests (639 total Python unit tests) passing
+      (turn N+8). Session-token delivery fixed at both ends: URL
+      fragment for the LTI redirect, `Sec-WebSocket-Protocol`
+      subprotocol header for the WS handshake. Query-param token
+      rejected by the server (no fallback). Client-side inference
+      (`@mediapipe/tasks-vision`) declared but not imported — turn N+9.
+- [ ] Client-side inference (FaceDetector, FaceLandmarker) — turn N+9
 - [ ] Production deployment (k8s cluster provisioned, end-to-end
       smoke test on a live cluster)

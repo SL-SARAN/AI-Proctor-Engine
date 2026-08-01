@@ -281,8 +281,9 @@ The **evidence & audit store** is now complete (turn N+6). The
 | N+5 | Fusion & flagging engine (3 termination paths + exemption suppression + book severity) | 68 unit |
 | N+6 | Evidence & audit store (S3-compatible adapter, checksums, retention deletion job) | 58 unit |
 | N+7 | API / orchestration (full route surface, session state machine, internal `INTERNAL_TERMINATE_TOKEN`, admin CRUD, evidence flush) | 73 unit |
+| N+8 | Browser client skeleton (WS subprotocol auth, browser events, rolling buffer, kill-switch UI), plus LTI fragment fix | 63 client + 4 Python |
 
-**Total: 635 unit tests passing, 16 PostgreSQL integration tests passing.**
+**Total: 639 unit + 63 client tests passing, 16 PostgreSQL integration tests passing.**
 
 ### Library availability (2026-07-24 corrections applied)
 
@@ -311,44 +312,16 @@ Per `SKILLS_ALIGNMENT.md` §7, these still require explicit user choice:
 - MediaPipe bundle path: env var.
 - YOLO weights path: env var.
 
-### The next atomic layer
+### Resolved this turn (turn N+8)
 
-### Resolved this turn (turn N+7)
-
-- **API / orchestration layer landed.** The full FastAPI route surface
-  covers `GET /sessions/{id}/status`, `POST /sessions/{id}/terminate`
-  (internal-only via `Authorization: Bearer <INTERNAL_TERMINATE_TOKEN>`),
-  `POST/GET /admin/policy-config`, `POST/GET /admin/accommodation-exemptions`,
-  `GET /admin/flags/{session_id}`, `POST /admin/flags/{flag_id}/review`,
-  and the deferred-gap `POST /sessions/{id}/flags/{flag_id}/evidence`.
-  Implements the session lifecycle state machine from
-  `docs/07-api-orchestration-design.md` §2 and the LTI-role-derived
-  authorization model in §3 (the internal terminate route is the
-  single exception; rejected by tests when called with a learner or
-  instructor session token). 73 unit tests passing on SQLite; no
-  schema changes (the existing `flag_immutable` / `termination_record_immutable`
-  triggers already enforce the append-only invariant).
-
-### Newly surfaced this turn (turn N+7)
-
-- **`PolicyConfig.name` uniqueness vs. versioning** — the v1 spec
-  promises "name uniquely identifies a family of versions"
-  (`docs/01-data-models-design.md`), but the v1 schema enforces
-  `name` as a column-level `unique=True`.  Two POSTs with the same
-  `name` collide even when the first is retired via
-  `retire_previous=True`.  The v2 fix is a schema migration: drop
-  `unique=True` and add a partial unique constraint on
-  `(name, is_active=True, retired_at IS NULL)`.  Until then,
-  callers must give each version a distinct `name` (or rely on
-  the document default "use `cs101-default-v2` style naming").
+- **Session token delivery** — no longer travels in any query string. The LTI redirect uses the URL fragment (`#`); the WebSocket handshake uses the `Sec-WebSocket-Protocol` header. Resolves the leak outlined in `docs/02` §2.
+- **Client test architecture** — Vanilla TypeScript + Vite + Vitest, run in a separate `client-ci` GitHub Actions job.
+- **Client serving** — multi-stage Docker build produces `/client-dist/`, served by the FastAPI `StaticFiles` mount at `/client/`.
 
 ### The next atomic layer
 
-**Browser client + capture** — the LTI launch routes the learner
-to a capture client that runs face presence + head pose inference
-client-side, opens a WebSocket on `/ws`, sends sparse heavy frames
-every 2–3 s, and emits the six browser events (`visibilitychange`,
-`blur`/`focus`, `fullscreenchange`, `copy`/`paste`,
-`contextmenu`). See `docs/02-ingestion-layer-design.md` §3-§4 for
-the browser contract and `docs/04-inference-modules-design.md` for
+**Client-side inference** (turn N+9). The browser client skeleton is
+complete (turn N+8); turn N+9 adds the `@mediapipe/tasks-vision`
+runtime code to the client (`FaceDetector` + `FaceLandmarker`) and the
+heavy-frame capture loop. See `docs/04-inference-modules-design.md` for
 the client-side inference shape.

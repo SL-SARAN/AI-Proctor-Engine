@@ -14,26 +14,27 @@ fail-closed env-var check:
   the API / orchestration layer (turn N+7).  Mounted when **both**
   the LTI settings and the orchestration settings are available,
   and the evidence-store settings can be loaded.
+* ``/client/`` — the browser capture client static bundle (turn N+8).
+  Mounted when the ``client-dist/`` directory exists on disk
+  (built by the Dockerfile's Node.js build stage).
 
 If a layer's env vars are missing the lifespan logs a warning and
 serves the rest of the surface.  This is the v1 dev-mode shape: a
 developer with no LMS can still run the service and exercise the
 data model + the orchestration surface; a developer with an LMS but
 no S3 standalone can still launch and start a session.
-
-Future layers (browser client, audit-export endpoint, metrics
-scrape endpoint) will be mounted in the same lifespan-managed
-path.
 """
 
 from __future__ import annotations
 
 import logging
+import pathlib
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Callable
 
 import httpx
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
 from proctoring_engine.config import get_settings
@@ -255,6 +256,30 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 evidence_store=_evidence_store,
             )
             app.include_router(build_orchestration_router(orch_deps))
+
+    # ---- Static client bundle ------------------------------------------
+    # The browser capture client is built by the Dockerfile's Node.js
+    # stage and placed in ``client-dist/``.  In local dev the developer
+    # runs ``npm run dev`` from ``client/`` and Vite proxies to the
+    # FastAPI backend.  The static mount is a production convenience so
+    # the client bundle does not need a separate nginx sidecar or CDN to
+    # serve.  If the directory doesn't exist the mount is skipped
+    # (fail-open: the API surface is fully functional without the client
+    # bundle; the only thing missing is the static HTML/JS).
+    client_dist = pathlib.Path("client-dist")
+    if client_dist.is_dir():
+        app.mount(
+            "/client",
+            StaticFiles(directory=str(client_dist), html=True),
+            name="client",
+        )
+        logger.info("Mounted client bundle from %s at /client/", client_dist)
+    else:
+        logger.info(
+            "No client-dist/ directory found; /client/ static mount "
+            "skipped (run 'npm run build' in client/ or build the "
+            "Docker image to create it)."
+        )
 
     try:
         yield

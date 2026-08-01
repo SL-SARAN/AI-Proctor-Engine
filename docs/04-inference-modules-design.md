@@ -30,7 +30,50 @@ One subsection per modality. Each covers: what runs, the exact input/output cont
 
 ## 2. Identity match vs. enrollment
 
-**Approach:** face embedding + cosine similarity against `EnrollmentReference.embedding_vector`. Library choice deferred per the spec (`face_recognition` vs. `DeepFace`) — this doc assumes whichever is chosen exposes "give me an embedding vector for this cropped face," since that's the actual interface this module needs regardless of which library backs it.
+**Approach:** face embedding + cosine similarity against `EnrollmentReference.embedding_vector`. **Library: `face_recognition` (dlib ResNet, 128-d embeddings) — resolved, not deferred** (turn N+4). A generic image embedder (MediaPipe's `ImageEmbedder`) was evaluated and rejected: it's a MobileNetV3 trained on ImageNet object classification, with no face-identity training at all — the wrong tool for a security-critical identity check, not merely a lower-accuracy one. `DeepFace` was the other real candidate; `face_recognition` was chosen for footprint (no TF/Keras) given the confirmed thousands-of-concurrent-sessions scale and the worker-pod memory ceiling in `docs/DEPLOYMENT.md`.
+
+> **Packaging correction — not yet applied in code.** The current
+> dependency (`face-recognition>=1.3,<2`) pulls in
+> `face_recognition_models` 0.3.0, which depends on `pkg_resources` —
+> fully removed in setuptools 82.0.0 (Feb 2026). The current test suite
+> only has a Windows `pytest.importorskip` guard on this import, which
+> does not touch the actual bug: `pkg_resources` removal affects every
+> platform, including Linux production, not just Windows dev machines.
+> Verified fix: swap in the maintained fork
+> `face-recognition-models-ng` via a git URL pinned to a specific
+> commit hash (not on PyPI — model files exceed the 100MB release
+> limit). **Critical detail, verified by actually reproducing this**:
+> `face_recognition`'s own package metadata hard-declares
+> `Requires-Dist: face-recognition-models (>=0.3.0)` — pip resolves by
+> distribution name, not import name, so simply adding the fork
+> alongside the existing dependency is not sufficient; a normal
+> `pip install face_recognition` will still try to fetch and reinstall
+> the broken original package, silently overwriting the fork. The
+> verified-safe sequence: install `face_recognition` with `--no-deps`,
+> then its real dependencies (`click`, `numpy`, `Pillow`) explicitly,
+> then `dlib` via `dlib-bin` (prebuilt wheel — also solves the Windows
+> MSVC problem as a side effect, meaning the Windows test skip should
+> be **removed**, not kept), then the pinned fork. `pip check` will
+> permanently show two phantom "not installed" complaints for `dlib`
+> and `face-recognition-models` — expected, not a bug to "fix" by
+> installing the real broken packages.
+>
+> **Runtime-failure handling — designed, not yet built.** Lazy import
+> inside the backend constructor; `ImportError`/`SystemExit` propagate
+> as a clear runtime error, never a silent stub. Default: **the exam
+> session blocks entirely** rather than proceeding with identity
+> unverified — this is the one check nothing else in the pipeline
+> compensates for. Escape hatch: a scoped, time-bounded admin override
+> requiring two-person approval (a professor/admin requests with a
+> required reason; any `AdminUser` holding the new `HEAD` role for that
+> department must approve; resolved ahead of the exam, not live;
+> fails closed with no escalation if no Head responds). See the new
+> `IdentityVerificationOverrideRequest` entity in
+> `01-data-models-design.md`. The override lifts the block only —
+> `ExamSession.identity_verification_status` still records
+> `unavailable`, a mandatory-review `Flag` is still raised, and grade
+> release still holds pending that review for sessions run under an
+> override.
 
 **Contract:** input is the cropped, aligned face region (output of the face-presence module, not the raw frame — see preprocessing doc). Output is a similarity score in [0, 1].
 
@@ -57,6 +100,18 @@ Already fully speced in the original document (§3.1) — restating the module c
 Also fully speced (§3.2) — module contract:
 
 **Model:** YOLOv8 (Ultralytics), pretrained on COCO, denylist scope (`cell phone`, `laptop`, `tv`, conditionally `book`).
+
+> **Weights correction (resolved turn N+4, code matches):** force-bundle
+> the `.pt` file via `YOLO_WEIGHTS_PATH`, not the default
+> `YOLO('yolov8n.pt')` auto-download at init — matching the MediaPipe
+> `.task` bundle pattern. Ultralytics' download mechanism resolves a
+> pinned release tag by default (reproducible, unlike the earlier
+> MediaPipe "latest" concern), but it first calls `api.github.com` to
+> resolve the asset list, and that endpoint has a strict 60
+> requests/hour/IP unauthenticated limit — a real risk when several
+> pods cold-start behind the same cluster egress IP during an HPA
+> scale-up burst. This is already reflected in the code
+> (`YOLO_WEIGHTS_PATH` env-var guard, per `SYSTEM_STATE.md`).
 
 **Input:** a heavy-check frame. **Output:** a list of detections, each with class label, confidence, and bounding box — filtered to only the denylisted classes before being emitted as `TelemetryEvent`s (anything else the model detects but isn't on the denylist is discarded here, not persisted, per the denylist-not-allowlist design).
 

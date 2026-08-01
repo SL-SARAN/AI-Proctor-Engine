@@ -59,16 +59,47 @@ Evidence store                          Orchestration
 - Backend: Python 3.11+ / FastAPI, hybrid client/server inference
 - Transport: WebSocket, tiered sampling
 - Persistence: Postgres + S3-compatible object storage
-- Scale target: moderate (tens–low hundreds of concurrent sessions)
+- Scale target: **thousands of concurrent sessions** (revised
+  2026-07-24 from the original "moderate, tens–low hundreds" figure —
+  see `SYSTEM_STATE.md` §4)
 - Termination: auto-terminate on zero-tolerance violation, configurable severity threshold
 - Gaze-away: frequency-based escalation, sourced from your uploaded papers
 - Object detection: denylist strategy, phone/laptop/2nd-screen in v1, earbuds/smartwatches explicitly deferred
 - Accommodation exemptions: admin pre-approval, not self-declared
 - Evidence retention: rolling buffer + context, not evidence-only or full-session recording
+- **WebSocket gateway: Cloudflare Durable Objects** (resolved
+  2026-07-25) — not a hand-built stateful gateway. Reuses the
+  Cloudflare dependency already in the topology rather than adding a
+  new vendor or owning bespoke health-check/failover code.
+- **Accumulated-score termination path: wanted, single accumulator**
+  across all MEDIUM signals (resolved 2026-07-25) — see the full
+  design in `05-fusion-flagging-engine-design.md`, including the
+  admin-configurable terminate-vs-flag-for-review action and the
+  live-proctor fast-track-undo mechanism, both of which supersede
+  turn N+5's separate "termination is final" call (see that doc for
+  why).
+- **Identity-match library: `face_recognition`** (dlib ResNet), not a
+  generic embedder — resolved 2026-07-25, see
+  `04-inference-modules-design.md` §2 for the full reasoning and the
+  packaging fix it depends on.
 
-**Newly surfaced while writing these design docs — flagged clearly in the relevant file, not silently decided:**
-- Who can approve an `AccommodationExemption` or `PolicyConfig` change — no `AdminUser`/reviewer entity has been defined yet (see `01-data-models-design.md`)
-- Whether embeddings live in a `pgvector` column or an application-computed array (see `01-data-models-design.md`)
-- The exact mechanism for the accumulated-score termination path — proposed in `05-fusion-flagging-engine-design.md`, not something you'd explicitly confirmed before now
+**Resolved since this doc was first written (previously listed as open):**
+- **Admin/reviewer identity** — `AdminUser` table exists as part of
+  the initial schema (`01-data-models-design.md`); `approved_by`,
+  `created_by`, `reviewer_reference` still exist as string fields for
+  backward compatibility but the structured FK path is built.
+- **Embedding storage** — settled for v1 as a JSONB float array;
+  `pgvector` revisitable only if a "search across many embeddings"
+  use case appears.
 
-Each of those is called out inline where it appears, not buried — worth a look before we move to code.
+**Still genuinely open:**
+- The session-token delivery mechanism for LTI launches (query
+  parameter today; whether to move to a URL fragment) — see
+  `02-ingestion-layer-design.md` §6 note.
+- `PolicyConfig.name` uniqueness vs. its own versioning promise — a
+  real bug surfaced by Claude Code itself at turn N+7, fix proposed
+  but not yet applied (see `SYSTEM_STATE.md` §2, item 8).
+- The identity-match backend's runtime-failure handling (fail-closed
+  default, break-glass two-person-approved override) — designed, not
+  yet implemented; today's code only has a Windows-skip test, which
+  does not touch the underlying packaging failure.

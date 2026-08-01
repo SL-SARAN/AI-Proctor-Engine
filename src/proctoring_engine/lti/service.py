@@ -94,9 +94,24 @@ class LaunchResult:
     """The output of a successful :func:`process_launch` call.
 
     The :attr:`redirect_url` is the URL the route handler 302s
-    the browser to. It carries the session token as a query
-    parameter so the exam client (or admin surface, in v2) can
-    open the WebSocket with the token as the auth credential.
+    the browser to. It carries the session token and the exam
+    session id as a **URL fragment** (``#session_token=...&session_id=...``),
+    not a query string. Fragments are never sent in the HTTP
+    request, never logged by reverse proxies or CDNs along the
+    path, never leak via ``Referer`` headers, and never persist
+    in browser history in a way that an intermediate proxy would
+    record. The client reads both values out of
+    ``window.location.hash`` and immediately calls
+    ``history.replaceState`` to strip the fragment from the
+    visible URL.
+
+    Once the client has the token, it passes it to the
+    WebSocket handshake via the ``Sec-WebSocket-Protocol``
+    subprotocol header — not a query parameter — for the same
+    class of reason: the WS upgrade request is also logged by
+    whatever sits in front of the WS endpoint, and a query
+    parameter would put the token on the URL on every connect
+    and every reconnect.
     """
 
     participant: Participant
@@ -242,15 +257,28 @@ def process_launch(
         now=consent_at,
     )
 
-    # 7. Build the redirect URL. The token travels as a query
-    #    parameter so the exam client (or admin surface, in
-    #    v2) can open the WebSocket with it. The route
-    #    handler 302s to this URL on success.
+    # 7. Build the redirect URL. Both the session token and the
+    #    exam session id travel in the URL fragment, not the query
+    #    string. Fragments are not transmitted in the HTTP request,
+    #    so they are never logged by reverse proxies or CDNs, never
+    #    leak via ``Referer`` headers, and never end up in proxy
+    #    access logs the way a query parameter does. The client
+    #    reads them from ``window.location.hash`` and then calls
+    #    ``history.replaceState`` to strip the fragment from the
+    #    visible URL.
+    #
+    #    The route handler 302s to this URL on success.
     if role == AppRole.LEARNER:
-        redirect_url = f"{settings.exam_client_url}?session_token={session_token}"
+        redirect_url = (
+            f"{settings.exam_client_url}"
+            f"#session_token={session_token}"
+            f"&session_id={exam_session.id}"
+        )
     else:
         redirect_url = (
-            f"{settings.admin_surface_url}?session_token={session_token}"
+            f"{settings.admin_surface_url}"
+            f"#session_token={session_token}"
+            f"&session_id={exam_session.id}"
         )
 
     return LaunchResult(

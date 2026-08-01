@@ -13,6 +13,17 @@
 ARG PYTHON_VERSION=3.11
 
 # ----------------------------------------------------------------------
+# Client build stage (Node.js)
+# ----------------------------------------------------------------------
+FROM node:22-slim AS client-builder
+
+WORKDIR /client-build
+COPY client/package.json client/package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY client/ ./
+RUN npm run build
+
+# ----------------------------------------------------------------------
 # Builder stage
 # ----------------------------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim AS builder
@@ -49,7 +60,24 @@ COPY src ./src
 # non-obvious ways. Pin to the pip version that was current when
 # this project was last verified to build cleanly.
 RUN pip install --upgrade "pip==25.0.1" \
+    # The naive pip install .[dev] breaks because face_recognition's upstream
+    # metadata pulls the broken PyPI models package. The fix (verified end-to-end):
+    # 1. Install face_recognition without dependencies (blocks the bad PyPI fetch).
+    && pip install face_recognition==1.3.0 --no-deps \
+    # 2. Install the real dependencies explicitly.
+    && pip install "click>=6.0" numpy "Pillow>=10.4,<12" \
+    # 3. Install dlib prebuilt wheel.
+    && pip install dlib-bin \
+    # 4. Install the maintained fork of face_recognition_models pinned to commit.
+    && pip install "git+https://github.com/jucasansao/face_recognition_models.git@35fd7aea15bfa1aa35532b102f7b408ab238b03d" \
+    # 5. Install the proctoring engine.
     && pip install --prefix=/install ".[dev]"
+    # Note: `pip check` will report phantom warnings that dlib and
+    # face-recognition-models are not installed. This is expected — pip matches
+    # by distribution name, not import name, and the forks use alternative
+    # distribution names but satisfy the import constraint perfectly. Do not
+    # "fix" this by installing the PyPI packages; doing so would overwrite the
+    # forks.
 
 
 # ----------------------------------------------------------------------
@@ -89,6 +117,10 @@ COPY --chown=proctoring:proctoring --from=builder /build/src ./src
 COPY --chown=proctoring:proctoring pyproject.toml ./
 COPY --chown=proctoring:proctoring alembic.ini ./
 COPY --chown=proctoring:proctoring migrations ./migrations
+
+# Copy the client bundle from the Node.js build stage. Served by FastAPI
+# StaticFiles at /client/ — same TLS termination as the backend.
+COPY --chown=proctoring:proctoring --from=client-builder /client-build/dist ./client-dist
 
 USER proctoring
 

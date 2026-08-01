@@ -407,7 +407,16 @@ def test_redirect_url_uses_exam_client_for_learner(
     claims = _build_claims(settings)
     result = process_launch(db_session, claims, AppRole.LEARNER, settings=settings)
     assert result.redirect_url.startswith(settings.exam_client_url)
+    # Session token and session id travel in the URL fragment, not
+    # the query string — never logged by reverse proxies, never
+    # leaked via Referer headers, never persisted in browser history
+    # in a way that an intermediate proxy records.
     assert "session_token=" in result.redirect_url
+    assert "session_id=" in result.redirect_url
+    # Defensive: query string is empty (no "?" before the fragment).
+    fragment_index = result.redirect_url.index("#")
+    query_part = result.redirect_url[len(settings.exam_client_url) : fragment_index]
+    assert query_part == ""
 
 
 def test_redirect_url_uses_admin_surface_for_instructor(
@@ -421,6 +430,26 @@ def test_redirect_url_uses_admin_surface_for_instructor(
     )
     assert result.redirect_url.startswith(settings.admin_surface_url)
     assert "session_token=" in result.redirect_url
+    assert "session_id=" in result.redirect_url
+    fragment_index = result.redirect_url.index("#")
+    query_part = result.redirect_url[len(settings.admin_surface_url) : fragment_index]
+    assert query_part == ""
+
+
+def test_redirect_url_carries_session_id_in_fragment(
+    db_session, settings, active_policy
+) -> None:
+    """The fragment carries the exam session id alongside the token,
+    so the client can open the WebSocket against the right session
+    without parsing the JWT.
+    """
+
+    claims = _build_claims(settings)
+    result = process_launch(db_session, claims, AppRole.LEARNER, settings=settings)
+    fragment = result.redirect_url.split("#", 1)[1]
+    params = dict(p.split("=", 1) for p in fragment.split("&"))
+    assert params["session_token"] == result.session_token
+    assert params["session_id"] == str(result.exam_session.id)
 
 
 def test_learner_launch_does_not_create_admin_user(
