@@ -2,12 +2,11 @@
  * Client entry point.
  *
  * Wires the redirect-fragment reader, the WebSocket client, the
- * browser-event listeners, the rolling buffer, and the kill-switch
- * handler together.
+ * browser-event listeners, the rolling buffer, the kill-switch
+ * handler, and the capture loop (client-side inference) together.
  *
- * NOTE: client-side inference (FaceDetector, FaceLandmarker) is turn N+9.
- * This turn (N+8) only handles WS connection + browser events + rolling
- * buffer + kill-switch UI.
+ * Turn N+8: WS connection + browser events + rolling buffer + kill-switch UI.
+ * Turn N+9: Client-side inference (FaceDetector, FaceLandmarker) + capture loop.
  */
 
 import { consumeRedirectFragment, RedirectError } from './redirect.js';
@@ -16,6 +15,7 @@ import { attachBrowserEventListeners } from './browser-events.js';
 import { buildEnvelope, BrowserEventType, KillSwitchPayload } from './envelope.js';
 import { RollingBuffer } from './rolling-buffer.js';
 import { handleKillSwitch } from './kill-switch.js';
+import { CaptureLoop } from './capture-loop.js';
 
 function showError(msg: string): void {
   const el = document.getElementById('error-display');
@@ -85,7 +85,7 @@ function boot(): void {
   });
 
   // 5. Attach browser event listeners
-  const _detachBrowserEvents = attachBrowserEventListeners(
+  attachBrowserEventListeners(
     (eventType: BrowserEventType, detail: Record<string, unknown>) => {
       const envelope = buildEnvelope('browser_event', sessionId, {
         event_type: eventType,
@@ -97,6 +97,36 @@ function boot(): void {
 
   // 6. Connect
   ws.connect();
+
+  // 7. Start capture loop (client-side inference) after WebSocket connects
+  // The capture loop will:
+  // - Request camera access via getUserMedia
+  // - Initialize MediaPipe FaceDetector + FaceLandmarker
+  // - Run face presence detection on every frame (light telemetry)
+  // - Capture JPEG + landmarks every 2.5s (heavy frames)
+  // - Store frames in the rolling buffer for evidence retention
+  // The capture loop is started immediately since the WebSocket
+  // is created and connected in step 6.
+  const captureLoop = new CaptureLoop({
+    sessionId,
+    ws,
+    rollingBuffer,
+    config: {
+      heavyFrameIntervalMs: 2500,    // Heavy frame every 2.5s
+      maxLightFps: 15,                // Light inference at 15fps max
+      lightFrameSendIntervalMs: 1000, // Send light telemetry every 1s
+    },
+  });
+
+  captureLoop.start().catch((err) => {
+    showError(`Camera/init error: ${err.message}. Reload the page or check camera permissions.`);
+    console.error('Capture loop failed:', err);
+  });
+
+  // Clean up capture loop on page unload
+  window.addEventListener('beforeunload', () => {
+    captureLoop.stop();
+  });
 }
 
 // Boot on DOMContentLoaded if document is still loading, otherwise

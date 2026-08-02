@@ -42,7 +42,7 @@ design docs but is not built.
 | Evidence & audit store (S3, retention job) | **Implemented (turn N+6, 58 unit tests)** | `src/proctoring_engine/evidence/`, `docs/06-evidence-audit-store-design.md` |
 | API & orchestration (full route surface, state machine) | **Implemented (turn N+7, 73 unit tests)** | `src/proctoring_engine/orchestration/`, `docs/07-api-orchestration-design.md` |
 | Browser client skeleton (WS client, browser events, rolling buffer, kill-switch UI) | **Implemented (turn N+8, 63 Vitest tests)** | `client/`, `docs/02-ingestion-layer-design.md` |
-| Client-side inference (FaceDetector, FaceLandmarker) | Not started | n/a |
+| Client-side inference (FaceDetector, FaceLandmarker + capture loop) | **Implemented (turn N+9, 113 Vitest tests)** | `client/src/media-capture.ts`, `client/src/face-inference.ts`, `client/src/capture-loop.ts`, `docs/04-inference-modules-design.md` |
 
 `docs/COMPLETION_STATUS.md` and `docs/CLAUDE_HANDOFF.md` describe the
 *original* data-model layer only; this file is the up-to-date record
@@ -615,8 +615,17 @@ it to mark progress and to identify the next single atomic layer.
       (turn N+8). Session-token delivery fixed at both ends: URL
       fragment for the LTI redirect, `Sec-WebSocket-Protocol`
       subprotocol header for the WS handshake. Query-param token
-      rejected by the server (no fallback). Client-side inference
-      (`@mediapipe/tasks-vision`) declared but not imported — turn N+9.
-- [ ] Client-side inference (FaceDetector, FaceLandmarker) — turn N+9
+      rejected by the server (no fallback).
+- [x] Client-side inference (FaceDetector, FaceLandmarker via
+      `@mediapipe/tasks-vision` + heavy-frame capture loop) — 113
+      total Vitest client tests passing (turn N+9). Three new modules:
+      `media-capture.ts` (getUserMedia wrapper + JPEG frame encoding),
+      `face-inference.ts` (FaceDetector + FaceLandmarker wrappers with
+      lazy async init), `capture-loop.ts` (RAF-driven capture loop
+      coordinating light frames at 1s intervals and heavy frames at
+      2.5s intervals). Heavy frames stored in RollingBuffer for
+      evidence retention. Iris-position-based gaze/off-screen
+      classification. `RollingBuffer.add()` extended for heavy-frame
+      metadata. Build (`npm run build`) succeeds.
 - [ ] Production deployment (k8s cluster provisioned, end-to-end
       smoke test on a live cluster)

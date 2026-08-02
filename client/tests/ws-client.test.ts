@@ -66,9 +66,9 @@ describe('WsClient', () => {
         super(url, protocol);
         lastCreatedWs = this;
       }
-    };
+    } as unknown as typeof WebSocket;
     // Also need OPEN/CLOSED constants on the global
-    Object.assign((globalThis as Record<string, unknown>).WebSocket, {
+    Object.assign(globalThis as object, {
       CONNECTING: 0,
       OPEN: 1,
       CLOSING: 2,
@@ -81,14 +81,14 @@ describe('WsClient', () => {
     vi.restoreAllMocks();
   });
 
-  function makeClient(overrides?: Partial<Parameters<typeof WsClient.prototype.connect>[0]>) {
+  function makeClient(overrides?: Record<string, unknown>) {
     return new WsClient({
       url: 'wss://example.com/ws',
       sessionToken: 'test-jwt-token',
       reconnectBaseMs: 10,
       reconnectMaxMs: 100,
       ...overrides,
-    });
+    } as ConstructorParameters<typeof WsClient>[0]);
   }
 
   it('sends the token via the subprotocol header, not a query param', () => {
@@ -104,7 +104,7 @@ describe('WsClient', () => {
 
   it('transitions to "connected" on open', () => {
     const statuses: WSStatus[] = [];
-    const client = makeClient({ onStatusChange: (s) => statuses.push(s) });
+    const client = makeClient({ onStatusChange: (s: WSStatus) => statuses.push(s) });
     client.connect();
     lastCreatedWs!.simulateOpen();
     expect(statuses).toContain('connected');
@@ -113,7 +113,7 @@ describe('WsClient', () => {
 
   it('transitions to "disconnected_terminal" on 4xxx close code', () => {
     const statuses: WSStatus[] = [];
-    const client = makeClient({ onStatusChange: (s) => statuses.push(s) });
+    const client = makeClient({ onStatusChange: (s: WSStatus) => statuses.push(s) });
     client.connect();
     lastCreatedWs!.simulateOpen();
     lastCreatedWs!.simulateClose(4001, 'Auth failed');
@@ -123,7 +123,7 @@ describe('WsClient', () => {
   it('transitions to "reconnecting" on non-terminal close', () => {
     vi.useFakeTimers();
     const statuses: WSStatus[] = [];
-    const client = makeClient({ onStatusChange: (s) => statuses.push(s) });
+    const client = makeClient({ onStatusChange: (s: WSStatus) => statuses.push(s) });
     client.connect();
     lastCreatedWs!.simulateOpen();
     lastCreatedWs!.simulateClose(1006, 'Abnormal');

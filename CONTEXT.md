@@ -318,10 +318,29 @@ Per `SKILLS_ALIGNMENT.md` §7, these still require explicit user choice:
 - **Client test architecture** — Vanilla TypeScript + Vite + Vitest, run in a separate `client-ci` GitHub Actions job.
 - **Client serving** — multi-stage Docker build produces `/client-dist/`, served by the FastAPI `StaticFiles` mount at `/client/`.
 
+### Resolved this turn (turn N+9)
+
+- **Client-side inference** — Three new modules added to `client/src/`:
+  - `media-capture.ts` — `getUserMedia` wrapper with constraint
+    validation, frame extraction, JPEG base64 encoding.
+  - `face-inference.ts` — `FaceInferenceRunner` wrapping MediaPipe
+    Tasks Vision `FaceDetector` (face count, every frame) and
+    `FaceLandmarker` (478 iris-refined landmarks, heavy frames only).
+    Lazy async init via `FilesetResolver.forVisionTasks()`.
+  - `capture-loop.ts` — `CaptureLoop` coordinator driven by
+    `requestAnimationFrame`. Light telemetry sent every 1s, heavy
+    frames (JPEG + landmarks) every 2.5s. Heavy frames stored in the
+    `RollingBuffer` for evidence retention. Iris-position-based
+    gaze/off-screen classification (Landmark 468/473 vs. eye corners
+    33/263).
+- **RollingBuffer extended** — new `add(HeavyFrameEntry)` method to
+  accept the extended metadata format from the capture loop. Existing
+  `push()` API unchanged for backward compatibility.
+
 ### The next atomic layer
 
-**Client-side inference** (turn N+9). The browser client skeleton is
-complete (turn N+8); turn N+9 adds the `@mediapipe/tasks-vision`
-runtime code to the client (`FaceDetector` + `FaceLandmarker`) and the
-heavy-frame capture loop. See `docs/04-inference-modules-design.md` for
-the client-side inference shape.
+**Production deployment** (turn N+10). The client and server layers
+are complete; the only remaining item is the live Kubernetes cluster
+provisioning and end-to-end smoke test on a real cluster. The
+manifests under `k8s/00-…` through `k8s/10-…` are reviewed; the cluster
+itself is the next environment to provision.

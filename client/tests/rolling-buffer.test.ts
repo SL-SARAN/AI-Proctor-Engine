@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { RollingBuffer } from '../src/rolling-buffer.js';
 
 describe('RollingBuffer', () => {

@@ -1,6 +1,5 @@
 import {
   ClientEnvelope,
-  ServerMessage,
   parseServerMessage,
   KillSwitchPayload,
 } from './envelope.js';

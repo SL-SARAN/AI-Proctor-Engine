@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { attachBrowserEventListeners, isBrowserEventType } from '../src/browser-events.js';
 import type { BrowserEventType } from '../src/envelope.js';
 

@@ -25,8 +25,20 @@ export interface RollingBufferEntry {
   modality?: 'heavy_frame' | 'audio_chunk';
 }
 
+/**
+ * Extended entry format from capture loop (turn N+9).
+ * Contains additional metadata for heavy frames.
+ */
+export interface HeavyFrameEntry {
+  timestamp: number;
+  jpegBase64: string;
+  landmarks?: { x: number; y: number; z: number }[] | null;
+  dimensions: [number, number];
+}
+
 export class RollingBuffer {
   private entries: RollingBufferEntry[] = [];
+  private heavyFrameEntries: HeavyFrameEntry[] = [];
   private readonly windowMs: number;
 
   constructor(config: RollingBufferConfig) {
@@ -42,6 +54,19 @@ export class RollingBuffer {
   }
 
   /**
+   * Add a heavy frame entry from the capture loop (turn N+9).
+   * Stores the extended metadata alongside the base entry.
+   */
+  public add(entry: HeavyFrameEntry): void {
+    this.heavyFrameEntries.push(entry);
+    this.push({
+      data: entry.jpegBase64,
+      timestamp: entry.timestamp,
+      modality: 'heavy_frame',
+    });
+  }
+
+  /**
    * Returns a copy of all current entries, optionally filtered by modality.
    */
   public snapshot(modality?: 'heavy_frame' | 'audio_chunk'): RollingBufferEntry[] {
@@ -54,6 +79,7 @@ export class RollingBuffer {
   public drain(): RollingBufferEntry[] {
     const snapshot = this.entries.slice();
     this.entries = [];
+    this.heavyFrameEntries = [];
     return snapshot;
   }
 
@@ -62,6 +88,7 @@ export class RollingBuffer {
    */
   public reset(): void {
     this.entries = [];
+    this.heavyFrameEntries = [];
   }
 
   public size(): number {

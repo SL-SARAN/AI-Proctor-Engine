@@ -62,7 +62,10 @@ export function attachBrowserEventListeners(callback: BrowserEventCallback): () 
 
   // Attach all
   for (const eventName of Object.keys(listeners)) {
-    document.addEventListener(eventName, listeners[eventName]);
+    const listener = listeners[eventName];
+    if (listener) {
+      document.addEventListener(eventName, listener);
+    }
   }
 
   // Return detach function
@@ -71,7 +74,10 @@ export function attachBrowserEventListeners(callback: BrowserEventCallback): () 
     if (detached) return;
     detached = true;
     for (const eventName of Object.keys(listeners)) {
-      document.removeEventListener(eventName, listeners[eventName]);
+      const listener = listeners[eventName];
+      if (listener) {
+        document.removeEventListener(eventName, listener);
+      }
     }
   };
 }
