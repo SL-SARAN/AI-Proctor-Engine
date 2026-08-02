@@ -627,5 +627,14 @@ it to mark progress and to identify the next single atomic layer.
       evidence retention. Iris-position-based gaze/off-screen
       classification. `RollingBuffer.add()` extended for heavy-frame
       metadata. Build (`npm run build`) succeeds.
+- [x] Redis-backed `LaunchStateStore` — 14 new tests passing
+      (turn N+10). Extracts `LaunchStateStore` as a `Protocol`; renames
+      the original in-memory class to `InMemoryLaunchStateStore`;
+      adds `RedisLaunchStateStore` (async, uses `redis.asyncio`).
+      Atomic consume via Lua script (`EVALSHA`-cached). Wire via
+      `LTI_STATE_STORE_BACKEND=redis` + `REDIS_URL`. The route
+      handlers `await` whichever store is wired in. New dep:
+      `redis>=5.0,<6` + dev-only `fakeredis[lua]>=2.20,<3`. Total:
+      653 Python unit + 113 client tests passing.
 - [ ] Production deployment (k8s cluster provisioned, end-to-end
       smoke test on a live cluster)

@@ -22,6 +22,8 @@ _DEFAULT_SESSION_TOKEN_AUDIENCE = "proctoring-client"
 _DEFAULT_EXAM_CLIENT_URL = "http://localhost:5173/exam"
 _DEFAULT_ADMIN_SURFACE_URL = "http://localhost:5173/admin"
 _DEFAULT_OIDC_HTTP_TIMEOUT_SECONDS = 5.0
+_DEFAULT_STATE_STORE_BACKEND = "memory"
+_VALID_STATE_STORE_BACKENDS = frozenset({"memory", "redis"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +60,16 @@ class LtiSettings:
     # OIDC discovery and JWKS fetches. Tests override this with
     # a smaller value where the real timeout is a noisy bound.
     oidc_http_timeout_seconds: float = _DEFAULT_OIDC_HTTP_TIMEOUT_SECONDS
+    # Which launch-state backend to wire in. ``"memory"`` (default)
+    # is the single-replica fast path; ``"redis"`` is required when
+    # the api tier scales beyond one replica, per
+    # ``docs/DEPLOYMENT.md`` §6.2.
+    state_store_backend: str = _DEFAULT_STATE_STORE_BACKEND
+    # Redis connection URL, only consulted when
+    # ``state_store_backend == "redis"``. Examples:
+    # ``redis://redis:6379/0`` (no auth, in-cluster)
+    # ``redis://:password@host:6379/0`` (with auth)
+    redis_url: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Validate the secret length and numeric bounds.
@@ -87,6 +99,16 @@ class LtiSettings:
             raise ValueError("exam_client_url must be set")
         if not self.admin_surface_url:
             raise ValueError("admin_surface_url must be set")
+        if self.state_store_backend not in _VALID_STATE_STORE_BACKENDS:
+            raise ValueError(
+                f"state_store_backend must be one of "
+                f"{sorted(_VALID_STATE_STORE_BACKENDS)}, "
+                f"got {self.state_store_backend!r}"
+            )
+        if self.state_store_backend == "redis" and not self.redis_url:
+            raise ValueError(
+                "redis_url must be set when state_store_backend == 'redis'"
+            )
 
 
 _settings: LtiSettings | None = field(default=None, init=False)
@@ -170,6 +192,11 @@ def _load_from_env() -> LtiSettings:
             "OIDC_HTTP_TIMEOUT_SECONDS",
             _DEFAULT_OIDC_HTTP_TIMEOUT_SECONDS,
         ),
+        state_store_backend=getenv(
+            "LTI_STATE_STORE_BACKEND",
+            _DEFAULT_STATE_STORE_BACKEND,
+        ),
+        redis_url=_optional("REDIS_URL"),
     )
 
 

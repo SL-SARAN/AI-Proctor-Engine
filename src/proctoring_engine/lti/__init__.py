@@ -50,21 +50,28 @@ from proctoring_engine.lti.session_token import (
     issue_session_token,
 )
 from proctoring_engine.lti.state import (
+    InMemoryLaunchStateStore,
     LaunchStateError,
     LaunchStateExpired,
     LaunchStateMissing,
+    LaunchStateReplay,
     LaunchStateStore,
+    RedisLaunchStateStore,
+    generate_launch_nonce,
+    generate_launch_state,
 )
 
 
 __all__ = [
     "AppRole",
+    "InMemoryLaunchStateStore",
     "JwksCache",
     "JwksError",
     "LaunchResult",
     "LaunchStateError",
     "LaunchStateExpired",
     "LaunchStateMissing",
+    "LaunchStateReplay",
     "LaunchStateStore",
     "LtiClaimsError",
     "LtiContext",
@@ -78,6 +85,7 @@ __all__ = [
     "OidcDiscovery",
     "OidcDiscoveryCache",
     "OidcDiscoveryError",
+    "RedisLaunchStateStore",
     "SessionClaims",
     "SessionTokenError",
     "SessionTokenExpired",
@@ -85,6 +93,8 @@ __all__ = [
     "build_lti_router",
     "combined_context_id",
     "decode_session_token",
+    "generate_launch_nonce",
+    "generate_launch_state",
     "get_lti_settings",
     "is_admin_route",
     "issue_session_token",

@@ -243,19 +243,18 @@ redesign:
    committing budget, not assumed from this decision alone. Not yet
    implemented in code.
 2. **The LTI launch-state store is process-local.** v1's
-   `LaunchStateStore` lives in the API pod's memory (see
+   `InMemoryLaunchStateStore` lives in the API pod's memory (see
    `src/proctoring_engine/lti/state.py`). The launch routes are
    single-shot, so a pending `state`/`nonce` value is only ever
-   read by the same replica that issued it. **Escalated (2026-07-24):**
-   this was framed as "fine while the API tier is pinned to one
-   replica," but §3's own sizing table starts at 2 API replicas, not
-   1 — so this is not a future correctness issue contingent on scaling
-   up, it's a live bug in the topology as currently speced. The fix
-   (a Redis-backed implementation of the same `LaunchStateStore`
-   interface — a configuration swap, not a code rewrite, since the
-   route handler and launch service depend on the abstract interface)
-   needs to land before this deployment topology is trustworthy at
-   its own stated starting sizing, let alone at thousands of sessions.
+   read by the same replica that issued it. **Escalated (2026-07-24)
+   and resolved (2026-08-02, turn N+10):** at the documented starting
+   sizing of 2 API replicas this was a live bug. The fix landed as
+   `RedisLaunchStateStore` — a configuration swap, not a code
+   rewrite, since the route handler and launch service depend on
+   the abstract `LaunchStateStore` Protocol. Wire it in production
+   with `LTI_STATE_STORE_BACKEND=redis` and `REDIS_URL=...`. The
+   in-memory backend remains the default for dev/single-replica
+   deploys.
 3. **Postgres becomes the bottleneck** past ~10k concurrent sessions
    with the current write pattern (heavy at flag time, light
    otherwise). The mitigations, in order: (a) add a read replica for

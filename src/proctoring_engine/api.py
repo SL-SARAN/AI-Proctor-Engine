@@ -46,10 +46,11 @@ from proctoring_engine.evidence import (
     get_evidence_store_settings,
 )
 from proctoring_engine.lti import (
+    InMemoryLaunchStateStore,
     JwksCache,
-    LaunchStateStore,
     LtiSettings,
     OidcDiscoveryCache,
+    RedisLaunchStateStore,
     build_lti_router,
     get_lti_settings,
 )
@@ -164,9 +165,32 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             exc,
         )
     else:
-        state_store = LaunchStateStore(
-            ttl_seconds=settings.state_store_ttl_seconds
-        )
+        if settings.state_store_backend == "redis":
+            # Lazy-import redis so the dependency isn't required when
+            # running on the in-memory backend (the dev default).
+            try:
+                import redis.asyncio as redis_asyncio
+            except ImportError as exc:  # pragma: no cover - defensive
+                raise RuntimeError(
+                    "redis.asyncio is required for the 'redis' launch-state "
+                    "backend; install the redis package"
+                ) from exc
+            redis_client = redis_asyncio.from_url(
+                settings.redis_url,
+                decode_responses=False,
+            )
+            state_store = RedisLaunchStateStore(
+                client=redis_client,
+                ttl_seconds=settings.state_store_ttl_seconds,
+            )
+            logger.info(
+                "LaunchStateStore wired to Redis at %s",
+                settings.redis_url,
+            )
+        else:
+            state_store = InMemoryLaunchStateStore(
+                ttl_seconds=settings.state_store_ttl_seconds
+            )
         jwks_cache = JwksCache()
         discovery_cache = OidcDiscoveryCache()
         http_client = httpx.AsyncClient(

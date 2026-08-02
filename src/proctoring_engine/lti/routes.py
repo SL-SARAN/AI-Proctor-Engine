@@ -55,6 +55,8 @@ from proctoring_engine.lti.state import (
     LaunchStateExpired,
     LaunchStateMissing,
     LaunchStateStore,
+    generate_launch_state,
+    generate_launch_nonce,
 )
 
 
@@ -162,9 +164,9 @@ def build_lti_router(deps: _RouterDeps) -> APIRouter:
         # cryptographic randomness, URL-safe. The state is
         # bound to the launch URL and the issuer; the nonce is
         # the server-side replay protection.
-        state = LaunchStateStore.new_state()
-        nonce = LaunchStateStore.new_nonce()
-        deps.state_store.register(
+        state = generate_launch_state()
+        nonce = generate_launch_nonce()
+        await deps.state_store.register(
             state,
             nonce,
             redirect_uri=deps.settings.launch_url,
@@ -241,7 +243,7 @@ def build_lti_router(deps: _RouterDeps) -> APIRouter:
         #     7 — peek does not remove the entry.
         state_value = unverified.get("state", "")
         if isinstance(state_value, str) and state_value:
-            registered_issuer = deps.state_store.peek(state_value)
+            registered_issuer = await deps.state_store.peek(state_value)
             if registered_issuer is not None and registered_issuer != issuer:
                 raise _http_error(
                     "issuer_invalid",
@@ -335,7 +337,7 @@ def build_lti_router(deps: _RouterDeps) -> APIRouter:
         if not isinstance(state_value, str) or not state_value:
             raise _http_error("claims_invalid", "id_token is missing the 'state' claim")
         try:
-            deps.state_store.consume(state_value, claims.nonce)
+            await deps.state_store.consume(state_value, claims.nonce)
         except LaunchStateMissing as exc:
             raise _http_error("state_unknown", "state not found or already consumed") from exc
         except LaunchStateExpired as exc:

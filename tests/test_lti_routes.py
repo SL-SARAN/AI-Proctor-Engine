@@ -27,8 +27,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from proctoring_engine.lti import (
+    InMemoryLaunchStateStore,
     JwksCache,
-    LaunchStateStore,
     LtiSettings,
     OidcDiscoveryCache,
     build_lti_router,
@@ -102,8 +102,8 @@ def test_db():
 
 
 @pytest.fixture()
-def state_store() -> LaunchStateStore:
-    return LaunchStateStore(ttl_seconds=600)
+def state_store() -> InMemoryLaunchStateStore:
+    return InMemoryLaunchStateStore(ttl_seconds=600)
 
 
 @pytest.fixture()
@@ -181,7 +181,7 @@ def _sign_launch(oidc_setup, settings, *, policy_config_name="cs101-default", **
 # --- /lti/login tests -------------------------------------------------
 
 
-def test_login_happy_path_redirects_to_authorization_endpoint(
+async def test_login_happy_path_redirects_to_authorization_endpoint(
     client, httpx_mock, oidc_setup
 ) -> None:
     """A valid ``/lti/login`` request 302s to the platform's
@@ -213,7 +213,7 @@ def test_login_happy_path_redirects_to_authorization_endpoint(
     assert "login_hint=user-1" in location
 
 
-def test_login_missing_iss_returns_400(client) -> None:
+async def test_login_missing_iss_returns_400(client) -> None:
     response = client.get(
         "/lti/login",
         params={
@@ -228,7 +228,7 @@ def test_login_missing_iss_returns_400(client) -> None:
     assert response.status_code in (400, 422)
 
 
-def test_login_missing_login_hint_returns_400(client) -> None:
+async def test_login_missing_login_hint_returns_400(client) -> None:
     response = client.get(
         "/lti/login",
         params={
@@ -241,7 +241,7 @@ def test_login_missing_login_hint_returns_400(client) -> None:
     assert response.status_code in (400, 422)
 
 
-def test_login_discovery_failure_returns_502(client, httpx_mock, oidc_setup) -> None:
+async def test_login_discovery_failure_returns_502(client, httpx_mock, oidc_setup) -> None:
     """An OIDC discovery failure surfaces as 502."""
 
     httpx_mock.add_exception(httpx.ConnectError("connection refused"))
@@ -259,7 +259,7 @@ def test_login_discovery_failure_returns_502(client, httpx_mock, oidc_setup) -> 
     assert response.json()["detail"]["code"] == "discovery_error"
 
 
-def test_login_target_link_uri_mismatch_returns_400(
+async def test_login_target_link_uri_mismatch_returns_400(
     client, httpx_mock, oidc_setup
 ) -> None:
     """A ``target_link_uri`` that doesn't match the registered
@@ -289,7 +289,7 @@ def test_login_target_link_uri_mismatch_returns_400(
 # --- /lti/launch tests ------------------------------------------------
 
 
-def test_launch_happy_path_learner(
+async def test_launch_happy_path_learner(
     client, httpx_mock, oidc_setup, settings, active_policy, state_store, test_db
 ) -> None:
     """A valid learner launch 302s to the exam client with a
@@ -298,9 +298,9 @@ def test_launch_happy_path_learner(
 
     _register_full_oidc(httpx_mock, oidc_setup)
 
-    state = LaunchStateStore.new_state()
-    nonce = LaunchStateStore.new_nonce()
-    state_store.register(
+    state = InMemoryLaunchStateStore.new_state()
+    nonce = InMemoryLaunchStateStore.new_nonce()
+    await state_store.register(
         state, nonce,
         redirect_uri=settings.launch_url,
         lti_issuer=oidc_setup.issuer,
@@ -339,7 +339,7 @@ def test_launch_happy_path_learner(
     assert sessions[0].consent_recorded_at is not None
 
 
-def test_launch_happy_path_instructor_creates_admin(
+async def test_launch_happy_path_instructor_creates_admin(
     client, httpx_mock, oidc_setup, settings, active_policy, state_store, test_db
 ) -> None:
     """An instructor launch 302s to the admin surface; an
@@ -348,9 +348,9 @@ def test_launch_happy_path_instructor_creates_admin(
 
     _register_full_oidc(httpx_mock, oidc_setup)
 
-    state = LaunchStateStore.new_state()
-    nonce = LaunchStateStore.new_nonce()
-    state_store.register(
+    state = InMemoryLaunchStateStore.new_state()
+    nonce = InMemoryLaunchStateStore.new_nonce()
+    await state_store.register(
         state, nonce,
         redirect_uri=settings.launch_url,
         lti_issuer=oidc_setup.issuer,
@@ -372,16 +372,16 @@ def test_launch_happy_path_instructor_creates_admin(
     assert admins[0].role.value == "instructor"
 
 
-def test_launch_replay_returns_state_unknown(
+async def test_launch_replay_returns_state_unknown(
     client, httpx_mock, oidc_setup, settings, active_policy, state_store
 ) -> None:
     """The same ``state`` consumed twice → 400 ``state_unknown``."""
 
     _register_full_oidc(httpx_mock, oidc_setup)
 
-    state = LaunchStateStore.new_state()
-    nonce = LaunchStateStore.new_nonce()
-    state_store.register(
+    state = InMemoryLaunchStateStore.new_state()
+    nonce = InMemoryLaunchStateStore.new_nonce()
+    await state_store.register(
         state, nonce,
         redirect_uri=settings.launch_url,
         lti_issuer=oidc_setup.issuer,
@@ -396,16 +396,16 @@ def test_launch_replay_returns_state_unknown(
     assert second.json()["detail"]["code"] == "state_unknown"
 
 
-def test_launch_expired_returns_claims_invalid(
+async def test_launch_expired_returns_claims_invalid(
     client, httpx_mock, oidc_setup, settings, active_policy, state_store
 ) -> None:
     """An expired ``exp`` → 400 ``claims_invalid``."""
 
     _register_full_oidc(httpx_mock, oidc_setup)
 
-    state = LaunchStateStore.new_state()
-    nonce = LaunchStateStore.new_nonce()
-    state_store.register(
+    state = InMemoryLaunchStateStore.new_state()
+    nonce = InMemoryLaunchStateStore.new_nonce()
+    await state_store.register(
         state, nonce,
         redirect_uri=settings.launch_url,
         lti_issuer=oidc_setup.issuer,
@@ -419,7 +419,7 @@ def test_launch_expired_returns_claims_invalid(
     assert response.json()["detail"]["code"] == "claims_invalid"
 
 
-def test_launch_signature_from_unknown_key_returns_signature_invalid(
+async def test_launch_signature_from_unknown_key_returns_signature_invalid(
     client, httpx_mock, oidc_setup, settings, active_policy, state_store
 ) -> None:
     """A JWT signed by a key not in the JWKS → 400
@@ -428,9 +428,9 @@ def test_launch_signature_from_unknown_key_returns_signature_invalid(
 
     _register_full_oidc(httpx_mock, oidc_setup)
 
-    state = LaunchStateStore.new_state()
-    nonce = LaunchStateStore.new_nonce()
-    state_store.register(
+    state = InMemoryLaunchStateStore.new_state()
+    nonce = InMemoryLaunchStateStore.new_nonce()
+    await state_store.register(
         state, nonce,
         redirect_uri=settings.launch_url,
         lti_issuer=oidc_setup.issuer,
@@ -455,7 +455,7 @@ def test_launch_signature_from_unknown_key_returns_signature_invalid(
     assert response.json()["detail"]["code"] == "signature_invalid"
 
 
-def test_launch_wrong_iss_returns_issuer_invalid(
+async def test_launch_wrong_iss_returns_issuer_invalid(
     client, httpx_mock, oidc_setup, settings, active_policy, state_store
 ) -> None:
     """A launch with ``iss`` that does not match a known
@@ -464,9 +464,9 @@ def test_launch_wrong_iss_returns_issuer_invalid(
 
     _register_full_oidc(httpx_mock, oidc_setup, optional=True)
 
-    state = LaunchStateStore.new_state()
-    nonce = LaunchStateStore.new_nonce()
-    state_store.register(
+    state = InMemoryLaunchStateStore.new_state()
+    nonce = InMemoryLaunchStateStore.new_nonce()
+    await state_store.register(
         state, nonce,
         redirect_uri=settings.launch_url,
         lti_issuer=oidc_setup.issuer,
@@ -481,7 +481,7 @@ def test_launch_wrong_iss_returns_issuer_invalid(
     assert response.json()["detail"]["code"] == "issuer_invalid"
 
 
-def test_launch_wrong_nonce_returns_nonce_mismatch(
+async def test_launch_wrong_nonce_returns_nonce_mismatch(
     client, httpx_mock, oidc_setup, settings, active_policy, state_store
 ) -> None:
     """A launch with a ``nonce`` that doesn't match the
@@ -490,16 +490,16 @@ def test_launch_wrong_nonce_returns_nonce_mismatch(
 
     _register_full_oidc(httpx_mock, oidc_setup)
 
-    state = LaunchStateStore.new_state()
-    registered_nonce = LaunchStateStore.new_nonce()
-    state_store.register(
+    state = InMemoryLaunchStateStore.new_state()
+    registered_nonce = InMemoryLaunchStateStore.new_nonce()
+    await state_store.register(
         state, registered_nonce,
         redirect_uri=settings.launch_url,
         lti_issuer=oidc_setup.issuer,
     )
     id_token = _sign_launch(
         oidc_setup, settings, state=state,
-        nonce=LaunchStateStore.new_nonce(),
+        nonce=InMemoryLaunchStateStore.new_nonce(),
     )
 
     response = client.post("/lti/launch", data={"id_token": id_token}, follow_redirects=False)
@@ -507,7 +507,7 @@ def test_launch_wrong_nonce_returns_nonce_mismatch(
     assert response.json()["detail"]["code"] == "nonce_mismatch"
 
 
-def test_launch_missing_policy_returns_policy_not_found(
+async def test_launch_missing_policy_returns_policy_not_found(
     client, httpx_mock, oidc_setup, settings, state_store
 ) -> None:
     """A launch with no active policy matching the
@@ -516,9 +516,9 @@ def test_launch_missing_policy_returns_policy_not_found(
 
     _register_full_oidc(httpx_mock, oidc_setup)
 
-    state = LaunchStateStore.new_state()
-    nonce = LaunchStateStore.new_nonce()
-    state_store.register(
+    state = InMemoryLaunchStateStore.new_state()
+    nonce = InMemoryLaunchStateStore.new_nonce()
+    await state_store.register(
         state, nonce,
         redirect_uri=settings.launch_url,
         lti_issuer=oidc_setup.issuer,
@@ -533,7 +533,7 @@ def test_launch_missing_policy_returns_policy_not_found(
     assert response.json()["detail"]["code"] == "policy_not_found"
 
 
-def test_launch_wrong_aud_returns_audience_invalid(
+async def test_launch_wrong_aud_returns_audience_invalid(
     client, httpx_mock, oidc_setup, settings, active_policy, state_store
 ) -> None:
     """A launch with ``aud`` that doesn't match the
@@ -542,9 +542,9 @@ def test_launch_wrong_aud_returns_audience_invalid(
 
     _register_full_oidc(httpx_mock, oidc_setup)
 
-    state = LaunchStateStore.new_state()
-    nonce = LaunchStateStore.new_nonce()
-    state_store.register(
+    state = InMemoryLaunchStateStore.new_state()
+    nonce = InMemoryLaunchStateStore.new_nonce()
+    await state_store.register(
         state, nonce,
         redirect_uri=settings.launch_url,
         lti_issuer=oidc_setup.issuer,
@@ -559,7 +559,7 @@ def test_launch_wrong_aud_returns_audience_invalid(
     assert response.json()["detail"]["code"] == "audience_invalid"
 
 
-def test_launch_unknown_role_uri_returns_claims_invalid(
+async def test_launch_unknown_role_uri_returns_claims_invalid(
     client, httpx_mock, oidc_setup, settings, active_policy, state_store
 ) -> None:
     """A launch with a role URI the role mapper doesn't
@@ -568,9 +568,9 @@ def test_launch_unknown_role_uri_returns_claims_invalid(
 
     _register_full_oidc(httpx_mock, oidc_setup)
 
-    state = LaunchStateStore.new_state()
-    nonce = LaunchStateStore.new_nonce()
-    state_store.register(
+    state = InMemoryLaunchStateStore.new_state()
+    nonce = InMemoryLaunchStateStore.new_nonce()
+    await state_store.register(
         state, nonce,
         redirect_uri=settings.launch_url,
         lti_issuer=oidc_setup.issuer,

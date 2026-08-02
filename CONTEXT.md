@@ -296,8 +296,10 @@ The **evidence & audit store** is now complete (turn N+6). The
 
 Per `SKILLS_ALIGNMENT.md` §7, these still require explicit user choice:
 
-1. **WebSocket affinity / gateway architecture** — at "thousands of sessions" scale, the sticky-LB approach breaks down past ~10 replicas. Choose: (a) stateful WebSocket gateway, or (b) managed WebSocket product (Cloudflare Durable Objects / Ably / Pusher).
-2. **Redis-backed `LaunchStateStore`** — the process-local store is incorrect at the documented initial sizing of 2 API replicas. Needs Redis-backed implementation before multi-replica deployment.
+1. **`PolicyConfig.name` uniqueness vs. versioning** — `unique=True` blocks retiring old versions via same-name. Fix requires schema migration.
+2. **Identity-match runtime-failure handling** — designed (fail-closed + break-glass override entity), but needs admin route implementation.
+
+(Note: WebSocket affinity is resolved as Cloudflare Durable Objects, and Redis-backed LaunchStateStore is resolved; see below).
 
 ### Resolved this turn (turn N+5)
 
@@ -337,10 +339,39 @@ Per `SKILLS_ALIGNMENT.md` §7, these still require explicit user choice:
   accept the extended metadata format from the capture loop. Existing
   `push()` API unchanged for backward compatibility.
 
+### Resolved this turn (turn N+10)
+
+- **Redis-backed `LaunchStateStore`** — `src/proctoring_engine/lti/state.py`
+  refactored:
+  - `LaunchStateStore` is now a runtime-checkable `Protocol`
+    documenting the contract that route handlers depend on.
+  - `InMemoryLaunchStateStore` (the previous class, renamed) is the
+    single-replica default; its methods are `async def` so the
+    `await` shape is uniform.
+  - `RedisLaunchStateStore` (new) uses `redis.asyncio`. Atomic
+    consume is enforced by a Lua script (`EVALSHA`-cached at
+    construction) so a state cannot be consumed twice across
+    concurrent callers in different replicas. Per-key TTL is
+    enforced by Redis itself (`SET ... EX ttl_seconds`).
+- **`LtiSettings` extended** with `state_store_backend` (one of
+  `memory` or `redis`) and `redis_url`. The FastAPI lifespan
+  in `api.py` wires `RedisLaunchStateStore` when the env vars say
+  so; otherwise the in-memory default is used.
+- **CONTEXT.md doc fix** — removed "WebSocket affinity / gateway
+  architecture" from §4 (Open decisions). The other three files
+  already recorded the resolution as Cloudflare Durable Objects
+  (2026-07-25); CONTEXT.md was the stale one. The remaining open
+  decisions are now correctly: `PolicyConfig.name` uniqueness
+  schema migration, and identity-match runtime-failure handling.
+
 ### The next atomic layer
 
-**Production deployment** (turn N+10). The client and server layers
-are complete; the only remaining item is the live Kubernetes cluster
-provisioning and end-to-end smoke test on a real cluster. The
-manifests under `k8s/00-…` through `k8s/10-…` are reviewed; the cluster
-itself is the next environment to provision.
+**Production deployment** (turn N+11). All client and server code
+layers are now complete: the data model, ingestion, preprocessing,
+server-side inference, fusion, evidence, orchestration, browser
+client, client-side inference, and now the Redis-backed
+launch-state store. The remaining unchecked item is the live
+Kubernetes cluster provisioning and end-to-end smoke test on a
+real cluster. The manifests under `k8s/00-…` through `k8s/10-…`
+are reviewed; the cluster itself is the next environment to
+provision.
