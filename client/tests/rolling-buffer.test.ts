@@ -98,4 +98,73 @@ describe('RollingBuffer', () => {
     // All entries are within 10s window
     expect(buffer.size()).toBe(50);
   });
+
+  describe('heavyFrameEntries eviction (item 5 fix)', () => {
+    it('evicts old heavy frame entries beyond the time window', () => {
+      const now = Date.now();
+      // old heavy frame (12 seconds ago)
+      buffer.add({
+        timestamp: now - 12_000,
+        jpegBase64: 'old-frame',
+        landmarks: null,
+        dimensions: [640, 480],
+      });
+      // recent heavy frame
+      buffer.add({
+        timestamp: now - 1_000,
+        jpegBase64: 'recent-frame',
+        landmarks: null,
+        dimensions: [640, 480],
+      });
+
+      // The base entries array should have evicted the old one
+      expect(buffer.size()).toBe(1);
+
+      // Drain should return only the recent entry (both base + heavy cleared)
+      const drained = buffer.drain();
+      expect(drained).toHaveLength(1);
+      expect(drained[0]!.data).toBe('recent-frame');
+    });
+
+    it('drain clears both entries and heavyFrameEntries', () => {
+      const now = Date.now();
+      buffer.add({
+        timestamp: now,
+        jpegBase64: 'frame-data',
+        landmarks: [{ x: 0, y: 0, z: 0 }],
+        dimensions: [640, 480],
+      });
+
+      expect(buffer.size()).toBe(1);
+      const drained = buffer.drain();
+      expect(drained).toHaveLength(1);
+      expect(buffer.size()).toBe(0);
+
+      // A second drain should return nothing
+      expect(buffer.drain()).toHaveLength(0);
+    });
+
+    it('does not accumulate heavy frames indefinitely in a long session', () => {
+      // Simulate a session that's been running for 60 seconds, adding
+      // frames spaced 2.5s apart. Each frame's timestamp is anchored to
+      // (now - 60s) and increments forward — so the eviction logic
+      // (which uses Date.now() as "now") correctly identifies the early
+      // frames as outside the 10s window.
+      const now = Date.now();
+      const sessionStart = now - 60_000; // 60 seconds ago
+      for (let i = 0; i < 24; i++) {
+        buffer.add({
+          timestamp: sessionStart + i * 2500,
+          jpegBase64: `frame-${i}`,
+          landmarks: null,
+          dimensions: [640, 480],
+        });
+      }
+      // Only the last ~10s of frames survive in a 10s window. With 24
+      // frames spaced 2.5s apart starting 60s ago, the last ~5 frames
+      // (those within the last 10s) should remain.
+      expect(buffer.size()).toBeLessThanOrEqual(6);
+      expect(buffer.size()).toBeGreaterThan(0);
+    });
+  });
 });

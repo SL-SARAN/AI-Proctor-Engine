@@ -49,6 +49,25 @@ const REASON_MESSAGES: Record<string, string> = {
 const DEFAULT_MESSAGE = 'This session has ended and is pending review.';
 
 /**
+ * Track which flag IDs have already been handled.
+ *
+ * Prevents duplicate lockout overlays if the server retries a kill-switch
+ * delivery because the first acknowledgement was lost (network issue,
+ * race, etc.).  The set is module-scoped since a kill-switch is session-
+ * terminal — there's no scenario where we need to "reset" it.
+ */
+const handledFlagIds = new Set<string>();
+
+/**
+ * Reset the dedup guard.  **Test-only** — production code never needs
+ * this because a kill-switch is session-terminal and the set lives
+ * for the entire page lifetime.
+ */
+export function _resetHandledFlagIds(): void {
+  handledFlagIds.clear();
+}
+
+/**
  * Build and inject the lockout overlay into the page DOM.
  */
 function showLockoutOverlay(containerId: string | undefined, reason: string): void {
@@ -111,11 +130,37 @@ function showLockoutOverlay(containerId: string | undefined, reason: string): vo
 /**
  * Handle a kill-switch event. Returns the buffer contents for
  * evidence upload.
+ *
+ * If this `flag_id` has already been handled (e.g. the server retried
+ * because the first ack was lost), the function still sends a fresh
+ * ack so the server can advance its state machine, but does NOT
+ * stack a second overlay or drain the (already-empty) buffer.
  */
 export function handleKillSwitch(
   payload: KillSwitchPayload,
   deps: KillSwitchDeps
 ): KillSwitchResult {
+  // Dedup guard: re-ack but don't re-lock on retry
+  if (handledFlagIds.has(payload.flag_id)) {
+    // Still send an ack — the server may not have received the first one
+    const ackPayload: KillSwitchAcknowledgePayload = { flag_id: payload.flag_id };
+    const ackEnvelope = buildEnvelope(
+      'kill_switch_ack',
+      deps.sessionId,
+      ackPayload,
+    );
+    deps.ws.send(ackEnvelope);
+
+    return {
+      bufferedEntries: [],
+      flagId: payload.flag_id,
+      reason: payload.reason,
+    };
+  }
+
+  // First time seeing this flag_id — handle normally
+  handledFlagIds.add(payload.flag_id);
+
   // 1. Lock the UI
   showLockoutOverlay(deps.overlayContainerId, payload.reason);
 

@@ -56,6 +56,7 @@ export class RollingBuffer {
   /**
    * Add a heavy frame entry from the capture loop (turn N+9).
    * Stores the extended metadata alongside the base entry.
+   * Both entries and heavyFrameEntries are evicted to the same time window.
    */
   public add(entry: HeavyFrameEntry): void {
     this.heavyFrameEntries.push(entry);
@@ -64,6 +65,9 @@ export class RollingBuffer {
       timestamp: entry.timestamp,
       modality: 'heavy_frame',
     });
+    // evictOld() was called by push() for entries; now do the same
+    // for heavyFrameEntries so the two arrays stay in sync.
+    this.evictOldHeavyFrames();
   }
 
   /**
@@ -117,6 +121,22 @@ export class RollingBuffer {
     }
     if (startIndex > 0) {
       this.entries = this.entries.slice(startIndex);
+    }
+  }
+
+  /**
+   * Internal helper: evict heavy frame entries older than `windowMs`.
+   * Mirrors evictOld() but operates on the heavyFrameEntries array.
+   */
+  private evictOldHeavyFrames(): void {
+    const now = Date.now();
+    const cutoff = now - this.windowMs;
+    let startIndex = 0;
+    while (startIndex < this.heavyFrameEntries.length && (this.heavyFrameEntries[startIndex]?.timestamp ?? 0) < cutoff) {
+      startIndex++;
+    }
+    if (startIndex > 0) {
+      this.heavyFrameEntries = this.heavyFrameEntries.slice(startIndex);
     }
   }
 }

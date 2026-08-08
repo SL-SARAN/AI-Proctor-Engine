@@ -10,7 +10,7 @@ The FastAPI route surface, the session lifecycle state machine, and how authoriz
 |---|---|---|---|
 | `/lti/login` | GET/POST | Platform-initiated | OIDC login initiation (step 1 of the launch flow) |
 | `/lti/launch` | POST | Platform-initiated | Receives and validates the `id_token`, creates `Participant`/`ExamSession`, issues the session token |
-| `/ws/session/{session_id}` | WebSocket | Student client | Telemetry up, kill-switch/policy messages down — see ingestion doc |
+| `/ws` | WebSocket | Student client | Telemetry up, kill-switch/policy messages down. Session ID is derived from the signed JWT (`sub` claim), not from the URL path — see `src/proctoring_engine/websocket/routes.py`. |
 | `/sessions/{id}/status` | GET | Student client | REST fallback for session status if the WebSocket needs a lightweight polling backstop |
 | `/sessions/{id}/terminate` | POST | Internal (fusion engine) or admin | Explicit manual termination path, distinct from the automatic kill-switch — lets a human proctor end a session directly without waiting for an automated flag |
 | `/admin/policy-config` | GET/POST | Admin/instructor role | CRUD for `PolicyConfig` — POST creates a new *version*, never mutates an existing one (see data-models doc) |

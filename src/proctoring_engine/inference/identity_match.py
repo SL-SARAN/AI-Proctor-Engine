@@ -13,12 +13,28 @@ from several frames within a sampling window and computes the
 statistical interval (mean ± std, or min/max spread).  This keeps
 the inference module stateless and the window logic in one place.
 
-``face_recognition`` is **not installable on Windows** without MSVC
-Build Tools / dlib pre-built wheels.  The module is importable on
-any platform (the heavy import is deferred to ``FaceRecognitionBackend``
-construction), but tests that exercise the dlib backend use
+**Packaging / ``pkg_resources`` fix:** ``face-recognition`` is
+intentionally *not* listed in ``pyproject.toml`` dependencies.
+The naive ``pip install face-recognition>=1.3`` breaks under
+``setuptools>=82`` because pip resolves the dependency by
+distribution name and pulls the broken PyPI
+``face-recognition-models`` package, which uses the removed
+``pkg_resources`` API.  The verified install sequence is:
+
+1. ``pip install face_recognition==1.3.0 --no-deps``
+2. ``pip install "click>=6.0" numpy "Pillow>=10.4,<12"``
+3. ``pip install dlib-bin``  (prebuilt wheel — no MSVC needed)
+4. ``pip install "git+https://github.com/jucasansao/face_recognition_models.git@35fd7aea15bfa1aa35532b102f7b408ab238b03d"``
+
+This sequence is codified in the ``Dockerfile`` builder stage
+(lines 62-80) and the CI workflow.  See ``pyproject.toml``
+lines 29-44 for the rationale.
+
+The heavy import is deferred to ``FaceRecognitionBackend``
+construction, so the module is importable on any platform.
+Tests that exercise the dlib backend use
 ``pytest.importorskip("face_recognition")`` to skip cleanly on
-platforms where it is absent.
+platforms where the library is absent.
 
 Input:  a face-region crop (``np.ndarray``, RGB, HxWx3, uint8) +
         the enrollment embedding vector (``list[float]``).

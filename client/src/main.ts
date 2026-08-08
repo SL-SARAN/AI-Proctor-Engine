@@ -67,11 +67,49 @@ function boot(): void {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = `${protocol}//${window.location.host}/ws`;
 
+  // 7. Capture loop — created here, but started only once the WebSocket
+  //    is in the OPEN state. WsClient.send() silently drops messages
+  //    before readyState === OPEN, so starting the capture loop before
+  //    the connection is established would cause real data loss at the
+  //    start of every session.
+  let captureLoop: CaptureLoop | null = null;
+  let captureLoopStarted = false;
+
+  function startCaptureLoopOnce(): void {
+    if (captureLoopStarted) return;
+    captureLoopStarted = true;
+
+    captureLoop = new CaptureLoop({
+      sessionId,
+      ws,
+      rollingBuffer,
+      config: {
+        heavyFrameIntervalMs: 2500,    // Heavy frame every 2.5s
+        maxLightFps: 15,                // Light inference at 15fps max
+        lightFrameSendIntervalMs: 1000, // Send light telemetry every 1s
+      },
+    });
+
+    captureLoop.start().catch((err) => {
+      showError(`Camera/init error: ${err.message}. Reload the page or check camera permissions.`);
+      console.error('Capture loop failed:', err);
+    });
+  }
+
   // 4. Create WebSocket client
   const ws = new WsClient({
     url: wsUrl,
     sessionToken,
-    onStatusChange: updateStatusUI,
+    onStatusChange: (status: WSStatus) => {
+      updateStatusUI(status);
+
+      // Start capture loop once the WebSocket connection is established.
+      // This ensures no telemetry is silently dropped during the
+      // connecting / reconnecting window.
+      if (status === 'connected') {
+        startCaptureLoopOnce();
+      }
+    },
     onKillSwitch: (payload: KillSwitchPayload) => {
       handleKillSwitch(payload, {
         ws,
@@ -95,37 +133,15 @@ function boot(): void {
     }
   );
 
-  // 6. Connect
+  // 6. Connect — the capture loop starts via the onStatusChange callback
+  //    once the connection reaches 'connected' state.
   ws.connect();
-
-  // 7. Start capture loop (client-side inference) after WebSocket connects
-  // The capture loop will:
-  // - Request camera access via getUserMedia
-  // - Initialize MediaPipe FaceDetector + FaceLandmarker
-  // - Run face presence detection on every frame (light telemetry)
-  // - Capture JPEG + landmarks every 2.5s (heavy frames)
-  // - Store frames in the rolling buffer for evidence retention
-  // The capture loop is started immediately since the WebSocket
-  // is created and connected in step 6.
-  const captureLoop = new CaptureLoop({
-    sessionId,
-    ws,
-    rollingBuffer,
-    config: {
-      heavyFrameIntervalMs: 2500,    // Heavy frame every 2.5s
-      maxLightFps: 15,                // Light inference at 15fps max
-      lightFrameSendIntervalMs: 1000, // Send light telemetry every 1s
-    },
-  });
-
-  captureLoop.start().catch((err) => {
-    showError(`Camera/init error: ${err.message}. Reload the page or check camera permissions.`);
-    console.error('Capture loop failed:', err);
-  });
 
   // Clean up capture loop on page unload
   window.addEventListener('beforeunload', () => {
-    captureLoop.stop();
+    if (captureLoop) {
+      captureLoop.stop();
+    }
   });
 }
 

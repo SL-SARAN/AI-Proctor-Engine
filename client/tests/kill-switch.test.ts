@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { handleKillSwitch, KillSwitchDeps } from '../src/kill-switch.js';
+import { handleKillSwitch, KillSwitchDeps, _resetHandledFlagIds } from '../src/kill-switch.js';
 import { KillSwitchPayload } from '../src/envelope.js';
 import { RollingBuffer } from '../src/rolling-buffer.js';
 import { WsClient } from '../src/ws-client.js';
@@ -19,6 +19,9 @@ describe('handleKillSwitch', () => {
   let deps: KillSwitchDeps;
 
   beforeEach(() => {
+    _resetHandledFlagIds();
+    // Clean up any overlays from previous tests
+    document.querySelectorAll('#proctoring-kill-switch-overlay').forEach(el => el.remove());
     mockWs = makeMockWs();
     buffer = new RollingBuffer({ windowMs: 10_000 });
     deps = {
@@ -100,6 +103,8 @@ describe('handleKillSwitch', () => {
 
   it('uses "pending review" message for all reason types', () => {
     for (const reason of ['second_person_detected', 'gaze_frequency_exceeded', 'accumulated_score_exceeded'] as const) {
+      // Reset the dedup guard so each reason processes fresh
+      _resetHandledFlagIds();
       // Reset the DOM
       const old = document.getElementById('proctoring-kill-switch-overlay');
       old?.remove();
@@ -111,5 +116,93 @@ describe('handleKillSwitch', () => {
       expect(overlay).not.toBeNull();
       expect(overlay!.textContent).toContain('pending review');
     }
+  });
+
+  describe('dedup guard (item 8 fix)', () => {
+    it('does not stack a second overlay for the same flag_id', () => {
+      const payload: KillSwitchPayload = {
+        reason: 'second_person_detected',
+        flag_id: 'flag-dedup',
+      };
+
+      // First call — full handling
+      const first = handleKillSwitch(payload, deps);
+      expect(first.bufferedEntries).toHaveLength(0); // empty buffer
+      expect(mockWs.send).toHaveBeenCalledTimes(1);
+
+      // There should be exactly one overlay
+      const overlays = document.querySelectorAll('#proctoring-kill-switch-overlay');
+      expect(overlays).toHaveLength(1);
+
+      // Add a buffer entry (this simulates data arriving between kills)
+      buffer.push({ data: 'late-frame', timestamp: Date.now() });
+
+      // Second call (retry) — should not stack overlay or drain buffer
+      const retryPayload: KillSwitchPayload = {
+        reason: 'retry',
+        flag_id: 'flag-dedup', // same flag_id
+      };
+      const second = handleKillSwitch(retryPayload, deps);
+
+      // Still returns empty (not the new buffer entry — it wasn't drained)
+      expect(second.bufferedEntries).toHaveLength(0);
+
+      // Ack is still sent (so server knows the retry was received)
+      expect(mockWs.send).toHaveBeenCalledTimes(2);
+
+      // Still only one overlay in the DOM
+      const allOverlays = document.querySelectorAll('#proctoring-kill-switch-overlay');
+      expect(allOverlays).toHaveLength(1);
+    });
+
+    it('sends ack on retry even when already handled', () => {
+      const payload: KillSwitchPayload = {
+        reason: 'gaze_frequency_exceeded',
+        flag_id: 'flag-retry-ack',
+      };
+
+      handleKillSwitch(payload, deps);
+      expect(mockWs.send).toHaveBeenCalledTimes(1);
+
+      // Retry
+      handleKillSwitch({ ...payload, reason: 'retry' }, deps);
+      expect(mockWs.send).toHaveBeenCalledTimes(2);
+
+      // Both acks carry the same flag_id
+      const call1 = (mockWs.send as ReturnType<typeof vi.fn>).mock.calls[0]![0];
+      const call2 = (mockWs.send as ReturnType<typeof vi.fn>).mock.calls[1]![0];
+      expect(call1.payload.flag_id).toBe('flag-retry-ack');
+      expect(call2.payload.flag_id).toBe('flag-retry-ack');
+    });
+
+    it('handles different flag_ids independently', () => {
+      const payload1: KillSwitchPayload = {
+        reason: 'second_person_detected',
+        flag_id: 'flag-A',
+      };
+      const payload2: KillSwitchPayload = {
+        reason: 'gaze_frequency_exceeded',
+        flag_id: 'flag-B',
+      };
+
+      const first = handleKillSwitch(payload1, deps);
+      const second = handleKillSwitch(payload2, deps);
+
+      // Both should process fully (different flag_ids)
+      expect(first.flagId).toBe('flag-A');
+      expect(second.flagId).toBe('flag-B');
+      expect(mockWs.send).toHaveBeenCalledTimes(2);
+    });
+
+    it('accepts "retry" as a valid reason type', () => {
+      const payload: KillSwitchPayload = {
+        reason: 'retry',
+        flag_id: 'flag-retry-reason',
+      };
+
+      const result = handleKillSwitch(payload, deps);
+      expect(result.reason).toBe('retry');
+      expect(mockWs.send).toHaveBeenCalledTimes(1);
+    });
   });
 });

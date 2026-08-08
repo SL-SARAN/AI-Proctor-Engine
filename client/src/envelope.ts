@@ -136,12 +136,14 @@ export interface ServerEnvelope<TType extends ServerMessageType, TPayload> {
 }
 
 export interface SessionAcknowledgePayload {
-  sequence_number: number;
-  accepted_events: number;
+  /** Monotonically increasing sequence number for this session (matches server's `seq`). */
+  seq: number;
+  /** Server-side wall-clock timestamp when the frame was processed (ISO-8601). */
+  received_at: string;
 }
 
 export interface KillSwitchPayload {
-  reason: 'second_person_detected' | 'gaze_frequency_exceeded' | 'accumulated_score_exceeded';
+  reason: 'second_person_detected' | 'gaze_frequency_exceeded' | 'accumulated_score_exceeded' | 'retry';
   flag_id: string;
 }
 
