@@ -1,8 +1,11 @@
 /**
  * Face inference module using MediaPipe Tasks Vision API.
  *
- * Wraps FaceDetector (face presence/count) and FaceLandmarker
- * (landmarks for gaze detection) with lazy async initialization.
+ * Wraps FaceDetector (face presence/count) with lazy async initialization.
+ * The FaceLandmarker (gaze, blendshapes) is **not** loaded client-side —
+ * gaze / head-pose computation is server-side only, running the full
+ * MediaPipe FaceLandmarker on the raw heavy-frame JPEG.  See
+ * ``src/proctoring_engine/inference/head_pose_gaze.py``.
  *
  * Model files are served from the backend at /client/models/ and
  * loaded on first use. Initialization is async; detection methods
@@ -12,9 +15,7 @@
 import {
   FilesetResolver,
   FaceDetector,
-  FaceLandmarker,
   FaceDetectorResult,
-  FaceLandmarkerResult,
 } from '@mediapipe/tasks-vision';
 
 // ============================================================================
@@ -28,19 +29,6 @@ export interface FaceDetectorConfig {
   minSuppressionThreshold?: number;
 }
 
-export interface FaceLandmarkerConfig {
-  /** Maximum number of faces to detect (default 1) */
-  numFaces?: number;
-  /** Minimum face detection confidence (0-1, default 0.5) */
-  minFaceDetectionConfidence?: number;
-  /** Minimum face presence confidence (0-1, default 0.5) */
-  minFacePresenceConfidence?: number;
-  /** Minimum tracking confidence (0-1, default 0.5) */
-  minTrackingConfidence?: number;
-  /** Whether to output blendshapes (default false for v1) */
-  outputBlendshapes?: boolean;
-}
-
 export interface FaceDetection {
   /** Number of faces detected */
   faceCount: number;
@@ -48,15 +36,6 @@ export interface FaceDetection {
   confidence: number;
   /** Bounding box of the primary face [x, y, w, h] normalized 0-1 */
   bbox?: [number, number, number, number] | undefined;
-}
-
-export interface FaceLandmarks {
-  /** 478 normalized landmarks (x, y, z) per face */
-  landmarks: Array<{ x: number; y: number; z: number }>;
-  /** Whether blendshapes are included */
-  hasBlendshapes: boolean;
-  /** 52 blendshape coefficients (if enabled) */
-  blendshapes?: Map<string, number> | undefined;
 }
 
 export class FaceInferenceError extends Error {
@@ -75,46 +54,43 @@ const DEFAULT_WASM_PATH = '/client/wasm/';
 
 /** Default model paths relative to client bundle */
 const FACE_DETECTOR_MODEL = '/client/models/blaze_face_short_range.tflite';
-const FACE_LANDMARKER_MODEL = '/client/models/face_landmarker.task';
 
 // ============================================================================
 // Face Inference Runner
 // ============================================================================
 
 /**
- * Manages MediaPipe FaceDetector and FaceLandmarker instances.
+ * Manages the MediaPipe FaceDetector instance for light face-presence
+ * detection.
  *
  * Initialization is lazy and async. Call `initialize()` before use,
  * or check `isReady()` before calling detection methods.
+ *
+ * The FaceLandmarker is **not** loaded here — gaze / head-pose
+ * inference runs server-side on the raw heavy frame JPEG.  Keeping it
+ * out of the client saves ~2 MB of WASM + model download per session.
  */
 export class FaceInferenceRunner {
   private wasmPath: string;
   private faceDetectorModelPath: string;
-  private faceLandmarkerModelPath: string;
   private faceDetectorConfig: FaceDetectorConfig;
-  private faceLandmarkerConfig: FaceLandmarkerConfig;
 
   private faceDetector: FaceDetector | null = null;
-  private faceLandmarker: FaceLandmarker | null = null;
   private initPromise: Promise<void> | null = null;
   private initError: Error | null = null;
 
   constructor(config?: {
     wasmPath?: string;
     faceDetectorModelPath?: string;
-    faceLandmarkerModelPath?: string;
     faceDetectorConfig?: FaceDetectorConfig;
-    faceLandmarkerConfig?: FaceLandmarkerConfig;
   }) {
     this.wasmPath = config?.wasmPath ?? DEFAULT_WASM_PATH;
     this.faceDetectorModelPath = config?.faceDetectorModelPath ?? FACE_DETECTOR_MODEL;
-    this.faceLandmarkerModelPath = config?.faceLandmarkerModelPath ?? FACE_LANDMARKER_MODEL;
     this.faceDetectorConfig = config?.faceDetectorConfig ?? {};
-    this.faceLandmarkerConfig = config?.faceLandmarkerConfig ?? {};
   }
 
   /**
-   * Initialize both detectors. Safe to call multiple times;
+   * Initialize the face detector. Safe to call multiple times;
    * returns the same promise if already initializing.
    */
   async initialize(): Promise<void> {
@@ -122,7 +98,7 @@ export class FaceInferenceRunner {
       return this.initPromise;
     }
 
-    if (this.faceDetector && this.faceLandmarker) {
+    if (this.faceDetector) {
       return; // Already initialized
     }
 
@@ -145,23 +121,6 @@ export class FaceInferenceRunner {
         minDetectionConfidence: this.faceDetectorConfig.minDetectionConfidence ?? 0.5,
         minSuppressionThreshold: this.faceDetectorConfig.minSuppressionThreshold ?? 0.3,
       });
-
-      // Initialize FaceLandmarker for heavy frames (every 2-3s)
-      this.faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath: this.faceLandmarkerModelPath,
-          delegate: 'GPU',
-        },
-        runningMode: 'VIDEO',
-        numFaces: this.faceLandmarkerConfig.numFaces ?? 1,
-        minFaceDetectionConfidence:
-          this.faceLandmarkerConfig.minFaceDetectionConfidence ?? 0.5,
-        minFacePresenceConfidence:
-          this.faceLandmarkerConfig.minFacePresenceConfidence ?? 0.5,
-        minTrackingConfidence: this.faceLandmarkerConfig.minTrackingConfidence ?? 0.5,
-        outputFaceBlendshapes: this.faceLandmarkerConfig.outputBlendshapes ?? false,
-        outputFacialTransformationMatrixes: false,
-      });
     } catch (err) {
       this.initError = err instanceof Error ? err : new Error(String(err));
       this.initPromise = null;
@@ -169,9 +128,9 @@ export class FaceInferenceRunner {
     }
   }
 
-  /** Check if both detectors are ready */
+  /** Check if the detector is ready */
   isReady(): boolean {
-    return this.faceDetector !== null && this.faceLandmarker !== null;
+    return this.faceDetector !== null;
   }
 
   /** Get the initialization error, if any */
@@ -193,62 +152,6 @@ export class FaceInferenceRunner {
 
     const result: FaceDetectorResult = this.faceDetector.detectForVideo(video, timestamp);
     return this._processDetectionResult(result);
-  }
-
-  /**
-   * Run face landmark detection (heavy frame) for gaze.
-   *
-   * @param video - Video element to detect from
-   * @param timestamp - Frame timestamp in ms (performance.now())
-   * @returns Face landmarks result, or null if not ready
-   */
-  detectLandmarks(video: HTMLVideoElement, timestamp: number): FaceLandmarks | null {
-    if (!this.faceLandmarker) {
-      return null;
-    }
-
-    const result: FaceLandmarkerResult = this.faceLandmarker.detectForVideo(
-      video,
-      timestamp
-    );
-
-    if (!result.faceLandmarks || result.faceLandmarks.length === 0) {
-      return {
-        landmarks: [],
-        hasBlendshapes: false,
-      };
-    }
-
-    // Get first face's landmarks (478 points)
-    const firstFace = result.faceLandmarks[0];
-    if (!firstFace) {
-      return {
-        landmarks: [],
-        hasBlendshapes: false,
-      };
-    }
-
-    const landmarks = firstFace.map(lm => ({
-      x: lm.x,
-      y: lm.y,
-      z: lm.z,
-    }));
-
-    // Extract blendshapes if available
-    let blendshapes: Map<string, number> | undefined;
-    const firstBlendshape = result.faceBlendshapes?.[0];
-    if (firstBlendshape) {
-      blendshapes = new Map();
-      for (const category of firstBlendshape.categories) {
-        blendshapes.set(category.categoryName, category.score);
-      }
-    }
-
-    return {
-      landmarks,
-      hasBlendshapes: blendshapes !== undefined,
-      blendshapes,
-    };
   }
 
   private _processDetectionResult(result: FaceDetectorResult): FaceDetection {
@@ -290,10 +193,6 @@ export class FaceInferenceRunner {
     if (this.faceDetector) {
       this.faceDetector.close();
       this.faceDetector = null;
-    }
-    if (this.faceLandmarker) {
-      this.faceLandmarker.close();
-      this.faceLandmarker = null;
     }
     this.initPromise = null;
     this.initError = null;

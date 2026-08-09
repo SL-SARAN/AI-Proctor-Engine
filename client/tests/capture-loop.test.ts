@@ -39,20 +39,11 @@ vi.mock('../src/media-capture.js', () => ({
   getVideoDimensions: vi.fn(() => [640, 480] as [number, number]),
 }));
 
-// Mock face-inference
+// Mock face-inference (FaceLandmarker removed — gaze is server-side only)
 const mockDetectFaces = vi.fn().mockReturnValue({
   faceCount: 1,
   confidence: 0.95,
   bbox: [100, 50, 200, 250] as [number, number, number, number],
-});
-
-const mockDetectLandmarks = vi.fn().mockReturnValue({
-  landmarks: Array.from({ length: 478 }, (_, i) => ({
-    x: i / 478,
-    y: i / 478,
-    z: 0,
-  })),
-  hasBlendshapes: false,
 });
 
 const mockFaceInferenceDestroy = vi.fn();
@@ -62,7 +53,6 @@ vi.mock('../src/face-inference.js', () => ({
     initialize: vi.fn().mockResolvedValue(undefined),
     isReady: vi.fn(() => true),
     detectFaces: (...args: unknown[]) => mockDetectFaces(...args),
-    detectLandmarks: (...args: unknown[]) => mockDetectLandmarks(...args),
     destroy: (...args: unknown[]) => mockFaceInferenceDestroy(...args),
   })),
   normalizeBbox: vi.fn((bbox: number[], w: number, h: number) => [
@@ -200,7 +190,6 @@ describe('CaptureLoop', () => {
 
       expect(state.isRunning).toBe(true);
       expect(state.faceDetectorReady).toBe(true);
-      expect(state.faceLandmarkerReady).toBe(true);
       expect(state.frameCount).toBe(0);
     });
 

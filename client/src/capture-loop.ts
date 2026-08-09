@@ -2,9 +2,20 @@
  * Capture loop coordinator for client-side inference.
  *
  * Manages the frame capture loop with:
- * - Light frame inference (face presence) on every frame
- * - Heavy frame capture (JPEG upload + landmarks) at configurable intervals
+ * - Light frame inference (face presence via FaceDetector) on every frame
+ * - Heavy frame capture (JPEG upload) at configurable intervals
  * - Integration with RollingBuffer and WsClient
+ *
+ * **Gaze / head-pose computation is server-side only.**  The server runs
+ * the full MediaPipe FaceLandmarker (478 landmarks, blendshapes, EAR
+ * blink filtering) on the raw heavy frame JPEG — see
+ * ``src/proctoring_engine/inference/head_pose_gaze.py``.  An earlier
+ * version of this module ran a client-side FaceLandmarker and computed
+ * a crude iris-offset heuristic, but it was dead code: the server's
+ * ``TelemetryLightPayload`` Pydantic model only accepts
+ * ``modality: "face_presence"`` (with a required ``face_count`` field),
+ * so the client's ``head_pose_gaze`` messages were rejected at
+ * validation.  Removed 2026-08-09.
  */
 
 import { WsClient } from './ws-client.js';
@@ -19,7 +30,6 @@ import {
 import {
   FaceInferenceRunner,
   FaceDetection,
-  FaceLandmarks,
   normalizeBbox,
 } from './face-inference.js';
 
@@ -46,7 +56,6 @@ export interface CaptureLoopDeps {
 export interface CaptureLoopState {
   isRunning: boolean;
   faceDetectorReady: boolean;
-  faceLandmarkerReady: boolean;
   lastHeavyFrameTimestamp: number;
   frameCount: number;
 }
@@ -63,12 +72,13 @@ export class CaptureLoopError extends Error {
 // ============================================================================
 
 /**
- * Coordinates webcam capture, face inference, and telemetry sending.
+ * Coordinates webcam capture, face detection, and telemetry sending.
  *
  * Light frames (face presence) are processed on every frame but only
  * sent to the server at `lightFrameSendIntervalMs` intervals.
- * Heavy frames (JPEG + landmarks) are captured at `heavyFrameIntervalMs`
- * intervals and stored in the rolling buffer.
+ * Heavy frames (JPEG) are captured at `heavyFrameIntervalMs`
+ * intervals and stored in the rolling buffer.  Server-side inference
+ * (gaze, identity, object detection) runs on the heavy frame JPEG.
  */
 export class CaptureLoop {
   private sessionId: string;
@@ -187,7 +197,6 @@ export class CaptureLoop {
     return {
       isRunning: this.isRunningFlag,
       faceDetectorReady: this.faceInference?.isReady() ?? false,
-      faceLandmarkerReady: this.faceInference?.isReady() ?? false,
       lastHeavyFrameTimestamp: this.lastHeavyFrameTime,
       frameCount: this.frameCount,
     };
@@ -274,24 +283,19 @@ export class CaptureLoop {
     videoWidth: number,
     videoHeight: number
   ): void {
-    if (!this.faceInference) {
-      return;
-    }
-
     // Capture JPEG
     const jpegBase64 = captureFrameAsJpeg(video, 0.85);
     if (!jpegBase64) {
       return;
     }
 
-    // Run landmark detection for gaze
-    const landmarks = this.faceInference.detectLandmarks(video, timestamp);
-
-    // Add to rolling buffer
+    // Add to rolling buffer (JPEG only — the server runs its own
+    // FaceLandmarker on the raw frame for gaze/identity/object
+    // detection, so no client-side landmarks are stored).
     const bufferEntry = {
       timestamp,
       jpegBase64,
-      landmarks: landmarks?.landmarks ?? null,
+      landmarks: null,
       dimensions: [videoWidth, videoHeight] as [number, number],
     };
     this.rollingBuffer.add(bufferEntry);
@@ -304,48 +308,6 @@ export class CaptureLoop {
     };
 
     const envelope = buildEnvelope('telemetry_heavy_frame', this.sessionId, payload);
-    this.ws.send(envelope);
-
-    // Also send head_pose_gaze light telemetry if landmarks available
-    if (landmarks && landmarks.landmarks.length > 0) {
-      this.sendGazeTelemetry(landmarks);
-    }
-  }
-
-  private sendGazeTelemetry(landmarks: FaceLandmarks): void {
-    // Simple off-screen detection based on iris position
-    // Landmark indices for iris center (from MediaPipe FaceLandmarker spec)
-    // Left iris center: ~468, Right iris center: ~473
-    const LEFT_IRIS_CENTER = 468;
-    const RIGHT_IRIS_CENTER = 473;
-    const LEFT_EYE_CORNER = 33;  // Left eye outer corner
-    const RIGHT_EYE_CORNER = 263; // Right eye outer corner
-
-    if (landmarks.landmarks.length < RIGHT_IRIS_CENTER + 1) {
-      return;
-    }
-
-    const leftIris = landmarks.landmarks[LEFT_IRIS_CENTER]!;
-    const rightIris = landmarks.landmarks[RIGHT_IRIS_CENTER]!;
-    const leftCorner = landmarks.landmarks[LEFT_EYE_CORNER]!;
-    const rightCorner = landmarks.landmarks[RIGHT_EYE_CORNER]!;
-
-    // Simple heuristic: if both iris centers are very close to the eye corners,
-    // the person is likely looking away
-    const leftOffset = Math.abs(leftIris.x - leftCorner.x);
-    const rightOffset = Math.abs(rightIris.x - rightCorner.x);
-
-    // Threshold for "looking away" (tuned empirically)
-    const THRESHOLD = 0.02;
-    const offScreen = leftOffset < THRESHOLD && rightOffset < THRESHOLD;
-
-    const payload: TelemetryLightPayload = {
-      modality: 'head_pose_gaze',
-      confidence: landmarks.hasBlendshapes ? 0.9 : 0.7,
-      off_screen: offScreen,
-    };
-
-    const envelope = buildEnvelope('telemetry_light', this.sessionId, payload);
     this.ws.send(envelope);
   }
 }

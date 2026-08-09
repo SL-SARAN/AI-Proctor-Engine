@@ -3,6 +3,10 @@
  *
  * Uses Vitest with mocked MediaPipe Tasks Vision API.
  * vi.mock factories are hoisted — no references to outer variables.
+ *
+ * The FaceLandmarker tests were removed when client-side gaze was
+ * stripped (2026-08-09) — gaze / head-pose inference is server-side
+ * only.  See ``src/proctoring_engine/inference/head_pose_gaze.py``.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -14,10 +18,6 @@ vi.mock('@mediapipe/tasks-vision', () => {
     detectForVideo: vi.fn(),
     close: vi.fn(),
   };
-  const landmarker = {
-    detectForVideo: vi.fn(),
-    close: vi.fn(),
-  };
   return {
     FilesetResolver: {
       forVisionTasks: vi.fn().mockResolvedValue({}),
@@ -25,12 +25,8 @@ vi.mock('@mediapipe/tasks-vision', () => {
     FaceDetector: {
       createFromOptions: vi.fn().mockResolvedValue(detector),
     },
-    FaceLandmarker: {
-      createFromOptions: vi.fn().mockResolvedValue(landmarker),
-    },
-    // Expose the mock instances for test assertions.
+    // Expose the mock instance for test assertions.
     __mockDetector: detector,
-    __mockLandmarker: landmarker,
   };
 });
 
@@ -40,11 +36,9 @@ import {
   normalizeBbox,
 } from '../src/face-inference.js';
 
-// Pull out the mock instances the factory exposed.
+// Pull out the mock instance the factory exposed.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let mockDet: any;
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let mockLm: any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let mockFileset: any;
 
@@ -52,8 +46,6 @@ beforeEach(async () => {
   const mod = await import('@mediapipe/tasks-vision');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   mockDet = (mod as any).__mockDetector;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  mockLm = (mod as any).__mockLandmarker;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   mockFileset = (mod as any).FilesetResolver;
 });
@@ -94,10 +86,9 @@ describe('FaceInferenceRunner', () => {
       await runner.initialize(); // second call — should not throw
 
       expect(runner.isReady()).toBe(true);
-      // createFromOptions should only have been called once per detector
-      const { FaceDetector, FaceLandmarker } = await import('@mediapipe/tasks-vision');
+      // createFromOptions should only have been called once
+      const { FaceDetector } = await import('@mediapipe/tasks-vision');
       expect(FaceDetector.createFromOptions).toHaveBeenCalledTimes(1);
-      expect(FaceLandmarker.createFromOptions).toHaveBeenCalledTimes(1);
     });
 
     it('handles initialization failure', async () => {
@@ -113,7 +104,6 @@ describe('FaceInferenceRunner', () => {
       const customRunner = new FaceInferenceRunner({
         wasmPath: '/custom/wasm/',
         faceDetectorModelPath: '/custom/face.tflite',
-        faceLandmarkerModelPath: '/custom/landmarker.task',
       });
 
       await customRunner.initialize();
@@ -189,84 +179,12 @@ describe('FaceInferenceRunner', () => {
     });
   });
 
-  describe('detectLandmarks', () => {
-    it('returns null when not initialized', () => {
-      const result = runner.detectLandmarks(mockVideo, performance.now());
-      expect(result).toBeNull();
-    });
-
-    it('returns empty landmarks when no face detected', async () => {
-      await runner.initialize();
-
-      mockLm.detectForVideo.mockReturnValue({
-        faceLandmarks: [],
-        faceBlendshapes: [],
-      });
-
-      const result = runner.detectLandmarks(mockVideo, 1000);
-
-      expect(result?.landmarks).toEqual([]);
-      expect(result?.hasBlendshapes).toBe(false);
-    });
-
-    it('returns landmarks with blendshapes', async () => {
-      await runner.initialize();
-
-      const landmarks = Array.from({ length: 478 }, (_, i) => ({
-        x: i / 478,
-        y: i / 478,
-        z: 0,
-      }));
-
-      mockLm.detectForVideo.mockReturnValue({
-        faceLandmarks: [landmarks],
-        faceBlendshapes: [
-          {
-            categories: [
-              { categoryName: 'eyeBlinkLeft', score: 0.1 },
-              { categoryName: 'eyeBlinkRight', score: 0.05 },
-            ],
-          },
-        ],
-      });
-
-      const result = runner.detectLandmarks(mockVideo, 1000);
-
-      expect(result?.landmarks).toHaveLength(478);
-      expect(result?.hasBlendshapes).toBe(true);
-      expect(result?.blendshapes?.get('eyeBlinkLeft')).toBe(0.1);
-      expect(result?.blendshapes?.get('eyeBlinkRight')).toBe(0.05);
-    });
-
-    it('returns landmarks without blendshapes when disabled', async () => {
-      await runner.initialize();
-
-      const landmarks = Array.from({ length: 478 }, (_, i) => ({
-        x: i / 478,
-        y: i / 478,
-        z: 0,
-      }));
-
-      mockLm.detectForVideo.mockReturnValue({
-        faceLandmarks: [landmarks],
-        faceBlendshapes: [],
-      });
-
-      const result = runner.detectLandmarks(mockVideo, 1000);
-
-      expect(result?.landmarks).toHaveLength(478);
-      expect(result?.hasBlendshapes).toBe(false);
-      expect(result?.blendshapes).toBeUndefined();
-    });
-  });
-
   describe('destroy', () => {
-    it('closes both detectors', async () => {
+    it('closes the detector', async () => {
       await runner.initialize();
       runner.destroy();
 
       expect(mockDet.close).toHaveBeenCalled();
-      expect(mockLm.close).toHaveBeenCalled();
       expect(runner.isReady()).toBe(false);
     });
 
