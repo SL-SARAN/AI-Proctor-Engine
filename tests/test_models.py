@@ -345,6 +345,58 @@ def test_policy_medium_score_threshold_rejects_negative(db_session: Session) -> 
 
 
 # ----------------------------------------------------------------------
+# PolicyConfig.name uniqueness (item 3)
+# ----------------------------------------------------------------------
+
+
+def test_policy_config_active_name_must_be_unique(db_session: Session) -> None:
+    """Two active PolicyConfig rows with the same ``name`` are rejected.
+
+    Replaces the original ``unique=True`` on ``name`` with a partial
+    unique index over ``(name) WHERE is_active = true AND retired_at
+    IS NULL``.  SQLite drops the WHERE clause (no partial-index
+    support), so this test exercises the full unique-index fallback —
+    which still correctly rejects the active-duplicate case that the
+    partial index is designed to catch.
+    """
+
+    shared_name = f"shared-name-{uuid.uuid4()}"
+    policy_a = PolicyConfig(name=shared_name)
+    policy_b = PolicyConfig(name=shared_name)
+
+    db_session.add(policy_a)
+    db_session.flush()
+
+    db_session.add(policy_b)
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+    db_session.rollback()
+
+
+def test_policy_config_unique_constraint_name(db_session: Session) -> None:
+    """The partial unique index is named ``uq_policy_configs_active_name``.
+
+    Anchors the constraint name so future migrations don't accidentally
+    drop or rename it.  The Index object is introspected from the
+    table's ``__table_args__`` rather than via raw SQL because the
+    underlying DBMS may store it as a UNIQUE INDEX (Postgres /
+    SQLite) or as a UNIQUE constraint, depending on dialect.
+    """
+
+    from sqlalchemy import Index
+
+    indexes = {
+        i.name
+        for ix in PolicyConfig.__table__.indexes
+        for i in ([ix] if isinstance(ix, Index) else ix)  # noqa: PERF401
+    }
+    assert "uq_policy_configs_active_name" in indexes, (
+        f"Expected unique index 'uq_policy_configs_active_name' on "
+        f"policy_configs; got {sorted(indexes)!r}"
+    )
+
+
+# ----------------------------------------------------------------------
 # ExamSession.accumulated_medium_score
 # ----------------------------------------------------------------------
 

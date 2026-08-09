@@ -467,3 +467,126 @@ def test_admin_role_enum_values(
     assert "instructor" in values
     assert "admin" in values
     assert "proctor" in values
+
+
+# ----------------------------------------------------------------------
+# PolicyConfig.name: partial unique index (item 3)
+# ----------------------------------------------------------------------
+
+
+def test_policy_configs_partial_unique_index_exists(
+    integration_engine_session: Session,
+) -> None:
+    """The partial unique index ``uq_policy_configs_active_name`` is
+    installed by the initial migration with the expected ``WHERE``
+    clause.
+
+    Anchors the index definition so future migrations that try to add a
+    plain ``unique=True`` on ``name`` will be caught by
+    ``test_no_duplicate_schema_objects_in_post_initial_migrations``.
+    """
+
+    result = integration_engine_session.execute(
+        text(
+            """
+            SELECT indexdef
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename = 'policy_configs'
+              AND indexname = 'uq_policy_configs_active_name'
+            """
+        )
+    ).first()
+    assert result is not None, (
+        "Partial unique index 'uq_policy_configs_active_name' is missing "
+        "from policy_configs."
+    )
+    indexdef = result[0].lower()
+    assert "unique" in indexdef, f"Index is not unique: {indexdef!r}"
+    assert "where" in indexdef, (
+        f"Index is not partial — expected a WHERE clause in {indexdef!r}"
+    )
+    assert "is_active" in indexdef
+    assert "retired_at" in indexdef
+
+
+def test_policy_configs_multiple_retired_with_same_name_allowed(
+    integration_engine_session: Session,
+) -> None:
+    """Multiple retired policies can share a ``name`` — only the
+    active-and-non-retired slot is unique.
+
+    The partial-unique-index replacement for ``unique=True`` exists
+    specifically to support this: a policy can be retired and a new
+    version can take its name without colliding on the unique index.
+    """
+
+    shared_name = f"versioned-policy-{uuid.uuid4()}"
+    retired_v1 = PolicyConfig(
+        name=shared_name,
+        is_active=False,
+        retired_at=utc_now() - timedelta(days=30),
+    )
+    retired_v2 = PolicyConfig(
+        name=shared_name,
+        is_active=False,
+        retired_at=utc_now() - timedelta(days=15),
+    )
+    active_v3 = PolicyConfig(
+        name=shared_name,
+        is_active=True,
+        retired_at=None,
+    )
+    integration_engine_session.add_all([retired_v1, retired_v2, active_v3])
+    integration_engine_session.commit()  # No IntegrityError
+
+    rows = (
+        integration_engine_session.query(PolicyConfig)
+        .filter(PolicyConfig.name == shared_name)
+        .all()
+    )
+    assert len(rows) == 3
+
+
+def test_policy_configs_two_active_same_name_rejected(
+    integration_engine_session: Session,
+) -> None:
+    """The partial index still rejects two active, non-retired policies
+    with the same name — the headline invariant the new constraint
+    must preserve.
+    """
+
+    shared_name = f"duplicate-active-{uuid.uuid4()}"
+    policy_a = PolicyConfig(name=shared_name)
+    integration_engine_session.add(policy_a)
+    integration_engine_session.flush()
+
+    policy_b = PolicyConfig(name=shared_name)
+    integration_engine_session.add(policy_b)
+    with pytest.raises(IntegrityError):
+        integration_engine_session.commit()
+    integration_engine_session.rollback()
+
+
+def test_policy_configs_retired_then_active_replaces_slot(
+    integration_engine_session: Session,
+) -> None:
+    """After retiring the active policy, a new active policy can take
+    its name.  This is the versioning workflow the partial index
+    enables.
+    """
+
+    shared_name = f"versioned-{uuid.uuid4()}"
+    policy_a = PolicyConfig(name=shared_name)
+    integration_engine_session.add(policy_a)
+    integration_engine_session.flush()
+
+    # Retire the original
+    policy_a.is_active = False
+    policy_a.retired_at = utc_now()
+    integration_engine_session.commit()
+
+    # A new active policy with the same name should be accepted
+    policy_b = PolicyConfig(name=shared_name)
+    integration_engine_session.add(policy_b)
+    integration_engine_session.commit()  # No IntegrityError

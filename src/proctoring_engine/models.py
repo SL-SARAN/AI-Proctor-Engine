@@ -74,6 +74,7 @@ from sqlalchemy import (
     Uuid,
     event,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import SQLAlchemyError
@@ -354,10 +355,27 @@ class PolicyConfig(Base):
             "medium_score_termination_threshold >= 0",
             name="ck_policy_medium_score_threshold_nonnegative",
         ),
+        # Partial unique index: a ``name`` is unique among the rows that
+        # are currently active and not retired.  Retired policies
+        # (``is_active = false`` or ``retired_at IS NOT NULL``) keep
+        # their ``name`` slot for historical-reference / audit-trail
+        # reasons — the same name can therefore appear once as an
+        # active policy and again as a retired version of a prior
+        # policy.  Replaces the unconditional ``unique=True`` on
+        # ``name`` that was added at the v1 initial-schema commit and
+        # turned out to prevent exactly the versioning workflow the
+        # schema's ``is_active`` / ``retired_at`` columns were
+        # designed to support.
+        Index(
+            "uq_policy_configs_active_name",
+            "name",
+            unique=True,
+            postgresql_where=text("is_active = true AND retired_at IS NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    name: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     termination_severity: Mapped[FlagSeverity] = mapped_column(
