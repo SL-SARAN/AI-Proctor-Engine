@@ -4,6 +4,87 @@ One subsection per modality. Each covers: what runs, the exact input/output cont
 
 ---
 
+## 7. Liveness / anti-spoofing — added turn N+12
+
+**Model:** `MiniFASNetV2` (Apache 2.0), wrapped by **`uniface[cpu]`**
+(PyPI, MIT), running on **ONNX Runtime** (~58 MB installed size).
+Verified by direct install: imports cleanly, the model file is on
+the order of a few MB.
+
+**Weights distribution:** the model file is pinned to a specific
+SHA-256 hash
+(`b32929adc2d9c34b9486f8c4c7bc97c1b69bc0ea9befefc380e4faae4e463907`)
+and fetched from a pinned GitHub Releases URL. The build pipeline
+bakes it into the container image; the runtime loader verifies the
+SHA-256 before constructing the inference session — a silent swap
+to a different model family would be a security-relevant change, not
+just a versioning nit, so the load-time hash check is the
+load-bearing guarantee that the verified weights are in place.
+
+**Environment variable:** `LIVENESS_MODEL_PATH` — same pattern as
+`MP_FACE_DETECTOR_BUNDLE`, `MP_FACE_LANDMARKER_BUNDLE`,
+`YOLO_WEIGHTS_PATH`. If the var is unset at construction time, the
+backend raises `EnvironmentError` — same fail-closed contract as the
+other model bundles.
+
+**Contract:**
+- **Input:** the cropped face region from the same preprocessing
+  pipeline that feeds `IdentityMatchRunner` — no second detection
+  pass. RGB `uint8` numpy array of shape `(H, W, 3)`. The uniface
+  API accepts two crop sizes (`80x80` and `160x160`); the
+  preprocessing layer is responsible for emitting one of these.
+- **Output:** a 3-class softmax over `(real, print, replay)` plus a
+  binary `is_real` flag (`true` iff `real` is the argmax **and**
+  `real_score >= PolicyConfig.liveness_score_threshold`).
+- **Confidence:** single-frame point estimate, `(score, score,
+  score)` — the multi-frame confidence interval is built by the
+  fusion engine from consecutive frames in the same window that
+  identity-match uses. This keeps the inference module stateless
+  while preserving the typed contract the fusion engine needs.
+
+**Scope, honestly framed.** Catches **print and screen-replay
+spoofing** specifically — not deepfakes, not 3D masks, not
+adversarial perturbations of a live face. The 3-class softmax is the
+underlying model's documented capability; claims about catching
+deepfakes or 3D masks would be overpromising what v1 verifies. If
+that threat surface needs to be covered, it's a v2 candidate
+requiring separate model evaluation and calibration, not a
+configuration change on the v1 model.
+
+**Threshold:** `PolicyConfig.liveness_score_threshold` (default
+`0.5`). Same "don't bake a number into conditionals" principle as
+the other modalities. Default value flagged for calibration the
+same way the gaze thresholds are.
+
+**Action on failure:** the fusion engine branches on
+`PolicyConfig.liveness_check_action`:
+- `critical_terminate` — the aggregator emits a `CRITICAL` flag
+  with `triggered_termination=true`; rule code
+  `RULE_LIVENESS_CHECK_FAILED`.
+- `medium_accumulate` — the aggregator emits a `MEDIUM` flag with
+  `score_delta=1.0` that contributes to the accumulated-score path.
+
+**Cadence:** runs on the same heavy-frame cadence as identity-match
+(`docs/02-ingestion-layer-design.md` §3). Per-frame latency is on
+the order of the identity-match pipeline, well within the 2-3s
+heavy-frame interval.
+
+**Packaging:** `uniface[cpu]` is the runtime pip dependency.
+`onnxruntime` is the transitive ONNX-Runtime backend it pulls in
+(~58 MB installed). The Dockerfile builder stage needs to install
+the model file at build time and point `LIVENESS_MODEL_PATH` at it.
+
+**Why server-side, not client-side:** the face crop is already on
+the server (the identity-match pipeline consumes it), so doing the
+inference there avoids a second JPEG upload just for liveness.
+Client-side inference was evaluated and rejected: it would either
+double the heavy-frame upload bandwidth or fork the face-detection
+pipeline into a server-side and a client-side variant. Server-side
+also keeps the model file out of the client bundle (the existing
+design priority, see turn N+9).
+
+---
+
 ## 1. Face presence/count
 
 **Model:** MediaPipe Tasks API, `mediapipe.tasks.python.vision.FaceDetector` (BlazeFace short-range — the same underlying detector the original `mp.solutions.face_detection` used). Runs client-side, every frame.

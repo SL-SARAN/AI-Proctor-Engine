@@ -467,7 +467,21 @@ From `docs/proctoring-engine-v1-spec.md` §1 and the design docs:
   compile there.
 - YOLOv8 (Ultralytics): weights auto-download from GitHub Releases
   at first run. **Verifiable here.**
-- `face_recognition` (dlib ResNet) vs. `DeepFace`: choice pending.
+- `face_recognition` (dlib ResNet) vs. `DeepFace`: `face_recognition`
+  resolved as the v1 choice (turn N+4). The library is wired in via
+  the `IdentityBackend` ABC so a future swap to ArcFace / DeepFace is
+  a single-class change. The `--no-deps` install sequence codified in
+  the `Dockerfile` builder stage (lines 62-80) is the verified
+  workaround for the `pkg_resources` removal in `setuptools>=82`.
+- `uniface[cpu]` (MIT) wrapping MiniFASNetV2 (Apache 2.0) via ONNX
+  Runtime: v1 choice for the liveness / anti-spoofing modality
+  (turn N+12, item 11). Verified by direct install: imports cleanly,
+  ~58 MB for `onnxruntime`. Weights `MiniFASNetV2.onnx` pinned to
+  SHA-256 `b32929adc2d9c34b9486f8c4c7bc97c1b69bc0ea9befefc380e4faae4e463907`;
+  load-time verification via `LIVENESS_MODEL_PATH` env var. Catches
+  **print and screen-replay spoofing only** — not deepfakes or 3D
+  masks (the underlying model's documented capability; v1 does not
+  cover deepfakes or 3D masks).
 - `pgvector`: not used in v1; the JSONB approach is documented.
 - `pyannote.audio` (diarization): **explicitly out of v1**.
 
@@ -636,5 +650,40 @@ it to mark progress and to identify the next single atomic layer.
       handlers `await` whichever store is wired in. New dep:
       `redis>=5.0,<6` + dev-only `fakeredis[lua]>=2.20,<3`. Total:
       653 Python unit + 113 client tests passing.
+- [x] Cross-verification pass — 4 confirmed bugs + 1 contract drift +
+      1 doc fix. `RollingBuffer.heavyFrameEntries` time-window
+      eviction added; `main.ts` capture loop now gated on WS
+      `'connected'` state; ack payload field names fixed
+      (`seq`/`received_at`); kill-switch retry type and dedup guard
+      added; WebSocket route doc fixed. Total: 120 client tests
+      passing. (Turn after N+10.)
+- [x] Dead client-side gaze code removed — `sendGazeTelemetry()` +
+      client-side `FaceLandmarker` deleted (rejected by server-side
+      `TelemetryLightPayload` validation; gaze is server-side only on
+      the raw heavy frame JPEG). ~2 MB WASM + model download saved per
+      session. Total: 116 client tests passing.
+- [x] `PolicyConfig.name` partial unique constraint — dropped
+      `unique=True`, added `CREATE UNIQUE INDEX ... WHERE is_active
+      = true AND retired_at IS NULL` (`uq_policy_configs_active_name`).
+      Initial migration's `Base.metadata.create_all` picks up the
+      change; no post-initial migration needed. Migration chain test
+      invariant preserved. Total: 655 Python unit tests passing.
+- [x] `medium_score_action` + `liveness / anti-spoofing` modality
+      (items 4 + 11, combined turn — same aggregator branching
+      shape). `PolicyConfig.medium_score_action` (`auto_terminate` |
+      `flag_for_review`) added; aggregator's `_check_accumulated_threshold`
+      branches on the configured action. `SessionStatus.REINSTATED`
+      added with `TERMINATED → REINSTATED` and `REINSTATED →
+      UNDER_REVIEW` state-machine transitions. New
+      `src/proctoring_engine/inference/liveness.py` wraps
+      `uniface[cpu]` (MiniFASNetV2 / ONNX Runtime); weights pinned
+      via SHA-256 at load time. New `PolicyConfig.liveness_check_enabled`
+      / `liveness_check_action` / `liveness_score_threshold` fields
+      + 2 SQL CHECK constraints. New `TelemetryModality.LIVENESS`,
+      `RULE_LIVENESS_CHECK_FAILED` rule code, `process_liveness()`
+      aggregator method. `LIVENESS_MODEL_PATH` env var. Catches print
+      and screen-replay spoofing only — not deepfakes or 3D masks
+      (documented honestly). Total: 686 Python unit + 116 client
+      tests passing.
 - [ ] Production deployment (k8s cluster provisioned, end-to-end
       smoke test on a live cluster)

@@ -254,7 +254,8 @@ them silently is non-conformant.
 | `webrtcvad-wheels` | pip package, prebuilt wheels (Windows/macOS/Linux, Python 3.6–3.13), no external download | Yes |
 | ~~`webrtcvad` (base)~~ | ~~pip package, no external download~~ | **No Windows wheel; needs MSVC Build Tools to compile there — use `webrtcvad-wheels` instead** |
 | YOLOv8 (Ultralytics) | weights auto-download from GitHub Releases at first run | Yes |
-| `face_recognition` (dlib ResNet) | pip-installable, weights ship with dlib | Implementation choice pending |
+| `face_recognition` (dlib ResNet) | pip-installable, weights ship with dlib | Yes — verified install sequence codified in `Dockerfile` builder stage (lines 62-80) and `pyproject.toml` notes (lines 29-44): `pip install face_recognition --no-deps` + `dlib-bin` + pinned `face-recognition-models-ng` git fork |
+| `uniface[cpu]` (MiniFASNetV2 / ONNX Runtime) | pip package; weights `MiniFASNetV2.onnx` from pinned GitHub Releases URL with built-in SHA-256 check (`b32929adc2d9c34b9486f8c4c7bc97c1b69bc0ea9befefc380e4faae4e463907`) | Yes — verified by direct install, imports cleanly, ~58 MB for onnxruntime. Catches print and screen-replay spoofing only — not deepfakes or 3D masks (the underlying model's documented capability). |
 | `DeepFace` | weights download from GitHub release assets | Implementation choice pending |
 | `pgvector` | Postgres extension | **Not used in v1** |
 | `pyannote.audio` | Hugging Face-hosted, license-gated | **Explicitly out of v1** |

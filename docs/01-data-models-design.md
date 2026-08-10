@@ -159,6 +159,9 @@ that sits alongside the original flag.
 | `gaze_termination_limit` | integer | CRITICAL flag threshold. |
 | `medium_score_termination_threshold` | numeric | The accumulated-score path's threshold. |
 | `medium_score_action` | enum: `auto_terminate`, `flag_for_review` | Admin-configured default for what happens when the threshold is crossed. Fires immediately through the existing kill-switch — no new "pending termination" hold state. A live proctor can fast-track an undo via the existing `ProctorReview` overturn path (see `05-fusion-flagging-engine-design.md`), which supersedes turn N+5's separate "termination is final" call. |
+| `liveness_check_enabled` | boolean | Whether the liveness / anti-spoofing modality runs for sessions under this policy. Default `false` — opt-in. See `05-fusion-flagging-engine-design.md` §Path 4 and `04-inference-modules-design.md` §7. |
+| `liveness_check_action` | nullable enum: `critical_terminate`, `medium_accumulate` | What happens on a failed liveness check. SQL constraint `ck_policy_liveness_action_when_enabled` requires this to be non-null when `liveness_check_enabled=true`. |
+| `liveness_score_threshold` | numeric (0–1) | The minimum `real_score` for a frame to be classified `is_real=true`. Default `0.5` — flagged for calibration the same way the gaze thresholds are. |
 | `extra_rules` | JSONB | Forward-compatible extension point. |
 | `created_at`, `retired_at` | timestamp | `retired_at` is set when a new version supersedes this one. |
 | `created_by` | string | Admin reference; the `AdminUser` table lands in the next layer. |
