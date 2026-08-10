@@ -125,6 +125,22 @@ def _validate_policy_request(request: CreatePolicyConfigRequest) -> None:
         raise PolicyVersioningError(
             "medium_score_termination_threshold must be >= 0"
         )
+    if (
+        request.liveness_check_enabled
+        and request.liveness_check_action is None
+    ):
+        # Mirror of the SQL-level
+        # ``ck_policy_liveness_action_when_enabled`` constraint.
+        raise PolicyVersioningError(
+            "liveness_check_action must be set when "
+            "liveness_check_enabled is true"
+        )
+    if not (
+        0.0 <= request.liveness_score_threshold <= 1.0
+    ):
+        raise PolicyVersioningError(
+            "liveness_score_threshold must be in [0, 1]"
+        )
 
 
 def _validate_exemption_request(
@@ -251,6 +267,10 @@ def create_policy_version(
         medium_score_termination_threshold=(
             request.medium_score_termination_threshold
         ),
+        medium_score_action=request.medium_score_action,
+        liveness_check_enabled=request.liveness_check_enabled,
+        liveness_check_action=request.liveness_check_action,
+        liveness_score_threshold=request.liveness_score_threshold,
         extra_rules=dict(request.extra_rules),
         created_by_id=created_by.id,
     )

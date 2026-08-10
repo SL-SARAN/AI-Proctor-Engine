@@ -28,6 +28,7 @@ from proctoring_engine.inference._types import (
     ConfidenceInterval,
     FacePresenceResult,
     HeadPoseGazeResult,
+    LivenessResult,
     ObjectDetectionResult,
 )
 from proctoring_engine.fusion._types import FlagDecision, GazeAwayEvent
@@ -35,12 +36,14 @@ from proctoring_engine.fusion.aggregator import (
     RULE_ACCUMULATED_SCORE,
     RULE_BROWSER_EVENT,
     RULE_GAZE_AWAY_FREQUENCY,
+    RULE_LIVENESS_CHECK_FAILED,
     RULE_OBJECT_DETECTED,
     RULE_SECOND_PERSON,
     PolicySnapshot,
     SessionAggregator,
     SessionContext,
 )
+from proctoring_engine.models import LivenessAction, MediumScoreAction
 from proctoring_engine.fusion.book_severity import (
     BOOK_FLAG_SEVERITY,
     BOOK_RULE_CODE,
@@ -77,6 +80,10 @@ def _default_policy(**overrides: object) -> PolicySnapshot:
         "gaze_warning_limit": 3,
         "gaze_termination_limit": 8,
         "medium_score_termination_threshold": 10.0,
+        "medium_score_action": MediumScoreAction.AUTO_TERMINATE,
+        "liveness_check_enabled": False,
+        "liveness_check_action": None,
+        "liveness_score_threshold": 0.5,
     }
     defaults.update(overrides)
     return PolicySnapshot(**defaults)  # type: ignore[arg-type]
@@ -1046,6 +1053,7 @@ class TestPackageExports:
             RULE_ACCUMULATED_SCORE,
             RULE_BROWSER_EVENT,
             RULE_GAZE_AWAY_FREQUENCY,
+            RULE_LIVENESS_CHECK_FAILED,
             RULE_OBJECT_DETECTED,
             RULE_SECOND_PERSON,
         )
@@ -1054,3 +1062,325 @@ class TestPackageExports:
         assert RULE_ACCUMULATED_SCORE == "accumulated_score"
         assert RULE_OBJECT_DETECTED == "object_detected"
         assert RULE_BROWSER_EVENT == "browser_event"
+        assert RULE_LIVENESS_CHECK_FAILED == "liveness_check_failed"
+
+
+# ===========================================================================
+# Item 4: medium_score_action branching (auto_terminate vs flag_for_review)
+# ===========================================================================
+
+
+def _make_liveness_result(
+    *,
+    is_real: bool = False,
+    real_score: float = 0.2,
+    print_score: float = 0.7,
+    replay_score: float = 0.1,
+) -> LivenessResult:
+    return LivenessResult(
+        modality="liveness",
+        event_type="liveness_spoof" if not is_real else "liveness_real",
+        confidence=_CI,
+        bounding_boxes=[],
+        raw_value={},
+        is_real=is_real,
+        real_score=real_score,
+        print_score=print_score,
+        replay_score=replay_score,
+    )
+
+
+class TestMediumScoreActionBranching:
+    """Item 4: the aggregator branches on ``medium_score_action``.
+
+    AUTO_TERMINATE is the legacy default — the
+    accumulated-score-over-threshold fires a CRITICAL flag with
+    ``triggered_termination=True`` (unchanged behaviour).
+    FLAG_FOR_REVIEW keeps the session live; the flag is CRITICAL but
+    ``triggered_termination=False``, and a human reviewer decides.
+    """
+
+    def _trigger_accumulated_threshold(self) -> list[FlagDecision]:
+        """Helper: drive an aggregator past its threshold with browser events."""
+        agg = _make_aggregator(
+            policy=_default_policy(
+                medium_score_termination_threshold=2.0,
+            )
+        )
+        # Two visibilitychange events at weight 1.0 each — past threshold
+        decisions: list[FlagDecision] = []
+        for _ in range(2):
+            decisions.extend(
+                agg.process_browser_event(
+                    BrowserEventResult(
+                        modality="browser",
+                        event_type="visibilitychange",
+                        confidence=_CI_POINT,
+                        bounding_boxes=[],
+                        raw_value={},
+                        detail={},
+                    ),
+                    telemetry_event_id=uuid.uuid4(),
+                )
+            )
+        return decisions
+
+    def test_auto_terminate_still_terminates(self) -> None:
+        """AUTO_TERMINATE preserves the legacy behaviour: triggered_termination=True."""
+        agg = _make_aggregator(
+            policy=_default_policy(
+                medium_score_termination_threshold=2.0,
+                medium_score_action=MediumScoreAction.AUTO_TERMINATE,
+            )
+        )
+        all_decisions: list[FlagDecision] = []
+        for _ in range(2):
+            all_decisions.extend(
+                agg.process_browser_event(
+                    BrowserEventResult(
+                        modality="browser",
+                        event_type="visibilitychange",
+                        confidence=_CI_POINT,
+                        bounding_boxes=[],
+                        raw_value={},
+                        detail={},
+                    ),
+                    telemetry_event_id=uuid.uuid4(),
+                )
+            )
+        acc_flags = [
+            d for d in all_decisions
+            if d.rule_code == RULE_ACCUMULATED_SCORE
+        ]
+        assert len(acc_flags) == 1
+        assert acc_flags[0].triggered_termination is True
+        assert acc_flags[0].severity == "critical"
+        assert acc_flags[0].detail["medium_score_action"] == "auto_terminate"
+
+    def test_flag_for_review_does_not_terminate(self) -> None:
+        """FLAG_FOR_REVIEW: CRITICAL flag, triggered_termination=False."""
+        agg = _make_aggregator(
+            policy=_default_policy(
+                medium_score_termination_threshold=2.0,
+                medium_score_action=MediumScoreAction.FLAG_FOR_REVIEW,
+            )
+        )
+        all_decisions: list[FlagDecision] = []
+        for _ in range(2):
+            all_decisions.extend(
+                agg.process_browser_event(
+                    BrowserEventResult(
+                        modality="browser",
+                        event_type="visibilitychange",
+                        confidence=_CI_POINT,
+                        bounding_boxes=[],
+                        raw_value={},
+                        detail={},
+                    ),
+                    telemetry_event_id=uuid.uuid4(),
+                )
+            )
+        acc_flags = [
+            d for d in all_decisions
+            if d.rule_code == RULE_ACCUMULATED_SCORE
+        ]
+        assert len(acc_flags) == 1
+        assert acc_flags[0].triggered_termination is False
+        assert acc_flags[0].severity == "critical"
+        assert acc_flags[0].detail["medium_score_action"] == "flag_for_review"
+
+    def test_flag_for_review_session_still_processes(self) -> None:
+        """After FLAG_FOR_REVIEW fires, the aggregator is NOT
+        terminal — it can still process subsequent events.  (Compare
+        with AUTO_TERMINATE, where ``Flag.triggered_termination=True``
+        is the engine's kill-switch trigger.)
+        """
+
+        agg = _make_aggregator(
+            policy=_default_policy(
+                medium_score_termination_threshold=2.0,
+                medium_score_action=MediumScoreAction.FLAG_FOR_REVIEW,
+            )
+        )
+        # First two browser events trigger the flag-for-review path.
+        for _ in range(2):
+            agg.process_browser_event(
+                BrowserEventResult(
+                    modality="browser",
+                    event_type="visibilitychange",
+                    confidence=_CI_POINT,
+                    bounding_boxes=[],
+                    raw_value={},
+                    detail={},
+                ),
+                telemetry_event_id=uuid.uuid4(),
+            )
+
+        # A subsequent event should still be processed (the
+        # aggregator does not enter a terminal state on
+        # FLAG_FOR_REVIEW — that's only AUTO_TERMINATE's role).
+        later = agg.process_browser_event(
+            BrowserEventResult(
+                modality="browser",
+                event_type="paste",
+                confidence=_CI_POINT,
+                bounding_boxes=[],
+                raw_value={},
+                detail={},
+            ),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert len(later) >= 1
+        # The new flag is the paste event (no accumulation)
+        assert any(d.rule_code == RULE_BROWSER_EVENT for d in later)
+
+
+# ===========================================================================
+# Item 11: liveness / anti-spoofing modality
+# ===========================================================================
+
+
+class TestLivenessModality:
+    """Item 11: the liveness / anti-spoofing pipeline.
+
+    Catches print and screen-replay spoofing specifically — not
+    deepfakes or 3D masks.  Branches on
+    ``PolicyConfig.liveness_check_action``.
+    """
+
+    def test_disabled_by_default_returns_empty(self) -> None:
+        """When liveness_check_enabled=False, no decisions are emitted
+        even on spoof frames.  Defaults to disabled per the design
+        doc — this is opt-in infrastructure."""
+        agg = _make_aggregator(
+            policy=_default_policy(liveness_check_enabled=False)
+        )
+        decisions = agg.process_liveness(
+            _make_liveness_result(is_real=False),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert decisions == []
+
+    def test_real_frame_no_flag(self) -> None:
+        """A frame classified ``is_real=True`` does not raise a flag,
+        regardless of action."""
+        agg = _make_aggregator(
+            policy=_default_policy(
+                liveness_check_enabled=True,
+                liveness_check_action=LivenessAction.CRITICAL_TERMINATE,
+            )
+        )
+        decisions = agg.process_liveness(
+            _make_liveness_result(is_real=True, real_score=0.95),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert decisions == []
+
+    def test_critical_terminate_on_spoof(self) -> None:
+        """``CRITICAL_TERMINATE``: spoof frame raises a CRITICAL flag
+        with ``triggered_termination=True``."""
+        agg = _make_aggregator(
+            policy=_default_policy(
+                liveness_check_enabled=True,
+                liveness_check_action=LivenessAction.CRITICAL_TERMINATE,
+            )
+        )
+        decisions = agg.process_liveness(
+            _make_liveness_result(
+                is_real=False, real_score=0.1, print_score=0.85,
+                replay_score=0.05,
+            ),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert len(decisions) == 1
+        d = decisions[0]
+        assert d.rule_code == RULE_LIVENESS_CHECK_FAILED
+        assert d.severity == "critical"
+        assert d.triggered_termination is True
+        assert d.detail["liveness_check_action"] == "critical_terminate"
+        assert d.detail["real_score"] == 0.1
+        assert d.detail["print_score"] == 0.85
+
+    def test_medium_accumulate_on_spoof(self) -> None:
+        """``MEDIUM_ACCUMULATE``: spoof frame raises a MEDIUM flag
+        that contributes to the accumulated-score path."""
+        agg = _make_aggregator(
+            policy=_default_policy(
+                liveness_check_enabled=True,
+                liveness_check_action=LivenessAction.MEDIUM_ACCUMULATE,
+                medium_score_termination_threshold=3.0,
+            )
+        )
+        decisions = agg.process_liveness(
+            _make_liveness_result(is_real=False),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert len(decisions) == 1
+        d = decisions[0]
+        assert d.rule_code == RULE_LIVENESS_CHECK_FAILED
+        assert d.severity == "medium"
+        assert d.triggered_termination is False
+        assert d.score_delta == 1.0
+        assert d.detail["liveness_check_action"] == "medium_accumulate"
+
+    def test_medium_accumulate_trips_threshold(self) -> None:
+        """After three MEDIUM_ACCUMULATE liveness events (each at the
+        default weight 1.0), the third one should also raise the
+        accumulated-score CRITICAL flag — same shape as the
+        browser-event / gaze-away-frequency accumulation."""
+        agg = _make_aggregator(
+            policy=_default_policy(
+                liveness_check_enabled=True,
+                liveness_check_action=LivenessAction.MEDIUM_ACCUMULATE,
+                medium_score_termination_threshold=3.0,
+                medium_score_action=MediumScoreAction.AUTO_TERMINATE,
+            )
+        )
+
+        all_decisions: list[FlagDecision] = []
+        for _ in range(3):
+            all_decisions.extend(
+                agg.process_liveness(
+                    _make_liveness_result(is_real=False),
+                    telemetry_event_id=uuid.uuid4(),
+                )
+            )
+
+        liveness_flags = [
+            d for d in all_decisions
+            if d.rule_code == RULE_LIVENESS_CHECK_FAILED
+        ]
+        assert len(liveness_flags) == 3
+        acc_flags = [
+            d for d in all_decisions
+            if d.rule_code == RULE_ACCUMULATED_SCORE
+        ]
+        assert len(acc_flags) == 1
+        assert acc_flags[0].triggered_termination is True
+
+    def test_threshold_below_real_score_returns_real(self) -> None:
+        """The threshold check is applied by the runner, not the
+        aggregator — but verify the aggregator passes through
+        ``is_real=False`` exactly.  Threshold semantics are tested
+        in ``test_inference.py`` for the runner side."""
+
+        agg = _make_aggregator(
+            policy=_default_policy(
+                liveness_check_enabled=True,
+                liveness_check_action=LivenessAction.CRITICAL_TERMINATE,
+            )
+        )
+        # Borderline frame: high real_score but still marked spoof
+        # by the runner.  Aggregator must treat it as spoof.
+        decisions = agg.process_liveness(
+            _make_liveness_result(
+                is_real=False,
+                real_score=0.49,  # below 0.5 threshold
+                print_score=0.51,
+                replay_score=0.0,
+            ),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert len(decisions) == 1
+        assert decisions[0].severity == "critical"
+        assert decisions[0].detail["real_score"] == 0.49

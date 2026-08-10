@@ -93,7 +93,10 @@ class SessionStatus(str, enum.Enum):
     The state machine is defined in ``docs/07-api-orchestration-design.md``
     §2. Only the fusion engine or an admin can move ``ACTIVE → TERMINATED``;
     every other transition is either student-driven (``COMPLETED``) or
-    admin-driven (``UNDER_REVIEW``).
+    admin-driven (``UNDER_REVIEW``).  ``REINSTATED`` is the
+    ``TERMINATED → REINSTATED`` fast-track-undo path for the
+    accumulated-score termination (see ``05-fusion-flagging-engine-design.md``
+    §Path 3 and ``01-data-models-design.md`` §"SessionStatus").
     """
 
     PENDING = "pending"
@@ -101,6 +104,41 @@ class SessionStatus(str, enum.Enum):
     COMPLETED = "completed"
     TERMINATED = "terminated"
     UNDER_REVIEW = "under_review"
+    REINSTATED = "reinstated"
+
+
+class MediumScoreAction(str, enum.Enum):
+    """What happens when the accumulated medium-score threshold is crossed.
+
+    ``AUTO_TERMINATE`` is the legacy default — the kill-switch fires
+    immediately through the existing path.  ``FLAG_FOR_REVIEW`` keeps
+    the session live but raises a ``CRITICAL`` flag that must be
+    reviewed by a live proctor before any further action.
+
+    Per the design doc §Path 3, the action is admin-configurable via
+    ``PolicyConfig.medium_score_action`` and is set ahead of the
+    exam, not adjustable mid-session.
+    """
+
+    AUTO_TERMINATE = "auto_terminate"
+    FLAG_FOR_REVIEW = "flag_for_review"
+
+
+class LivenessAction(str, enum.Enum):
+    """How the fusion engine treats a failed liveness check.
+
+    ``CRITICAL_TERMINATE`` raises a ``CRITICAL`` flag with
+    ``triggered_termination=True`` — the kill-switch fires immediately.
+    ``MEDIUM_ACCUMULATE`` raises a ``MEDIUM`` flag that contributes to
+    the accumulated-score path.
+
+    Per the design doc §7, the action is admin-configurable via
+    ``PolicyConfig.liveness_check_action`` and is required to be set
+    explicitly when ``liveness_check_enabled=True``.
+    """
+
+    CRITICAL_TERMINATE = "critical_terminate"
+    MEDIUM_ACCUMULATE = "medium_accumulate"
 
 
 class ReferenceMaterialPolicy(str, enum.Enum):
@@ -120,6 +158,7 @@ class TelemetryModality(str, enum.Enum):
     IDENTITY = "identity"
     OBJECT = "object"
     AUDIO = "audio"
+    LIVENESS = "liveness"
     SYSTEM = "system"
 
 
@@ -355,6 +394,18 @@ class PolicyConfig(Base):
             "medium_score_termination_threshold >= 0",
             name="ck_policy_medium_score_threshold_nonnegative",
         ),
+        CheckConstraint(
+            "liveness_score_threshold >= 0 AND liveness_score_threshold <= 1",
+            name="ck_policy_liveness_threshold_in_unit_interval",
+        ),
+        # liveness_check_action must be set if liveness_check_enabled
+        # is true.  The contrapositive (enabled=false → action=null)
+        # is allowed; the design doc explicitly says the action is
+        # unset when the feature is off, not "set to a default".
+        CheckConstraint(
+            "(liveness_check_enabled = false) OR (liveness_check_action IS NOT NULL)",
+            name="ck_policy_liveness_action_when_enabled",
+        ),
         # Partial unique index: a ``name`` is unique among the rows that
         # are currently active and not retired.  Retired policies
         # (``is_active = false`` or ``retired_at IS NOT NULL``) keep
@@ -403,6 +454,22 @@ class PolicyConfig(Base):
     )
     medium_score_termination_threshold: Mapped[float] = mapped_column(
         Numeric(10, 4), nullable=False, default=10.0
+    )
+    medium_score_action: Mapped[MediumScoreAction] = mapped_column(
+        enum_type(MediumScoreAction, "medium_score_action"),
+        nullable=False,
+        default=MediumScoreAction.AUTO_TERMINATE,
+    )
+    liveness_check_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    liveness_check_action: Mapped[LivenessAction | None] = mapped_column(
+        enum_type(LivenessAction, "liveness_action"),
+        nullable=True,
+        default=None,
+    )
+    liveness_score_threshold: Mapped[float] = mapped_column(
+        Numeric(5, 4), nullable=False, default=0.5
     )
     extra_rules: Mapped[dict[str, Any]] = mapped_column(
         JsonPayload, nullable=False, default=dict

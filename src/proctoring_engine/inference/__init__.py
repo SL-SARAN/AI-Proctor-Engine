@@ -22,6 +22,9 @@ Modules:
   VAD + RMS ambient-noise heuristic.
 - :mod:`~proctoring_engine.inference.browser_events` — deterministic
   DOM event passthrough.
+- :mod:`~proctoring_engine.inference.liveness` — liveness / anti-spoofing
+  via ``uniface[cpu]`` (MiniFASNetV2 / ONNX Runtime), catches print and
+  screen-replay spoofing.
 """
 
 # --- Shared types ---
@@ -34,6 +37,7 @@ from proctoring_engine.inference._types import (
     HeadPoseGazeResult,
     IdentityMatchResult,
     InferenceResult,
+    LivenessResult,
     ObjectDetectionResult,
 )
 
@@ -89,6 +93,18 @@ from proctoring_engine.inference.browser_events import (
     classify_browser_event,
 )
 
+# --- Liveness / anti-spoofing ---
+from proctoring_engine.inference.liveness import (
+    EVENT_LIVENESS_REAL,
+    EVENT_LIVENESS_SPOOF,
+    LIVENESS_MODEL_PATH_ENV,
+    LivenessBackend,
+    LivenessRunner,
+    MINIFASNET_V2_SHA256,
+    UnifaceBackend,
+    compute_liveness_confidence,
+)
+
 __all__ = [
     # Shared types
     "AudioVadResult",
@@ -99,6 +115,7 @@ __all__ = [
     "HeadPoseGazeResult",
     "IdentityMatchResult",
     "InferenceResult",
+    "LivenessResult",
     "ObjectDetectionResult",
     # Face presence
     "EVENT_NO_FACE",
@@ -134,4 +151,13 @@ __all__ = [
     "AudioVadRunner",
     # Browser events
     "classify_browser_event",
+    # Liveness / anti-spoofing
+    "EVENT_LIVENESS_REAL",
+    "EVENT_LIVENESS_SPOOF",
+    "LIVENESS_MODEL_PATH_ENV",
+    "LivenessBackend",
+    "LivenessRunner",
+    "MINIFASNET_V2_SHA256",
+    "UnifaceBackend",
+    "compute_liveness_confidence",
 ]

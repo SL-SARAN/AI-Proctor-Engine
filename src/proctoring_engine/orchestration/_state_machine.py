@@ -51,7 +51,19 @@ _ALLOWED: Final[dict[SessionStatus, frozenset[SessionStatus]]] = {
         }
     ),
     SessionStatus.COMPLETED: frozenset({SessionStatus.UNDER_REVIEW}),
-    SessionStatus.TERMINATED: frozenset({SessionStatus.UNDER_REVIEW}),
+    # TERMINATED → REINSTATED is the fast-track-undo path for the
+    # accumulated-score termination (``05-fusion-flagging-engine-design.md``
+    # §Path 3): when ``medium_score_action=auto_terminate`` fires, a
+    # live proctor can immediately reinstate via the existing
+    # ``ProctorReview`` overturn path rather than waiting for a full
+    # review cycle.  This is the one new transition added in turn N+12
+    # (item 4); ``REINSTATED → UNDER_REVIEW`` is also allowed so the
+    # same session can still be put under review if the overturn was
+    # wrong.
+    SessionStatus.TERMINATED: frozenset(
+        {SessionStatus.UNDER_REVIEW, SessionStatus.REINSTATED}
+    ),
+    SessionStatus.REINSTATED: frozenset({SessionStatus.UNDER_REVIEW}),
     # UNDER_REVIEW is terminal from the engine's perspective.
     SessionStatus.UNDER_REVIEW: frozenset(),
 }

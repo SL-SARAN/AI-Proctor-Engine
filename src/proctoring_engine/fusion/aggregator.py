@@ -39,6 +39,7 @@ from proctoring_engine.inference._types import (
     ConfidenceInterval,
     FacePresenceResult,
     HeadPoseGazeResult,
+    LivenessResult,
     ObjectDetectionResult,
 )
 from proctoring_engine.fusion._types import FlagDecision, GazeAwayEvent
@@ -52,6 +53,7 @@ from proctoring_engine.fusion.exemptions import (
     ExemptionRecord,
     find_matching_exemption,
 )
+from proctoring_engine.models import LivenessAction, MediumScoreAction
 
 
 logger = logging.getLogger(__name__)
@@ -65,6 +67,7 @@ RULE_GAZE_AWAY_FREQUENCY: Final[str] = "gaze_away_frequency"
 RULE_ACCUMULATED_SCORE: Final[str] = "accumulated_score"
 RULE_OBJECT_DETECTED: Final[str] = "object_detected"
 RULE_BROWSER_EVENT: Final[str] = "browser_event"
+RULE_LIVENESS_CHECK_FAILED: Final[str] = "liveness_check_failed"
 
 # Severity constants (match FlagSeverity enum values)
 _CRITICAL: Final[str] = "critical"
@@ -100,6 +103,11 @@ class PolicySnapshot:
     gaze_termination_limit: int = 8
 
     medium_score_termination_threshold: float = 10.0
+    medium_score_action: MediumScoreAction = MediumScoreAction.AUTO_TERMINATE
+
+    liveness_check_enabled: bool = False
+    liveness_check_action: LivenessAction | None = None
+    liveness_score_threshold: float = 0.5
 
     # Per-rule-code weight for the accumulated-score path.
     # Keys are ``Flag.rule_code`` values; values are the weight
@@ -265,6 +273,95 @@ class SessionAggregator:
             self._second_person_event_ids.clear()
 
         return []
+
+    # -----------------------------------------------------------------
+    # Path 4: liveness / anti-spoofing
+    # -----------------------------------------------------------------
+
+    def process_liveness(
+        self,
+        result: LivenessResult,
+        *,
+        telemetry_event_id: uuid.UUID,
+    ) -> list[FlagDecision]:
+        """Process a liveness inference result.
+
+        The liveness modality catches print and screen-replay spoofing
+        specifically — not deepfakes or 3D masks (``docs/04-inference-modules-design.md``
+        §7).  A failed check is one where ``is_real=False``: the
+        model's softmax assigned the highest probability to the
+        ``print`` or ``replay`` class rather than ``real``.
+
+        Branches on ``PolicyConfig.liveness_check_action``:
+
+        - ``CRITICAL_TERMINATE`` (default for institutions that treat
+          spoofing as a hard rule): emit a ``CRITICAL`` flag with
+          ``triggered_termination=True``.
+        - ``MEDIUM_ACCUMULATE``: emit a ``MEDIUM`` flag with
+          ``score_delta=1.0`` that contributes to the
+          accumulated-score path — ``liveness_check_failed`` follows
+          the same escalation ladder as ``gaze_away_frequency``,
+          ``browser_event``, etc.
+
+        Returns ``[]`` if liveness check is disabled on the policy
+        or if the frame passes (``is_real=True``).
+        """
+
+        if not self._policy.liveness_check_enabled:
+            return []
+
+        if result.is_real:
+            return []
+
+        if self._policy.liveness_check_action == LivenessAction.CRITICAL_TERMINATE:
+            return [
+                FlagDecision(
+                    rule_code=RULE_LIVENESS_CHECK_FAILED,
+                    severity=_CRITICAL,
+                    confidence=result.confidence,
+                    triggered_termination=True,
+                    detail={
+                        "real_score": result.real_score,
+                        "print_score": result.print_score,
+                        "replay_score": result.replay_score,
+                        "threshold": self._policy.liveness_score_threshold,
+                        "liveness_check_action": (
+                            LivenessAction.CRITICAL_TERMINATE.value
+                        ),
+                    },
+                    contributing_event_ids=(telemetry_event_id,),
+                )
+            ]
+
+        # MEDIUM_ACCUMULATE: contributes to the accumulated score.
+        weight = self._policy.weight_for(RULE_LIVENESS_CHECK_FAILED)
+        decision = FlagDecision(
+            rule_code=RULE_LIVENESS_CHECK_FAILED,
+            severity=_MEDIUM,
+            confidence=result.confidence,
+            triggered_termination=False,
+            detail={
+                "real_score": result.real_score,
+                "print_score": result.print_score,
+                "replay_score": result.replay_score,
+                "threshold": self._policy.liveness_score_threshold,
+                "liveness_check_action": (
+                    LivenessAction.MEDIUM_ACCUMULATE.value
+                ),
+            },
+            contributing_event_ids=(telemetry_event_id,),
+            score_delta=weight,
+        )
+
+        self._accumulated_score += weight
+
+        decisions = [decision]
+        acc_decision = self._check_accumulated_threshold(
+            contributing_event_ids=(telemetry_event_id,),
+        )
+        if acc_decision is not None:
+            decisions.append(acc_decision)
+        return decisions
 
     # -----------------------------------------------------------------
     # Path 2: gaze-away frequency ladder
@@ -559,14 +656,23 @@ class SessionAggregator:
     ) -> FlagDecision | None:
         """Check whether the accumulated score has crossed the threshold.
 
-        Returns a ``CRITICAL`` flag with ``triggered_termination=True``
-        if the threshold is crossed, or ``None`` otherwise.
+        Branches on ``PolicyConfig.medium_score_action``:
 
-        This is only called from methods that have just incremented
-        the score.  It fires at most once (the ``_gaze_termination_fired``
-        / ``_second_person_fired`` flags guard the other paths; this path
-        uses the threshold itself as the guard — once it fires, the
-        session is terminated and no further processing occurs).
+        - ``AUTO_TERMINATE`` (legacy default): emits a ``CRITICAL`` flag
+          with ``triggered_termination=True``.  Fires through the
+          existing kill-switch mechanism — no new "pending termination"
+          hold state.  Per the design doc §Path 3, this is overridable
+          via the live-proctor fast-track-undo path
+          (``TERMINATED → REINSTATED`` state-machine transition,
+          triggered by an ``OVERTURNED`` ``ProctorReview`` against
+          the triggering flag).
+        - ``FLAG_FOR_REVIEW``: emits a ``CRITICAL`` flag with
+          ``triggered_termination=False``.  The session stays live;
+          a human reviewer must act.  Auto-termination is deferred
+          to the reviewer's decision.
+
+        Returns ``None`` if the threshold is not crossed, or if the
+        path is disabled (``medium_score_termination_threshold = 0``).
         """
 
         threshold = self._policy.medium_score_termination_threshold
@@ -576,7 +682,10 @@ class SessionAggregator:
             # has a >= 0 constraint, so 0 is the only way to disable).
             return None
 
-        if self._accumulated_score >= threshold:
+        if self._accumulated_score < threshold:
+            return None
+
+        if self._policy.medium_score_action == MediumScoreAction.AUTO_TERMINATE:
             return FlagDecision(
                 rule_code=RULE_ACCUMULATED_SCORE,
                 severity=_CRITICAL,
@@ -587,8 +696,23 @@ class SessionAggregator:
                 detail={
                     "accumulated_score": self._accumulated_score,
                     "threshold": threshold,
+                    "medium_score_action": MediumScoreAction.AUTO_TERMINATE.value,
                 },
                 contributing_event_ids=contributing_event_ids,
             )
 
-        return None
+        # FLAG_FOR_REVIEW: CRITICAL flag, no auto-termination.
+        return FlagDecision(
+            rule_code=RULE_ACCUMULATED_SCORE,
+            severity=_CRITICAL,
+            confidence=ConfidenceInterval(
+                lower=1.0, score=1.0, upper=1.0,
+            ),
+            triggered_termination=False,
+            detail={
+                "accumulated_score": self._accumulated_score,
+                "threshold": threshold,
+                "medium_score_action": MediumScoreAction.FLAG_FOR_REVIEW.value,
+            },
+            contributing_event_ids=contributing_event_ids,
+        )

@@ -29,6 +29,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from proctoring_engine.models import (
     EvidenceKind,
     FlagSeverity,
+    LivenessAction,
+    MediumScoreAction,
     ReferenceMaterialPolicy,
     ReviewDecision,
 )
@@ -157,6 +159,10 @@ class CreatePolicyConfigRequest(BaseModel):
     gaze_warning_limit: int = Field(default=3, ge=0, le=1_000)
     gaze_termination_limit: int = Field(default=8, ge=1, le=1_000)
     medium_score_termination_threshold: float = Field(default=10.0, ge=0.0)
+    medium_score_action: MediumScoreAction = MediumScoreAction.AUTO_TERMINATE
+    liveness_check_enabled: bool = False
+    liveness_check_action: LivenessAction | None = None
+    liveness_score_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     extra_rules: dict[str, Any] = Field(default_factory=dict)
     is_active: bool = True
     retire_previous: bool = False
@@ -180,6 +186,10 @@ class PolicyConfigResponse(BaseModel):
     gaze_warning_limit: int
     gaze_termination_limit: int
     medium_score_termination_threshold: float
+    medium_score_action: MediumScoreAction
+    liveness_check_enabled: bool
+    liveness_check_action: LivenessAction | None
+    liveness_score_threshold: float
     created_by_id: uuid.UUID | None
     created_at: datetime
 
@@ -203,6 +213,10 @@ class PolicyConfigResponse(BaseModel):
             medium_score_termination_threshold=float(
                 orm.medium_score_termination_threshold
             ),
+            medium_score_action=orm.medium_score_action,
+            liveness_check_enabled=orm.liveness_check_enabled,
+            liveness_check_action=orm.liveness_check_action,
+            liveness_score_threshold=float(orm.liveness_score_threshold),
             created_by_id=orm.created_by_id,
             created_at=orm.created_at,
         )

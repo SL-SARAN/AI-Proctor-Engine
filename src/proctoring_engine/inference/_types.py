@@ -215,6 +215,29 @@ class AudioVadResult(InferenceResult):
 
 
 @dataclass(frozen=True, slots=True)
+class LivenessResult(InferenceResult):
+    """Per-frame liveness / anti-spoofing classification.
+
+    Catches print and screen-replay spoofing specifically — not
+    deepfakes or 3D masks (``docs/04-inference-modules-design.md``
+    §7).  The single-frame ``is_real`` classification is a point
+    estimate; the fusion engine collects consecutive frames within a
+    sampling window and computes the multi-frame confidence
+    interval, mirroring the identity-match pipeline.
+
+    ``real_score``, ``print_score``, and ``replay_score`` are the raw
+    softmax probabilities from the 3-class classifier, each in
+    ``[0, 1]``.  ``is_real`` is ``True`` iff ``real_score`` is the
+    argmax over the three classes.
+    """
+
+    is_real: bool = True
+    real_score: float = 1.0
+    print_score: float = 0.0
+    replay_score: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
 class BrowserEventResult(InferenceResult):
     """Result for a DOM-level browser event (deterministic, no model).
 
