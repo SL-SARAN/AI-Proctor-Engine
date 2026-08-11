@@ -120,27 +120,22 @@ def run_retention_deletion(
     # Process expired EvidenceArtifact rows.
     # We iterate in batches to avoid loading everything into memory.
     while True:
-        artifacts = (
-            db.execute(
-                select(EvidenceArtifact)
-                .where(EvidenceArtifact.retention_expires_at < now)
-                .limit(batch_size)
-            )
-            .scalars()
-            .all()
+        stmt = select(EvidenceArtifact).where(
+            EvidenceArtifact.retention_expires_at < now
         )
+        if failed_artifact_ids:
+            stmt = stmt.where(EvidenceArtifact.id.notin_(failed_artifact_ids))
+
+        # Order by id to guarantee deterministic forward progress
+        stmt = stmt.order_by(EvidenceArtifact.id).limit(batch_size)
+
+        artifacts = db.execute(stmt).scalars().all()
 
         if not artifacts:
             break
 
-        # Filter out artifacts already failed in this run.
-        processable = [a for a in artifacts if a.id not in failed_artifact_ids]
-        if not processable:
-            # All returned artifacts are ones we already failed on;
-            # no progress possible in this run.
-            break
-
-        for artifact in processable:
+        batch_deleted = 0
+        for artifact in artifacts:
             # Extract the storage key from storage_uri.
             # storage_uri format: "s3://evidence/{session_id}/{flag_id}/{type}.{ext}"
             storage_key = _extract_storage_key(artifact.storage_uri)
@@ -172,19 +167,14 @@ def run_retention_deletion(
                     exc,
                 )
                 storage_errors += 1
-                # Mark failed so we don't retry this artifact in subsequent
-                # iterations of this run (avoids infinite loop on persistent
-                # storage failure).
                 failed_artifact_ids.add(artifact.id)
-                # Don't delete the DB row if blob deletion failed — it's safer
-                # to have a row pointing at a missing blob than to have an
-                # orphaned blob with no audit trail.
                 continue
 
             # Delete the DB row.
             try:
                 db.delete(artifact)
                 db.flush()  # Flush per row to catch constraint violations early
+                batch_deleted += 1
                 artifacts_deleted += 1
             except Exception as exc:
                 logger.error(
@@ -196,14 +186,18 @@ def run_retention_deletion(
                 failed_artifact_ids.add(artifact.id)
                 continue
 
-    # Commit artifact deletions.
-    if artifacts_deleted > 0:
-        try:
-            db.commit()
-        except Exception as exc:
-            logger.error("Failed to commit artifact deletions: %s", exc)
-            db.rollback()
-            artifacts_deleted = 0
+        # Commit artifact deletions per batch to avoid long-running transactions
+        if batch_deleted > 0:
+            try:
+                db.commit()
+            except Exception as exc:
+                logger.error("Failed to commit artifact deletions for batch: %s", exc)
+                db.rollback()
+                # If the batch commit fails, we don't know which individual artifact
+                # caused it. Back out the counter for this batch and break the run
+                # to avoid infinite-looping on a poisoned database connection.
+                artifacts_deleted -= batch_deleted
+                break
 
     return RetentionDeletionResult(
         artifacts_deleted=artifacts_deleted,

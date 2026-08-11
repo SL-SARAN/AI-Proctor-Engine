@@ -861,6 +861,53 @@ class TestRetentionDeletionWorker:
             is not None
         )
 
+    def test_storage_error_avoids_infinite_loop(
+        self, db_session: Any, store: Any
+    ) -> None:
+        """A failed item is excluded from subsequent queries in the same
+        job run. With batch_size < total items, forward progress is
+        guaranteed (no infinite loop, no infinite re-querying of the
+        failed item).
+        """
+        from proctoring_engine.evidence.retention import run_retention_deletion
+        from proctoring_engine.evidence._protocol import EvidenceStoreError
+        from proctoring_engine.models import EvidenceArtifact
+
+        now = datetime.now(timezone.utc)
+        ids_and_keys = [
+            self._create_artifact(
+                db_session,
+                retention_expires_at=now - timedelta(hours=1),
+                store=store,
+            )
+            for _ in range(5)
+        ]
+
+        # Fail storage layer exactly once for the first item
+        failed_once = False
+        original_delete = store.delete
+
+        def transient_fail_delete(k):
+            nonlocal failed_once
+            if not failed_once:
+                failed_once = True
+                raise EvidenceStoreError("simulated storage failure for first item")
+            original_delete(k)
+
+        store.delete = transient_fail_delete  # type: ignore[method-assign]
+
+        # batch_size=2 means the loop must hit the failed item, then
+        # continue to process the remaining 4 — the SQL `notin_(failed_ids)`
+        # exclusion guarantees that.
+        result = run_retention_deletion(db_session, store, now=now, batch_size=2)
+
+        assert result.storage_errors == 1
+        assert result.artifacts_deleted == 4
+
+        # Exactly 1 row (the failed one) should remain
+        remaining = db_session.query(EvidenceArtifact).all()
+        assert len(remaining) == 1
+
 
 # ---------------------------------------------------------------------------
 # Protocol compliance tests
