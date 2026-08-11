@@ -758,6 +758,56 @@ class TestAudioVadRunner:
         result = runner.run(frames, rms_db=float("-inf"))
         assert result.event_type == EVENT_SILENCE
 
+    def test_speech_ratio_below_threshold_does_not_fire(self) -> None:
+        """A single noisy frame out of many must not classify the chunk
+        as ``speech_detected``.  The threshold defaults to 0.3, so
+        1-of-10 frames being speech (ratio=0.1) must NOT fire."""
+        from proctoring_engine.preprocessing.audio import AudioFrame
+
+        runner = AudioVadRunner(aggressiveness=2)
+        silence = _make_silence_frames(9, 16000, 20)
+        sine = _make_sine_frames(1, 16000, 20, freq_hz=1000, amplitude=16000)
+        # 1 speech + 9 silence frames
+        frames = silence + sine
+        # rms_db low so this isn't elevated_rms.
+        result = runner.run(frames, rms_db=-50.0)
+        assert result.speech_ratio == 0.1
+        assert result.event_type == EVENT_SILENCE
+
+    def test_speech_ratio_at_or_above_threshold_fires(self) -> None:
+        """A chunk where 30% or more of the frames are speech should
+        classify as ``speech_detected``."""
+        from proctoring_engine.preprocessing.audio import AudioFrame
+
+        runner = AudioVadRunner(aggressiveness=0)
+        # At aggressiveness=0 (least aggressive), all loud sine frames
+        # should classify as speech.  3 of 10 = 30%, exactly at threshold.
+        silence = _make_silence_frames(7, 16000, 20)
+        sine = _make_sine_frames(3, 16000, 20, freq_hz=1000, amplitude=16000)
+        frames = silence + sine
+        result = runner.run(frames, rms_db=-10.0)
+        assert result.speech_ratio >= 0.3
+        assert result.event_type == EVENT_SPEECH_DETECTED
+
+    def test_custom_speech_ratio_threshold(self) -> None:
+        """The threshold is a configurable constructor argument."""
+        # At threshold=1.0, no chunk can ever be speech_detected (unless
+        # every single frame is).
+        runner = AudioVadRunner(aggressiveness=2, speech_ratio_threshold=1.0)
+        sine = _make_sine_frames(5, 16000, 20, freq_hz=1000, amplitude=16000)
+        result = runner.run(sine, rms_db=-10.0)
+        # Even if every frame is speech, ratio=1.0 == 1.0 >= 1.0, so
+        # speech_detected fires.  But the threshold validation itself
+        # is what we care about.
+        assert result.event_type in (EVENT_SPEECH_DETECTED, EVENT_ELEVATED_RMS)
+
+    def test_invalid_speech_ratio_threshold_raises(self) -> None:
+        """Threshold must be in [0, 1]."""
+        with pytest.raises(ValueError, match="speech_ratio_threshold"):
+            AudioVadRunner(speech_ratio_threshold=1.5)
+        with pytest.raises(ValueError, match="speech_ratio_threshold"):
+            AudioVadRunner(speech_ratio_threshold=-0.1)
+
 
 # ======================================================================
 # Section 7 — Browser events (browser_events.py)

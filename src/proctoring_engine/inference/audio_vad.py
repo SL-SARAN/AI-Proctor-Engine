@@ -66,6 +66,18 @@ EVENT_ELEVATED_RMS: Final[str] = "elevated_rms"
 # length.  This is a constructor argument, not hardcoded.
 _DEFAULT_NOISE_FLOOR_DBFS: Final[float] = -30.0
 
+# Default minimum speech ratio for the ``speech_detected`` event.
+# A single VAD-positive frame out of an entire chunk was triggering
+# speech detection — the 04-inference-modules-design.md §5 spec
+# explicitly framed speech detection as "consistent speech
+# activity... not every individual VAD frame", so we require the
+# speech ratio to clear this minimum before classifying the chunk
+# as ``speech_detected``.  ``0.3`` is a calibration starting point
+# (require at least 30% of the chunk's frames to be classified as
+# speech); it should be tuned against real session audio the same
+# way the gaze thresholds are.
+_DEFAULT_SPEECH_RATIO_THRESHOLD: Final[float] = 0.3
+
 # Valid aggressiveness modes for ``webrtcvad.Vad``.
 _VALID_AGGRESSIVENESS: Final[frozenset[int]] = frozenset({0, 1, 2, 3})
 
@@ -85,11 +97,18 @@ class AudioVadRunner:
     noise_floor_dbfs:
         RMS threshold (dBFS) above which the ``elevated_rms`` event
         fires when VAD says silence.  Default -30.0.
+    speech_ratio_threshold:
+        Minimum fraction of the chunk's frames that must be classified
+        as speech for the chunk to be labeled ``speech_detected``.
+        Default 0.3 — a single noisy VAD-positive frame is no longer
+        sufficient to trigger a speech event.  Calibration starting
+        point; tune against real session audio.
 
     Raises
     ------
     ValueError
-        If ``aggressiveness`` is not in ``{0, 1, 2, 3}``.
+        If ``aggressiveness`` is not in ``{0, 1, 2, 3}`` or if
+        ``speech_ratio_threshold`` is not in ``[0, 1]``.
     """
 
     def __init__(
@@ -97,13 +116,20 @@ class AudioVadRunner:
         *,
         aggressiveness: int = 2,
         noise_floor_dbfs: float = _DEFAULT_NOISE_FLOOR_DBFS,
+        speech_ratio_threshold: float = _DEFAULT_SPEECH_RATIO_THRESHOLD,
     ) -> None:
         if aggressiveness not in _VALID_AGGRESSIVENESS:
             raise ValueError(
                 f"aggressiveness must be one of {sorted(_VALID_AGGRESSIVENESS)}; "
                 f"got {aggressiveness}."
             )
+        if not (0.0 <= speech_ratio_threshold <= 1.0):
+            raise ValueError(
+                f"speech_ratio_threshold must be in [0, 1]; "
+                f"got {speech_ratio_threshold}."
+            )
         self._noise_floor = noise_floor_dbfs
+        self._speech_ratio_threshold = speech_ratio_threshold
 
         import webrtcvad
         self._vad = webrtcvad.Vad(aggressiveness)
@@ -165,7 +191,7 @@ class AudioVadRunner:
         speech_ratio = speech_count / total
 
         # Classification logic.
-        if speech_ratio > 0.0:
+        if speech_ratio >= self._speech_ratio_threshold:
             event_type = EVENT_SPEECH_DETECTED
         elif rms_db > self._noise_floor:
             event_type = EVENT_ELEVATED_RMS
