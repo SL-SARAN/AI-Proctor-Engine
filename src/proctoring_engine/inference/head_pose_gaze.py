@@ -65,6 +65,7 @@ _MODALITY: Final[str] = "gaze"
 
 EVENT_ON_SCREEN: Final[str] = "on_screen"
 EVENT_OFF_SCREEN: Final[str] = "off_screen"
+EVENT_NO_LANDMARKS: Final[str] = "no_landmarks"
 
 # --- Landmark indices (MediaPipe 478-point mesh, 0-indexed) ---
 
@@ -268,6 +269,11 @@ class FaceLandmarkerRunner:
         Absolute yaw angle (degrees) beyond which the face is
         classified ``off_screen``.  Default 30° — a calibration
         starting point, not a final answer.
+    high_yaw_bypass_deg:
+        Absolute yaw angle (degrees) beyond which the face is
+        classified ``off_screen`` regardless of the EAR blink filter.
+        Default 45°. At extreme rotation, the eye-state question is
+        moot and foreshortening artificially lowers EAR.
     iris_offset_threshold:
         Iris offset ratio beyond which the eyes are classified as
         looking to the side.  Default 0.35.
@@ -289,6 +295,7 @@ class FaceLandmarkerRunner:
         *,
         model_bundle_path: str | None = None,
         yaw_threshold_deg: float = 30.0,
+        high_yaw_bypass_deg: float = 45.0,
         iris_offset_threshold: float = 0.35,
         ear_blink_threshold: float = 0.20,
     ) -> None:
@@ -306,6 +313,7 @@ class FaceLandmarkerRunner:
             )
 
         self._yaw_threshold = yaw_threshold_deg
+        self._high_yaw_bypass = high_yaw_bypass_deg
         self._iris_threshold = iris_offset_threshold
         self._ear_threshold = ear_blink_threshold
 
@@ -344,14 +352,17 @@ class FaceLandmarkerRunner:
         result = self._landmarker.detect(mp_image)
 
         if not result.face_landmarks:
-            # No face detected — treat as off-screen (the face-
-            # presence module will independently raise ``no_face``).
+            # No face detected. Treat as a distinct no_landmarks state,
+            # NOT off_screen=True. The face-presence module independently
+            # raises `no_face` for this frame.  Classifying this as
+            # off_screen would double-count the absence toward the gaze
+            # escalation ladder on top of the face-presence absence.
             return HeadPoseGazeResult(
                 modality=_MODALITY,
-                event_type=EVENT_OFF_SCREEN,
-                confidence=ConfidenceInterval(lower=0.0, score=0.0, upper=0.0),
+                event_type=EVENT_NO_LANDMARKS,
+                confidence=ConfidenceInterval(lower=1.0, score=1.0, upper=1.0),
                 raw_value={"reason": "no_landmarks"},
-                off_screen=True,
+                off_screen=None,
             )
 
         # MediaPipe returns landmark coordinates normalised to [0,1].
@@ -388,8 +399,19 @@ class FaceLandmarkerRunner:
         eyes_open = ear >= self._ear_threshold
         yaw_off = abs(yaw) > self._yaw_threshold
         iris_off = iris_offset > self._iris_threshold
+        high_yaw_bypass = abs(yaw) > self._high_yaw_bypass
 
-        off_screen = eyes_open and (yaw_off or iris_off)
+        # The blink filter (eyes_open) prevents a closed-eye frame from
+        # mis-classifying as looking away. But at extreme yaw, natural
+        # foreshortening of the projected eye contour lowers EAR even
+        # with eyes genuinely open. The high-yaw bypass overrides the
+        # blink filter when the head is rotated so far that the
+        # eye-state question is moot.
+        if high_yaw_bypass:
+            off_screen = True
+        else:
+            off_screen = eyes_open and (yaw_off or iris_off)
+
         event_type = EVENT_OFF_SCREEN if off_screen else EVENT_ON_SCREEN
 
         # Confidence: a rough heuristic — the further off-axis the

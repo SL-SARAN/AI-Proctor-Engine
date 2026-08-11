@@ -455,7 +455,13 @@ class SessionAggregator:
 
         decisions: list[FlagDecision] = []
 
-        if result.off_screen:
+        if result.off_screen is None:
+            # no_landmarks frame. Excluded from the gaze accumulator entirely
+            # so it doesn't double-count with the face-presence module's
+            # EVENT_NO_FACE signal.  The streak is neither continued nor
+            # broken; this frame simply doesn't exist to the gaze module.
+            pass
+        elif result.off_screen:
             # Continue / start an off-screen streak
             if self._gaze_off_start_ms is None:
                 self._gaze_off_start_ms = frame_timestamp_ms

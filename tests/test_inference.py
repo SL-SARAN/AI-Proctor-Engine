@@ -44,6 +44,7 @@ from proctoring_engine.inference.identity_match import (
 from proctoring_engine.inference.head_pose_gaze import (
     EVENT_OFF_SCREEN,
     EVENT_ON_SCREEN,
+    EVENT_NO_LANDMARKS,
     FaceLandmarkerRunner,
     _LEFT_EYE_IDS,
     _RIGHT_EYE_IDS,
@@ -226,6 +227,15 @@ class TestFacePresenceNoModel:
         assert EVENT_ONE_FACE == "one_face"
         assert EVENT_NO_FACE == "no_face"
         assert EVENT_SECOND_PERSON == "second_person"
+
+
+class TestGazeConstants:
+    """Tests for gaze constants."""
+
+    def test_event_type_constants(self) -> None:
+        assert EVENT_OFF_SCREEN == "off_screen"
+        assert EVENT_ON_SCREEN == "on_screen"
+        assert EVENT_NO_LANDMARKS == "no_landmarks"
 
 
 # ======================================================================

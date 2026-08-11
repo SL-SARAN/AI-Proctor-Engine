@@ -173,13 +173,15 @@ class HeadPoseGazeResult(InferenceResult):
     ``off_screen`` is the binary classification; the fusion engine
     aggregates consecutive ``off_screen=True`` frames into
     ``GazeAwayEvent`` objects (``docs/proctoring-engine-v1-spec.md``
-    §3.1 Stage 2).
+    §3.1 Stage 2).  If no landmarks were detected, ``off_screen`` is
+    ``None`` — this frame is excluded from the gaze accumulator entirely
+    to avoid double-counting with the face-presence module.
 
     The ``raw_value`` carries the underlying signals:
     ``yaw``, ``pitch``, ``roll``, ``ear``, ``iris_offset``.
     """
 
-    off_screen: bool = False
+    off_screen: bool | None = False
     yaw: float = 0.0
     pitch: float = 0.0
     roll: float = 0.0

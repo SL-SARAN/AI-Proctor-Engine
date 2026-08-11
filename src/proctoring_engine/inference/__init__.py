@@ -64,6 +64,7 @@ from proctoring_engine.inference.identity_match import (
 from proctoring_engine.inference.head_pose_gaze import (
     EVENT_OFF_SCREEN,
     EVENT_ON_SCREEN,
+    EVENT_NO_LANDMARKS,
     FaceLandmarkerRunner,
     MP_FACE_LANDMARKER_BUNDLE_ENV,
     compute_ear,
@@ -133,6 +134,7 @@ __all__ = [
     # Head pose / gaze
     "EVENT_OFF_SCREEN",
     "EVENT_ON_SCREEN",
+    "EVENT_NO_LANDMARKS",
     "FaceLandmarkerRunner",
     "MP_FACE_LANDMARKER_BUNDLE_ENV",
     "compute_ear",

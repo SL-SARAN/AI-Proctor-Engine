@@ -115,10 +115,10 @@ def _make_face_result(face_count: int = 2) -> FacePresenceResult:
     )
 
 
-def _make_gaze_result(off_screen: bool = True) -> HeadPoseGazeResult:
+def _make_gaze_result(off_screen: bool | None = True) -> HeadPoseGazeResult:
     return HeadPoseGazeResult(
         modality="gaze",
-        event_type="off_screen" if off_screen else "on_screen",
+        event_type="no_landmarks" if off_screen is None else ("off_screen" if off_screen else "on_screen"),
         confidence=_CI,
         off_screen=off_screen,
     )
@@ -546,6 +546,33 @@ class TestGazeAwayPath:
         assert len(medium_flags) == 1
         assert medium_flags[0].score_delta == 1.0  # default weight
         assert agg.accumulated_score == 1.0
+
+    def test_no_landmarks_excluded_from_gaze(self) -> None:
+        """A frame with off_screen=None (no landmarks) does not start,
+        break, or continue a gaze streak.  It is ignored entirely."""
+        agg = _make_aggregator(
+            policy=_default_policy(gaze_min_duration_ms=100, gaze_warning_limit=1)
+        )
+        # Start streak
+        agg.process_gaze(
+            _make_gaze_result(off_screen=True),
+            telemetry_event_id=uuid.uuid4(),
+            frame_timestamp_ms=0,
+        )
+        # No-landmarks frame in the middle
+        agg.process_gaze(
+            _make_gaze_result(off_screen=None),
+            telemetry_event_id=uuid.uuid4(),
+            frame_timestamp_ms=50,
+        )
+        # End streak
+        decisions = agg.process_gaze(
+            _make_gaze_result(off_screen=False),
+            telemetry_event_id=uuid.uuid4(),
+            frame_timestamp_ms=200,
+        )
+        # Streak was 200ms -> qualifies as an event
+        assert agg.gaze_away_count_in_window == 1
 
 
 # ===================================================================
