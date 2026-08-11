@@ -178,7 +178,7 @@ def decode_jpeg_frame(
 def normalize_for_mediapipe(frame: DecodedFrame) -> DecodedFrame:
     """Convert a decoded BGR frame to RGB for MediaPipe models.
 
-    The MediaPipe ``mp.solutions`` Face Detection and Face Mesh APIs
+    The MediaPipe Tasks API ``FaceDetector`` and ``FaceLandmarker``
     expect **RGB** inputs.  Passing a BGR array to them silently
     produces landmarks computed against the wrong channel order — the
     exact bug this layer exists to prevent.

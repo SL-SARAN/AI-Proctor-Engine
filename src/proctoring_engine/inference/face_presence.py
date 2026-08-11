@@ -157,9 +157,17 @@ class FaceDetectorRunner:
         confidences: list[float] = []
 
         for det in detections:
-            # MediaPipe Tasks API returns bounding box as a
-            # BoundingBox protobuf with origin_x, origin_y, width,
-            # height — already in normalised [0,1] coordinates.
+            # MediaPipe Tasks API returns the bounding box as a
+            # BoundingBox protobuf with origin_x, origin_y, width, height
+            # in **pixel coordinates** (in the same space as the input
+            # frame).  This differs from the deprecated
+            # ``mp.solutions.face_detection`` API which returned
+            # already-normalised [0, 1] coordinates — dividing by
+            # frame.width / frame.height here is REQUIRED, not a no-op.
+            # DO NOT simplify this code to "normalize by 1.0" thinking
+            # the box is already normalised; doing so will silently
+            # produce wildly wrong bounding boxes that exceed the
+            # image's pixel dimensions by 100x.
             bbox = det.bounding_box
             bounding_boxes.append(
                 BoundingBox(

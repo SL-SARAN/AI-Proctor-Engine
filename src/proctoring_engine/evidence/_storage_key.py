@@ -63,7 +63,7 @@ def build_storage_key(
     ...     UUID("00000000-0000-0000-0000-000000000002"),
     ...     "clip",
     ... )
-    'evidence/00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/video_clip.webm'
+    'evidence/00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/clip.webm'
     """
     ext = _ARTIFACT_EXTENSIONS.get(artifact_type)
     if ext is None:

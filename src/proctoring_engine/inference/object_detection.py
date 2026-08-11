@@ -21,8 +21,11 @@ Non-denylist detections are discarded here, not persisted.
 **Earbuds and smartwatches** are explicitly out of v1 scope — COCO
 has no class for either, and fine-tuning was deferred.
 
-Input:  a :class:`~proctoring_engine.preprocessing.frames.DecodedFrame`
-        (BGR or RGB — Ultralytics converts internally).
+Input:  a :class:`~proctoring_engine.preprocessing.frames.DecodedFrame`.
+        The Ultralytics model assumes **BGR** input — it does *not*
+        detect or convert channel order internally.  The
+        preprocessing layer (``frames.py``) natively decodes into
+        BGR, so the array is passed through unchanged.
 Output: ``list[ObjectDetectionResult]`` — one per detected denylist
         object, or an empty list if nothing on the denylist was found.
 """
@@ -181,8 +184,10 @@ class ObjectDetectorRunner:
         Parameters
         ----------
         frame:
-            A :class:`DecodedFrame` (BGR or RGB — Ultralytics
-            handles the conversion internally).
+            A :class:`DecodedFrame`. Must be in **BGR** channel order
+            (the native layout produced by the preprocessing layer)
+            because the Ultralytics model assumes BGR input and does
+            not convert it.
 
         Returns
         -------

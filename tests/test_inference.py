@@ -688,6 +688,108 @@ def _make_sine_frames(
     return frames
 
 
+class TestFaceDetectorBoundingBoxCoordinateSpace:
+    """Pins down the coordinate space of MediaPipe Tasks API bounding boxes.
+
+    The Tasks API returns bounding boxes in **pixel coordinates** of the
+    input frame, NOT normalised [0, 1].  This contrasts with the
+    deprecated ``mp.solutions.face_detection`` API which returned
+    already-normalised coordinates.  The ``FaceDetectorRunner.run``
+    method divides origin_x / origin_y / width / height by the frame's
+    pixel dimensions to produce the normalised ``BoundingBox`` dataclass.
+
+    These tests verify the pixel-to-normalised division against a known
+    input/output pair so this can't silently regress if someone
+    ``simplifies`` the code to match the wrong comment.
+    """
+
+    def _make_mock_runner_with_pixel_bbox(
+        self, ox: int, oy: int, w: int, h: int, frame_w: int, frame_h: int
+    ) -> tuple[Any, Any]:
+        """Build a ``FaceDetectorRunner`` with a mocked detector that
+        returns one detection at the given pixel coords. Returns the
+        runner and a fake ``DecodedFrame`` of the given dimensions."""
+
+        # We don't want to rely on mediapipe being installed for this test.
+        # We just need to mock the detector attribute.
+        from proctoring_engine.inference.face_presence import FaceDetectorRunner
+        from proctoring_engine.preprocessing.frames import DecodedFrame
+
+        bbox_pb = MagicMock()
+        bbox_pb.origin_x = ox
+        bbox_pb.origin_y = oy
+        bbox_pb.width = w
+        bbox_pb.height = h
+
+        det = MagicMock()
+        det.bounding_box = bbox_pb
+        det.categories = [MagicMock(score=0.9)]
+
+        detection_result = MagicMock()
+        detection_result.detections = [det]
+
+        # Use an uninitialized runner, then poke the mocked detector directly.
+        # Mock class so we can instantiate without model errors.
+        class _TestRunner(FaceDetectorRunner):
+            def __init__(self) -> None:
+                self._min_confidence = 0.5
+                self._detector = MagicMock()
+                self._detector.detect.return_value = detection_result
+
+        runner = _TestRunner()
+
+        frame = MagicMock(spec=DecodedFrame)
+        frame.width = frame_w
+        frame.height = frame_h
+        frame.array = MagicMock()
+        return runner, frame
+
+    def test_pixel_bbox_normalised_to_unit_interval(self) -> None:
+        """A 640x480 frame with a 100x150 box at (50, 60) must produce
+        BoundingBox(x=50/640, y=60/480, w=100/640, h=150/480)."""
+        runner, frame = self._make_mock_runner_with_pixel_bbox(
+            ox=50, oy=60, w=100, h=150, frame_w=640, frame_h=480
+        )
+
+        with patch("builtins.__import__"):
+            result = runner.run(frame)
+
+        assert len(result.bounding_boxes) == 1
+        bbox = result.bounding_boxes[0]
+        assert bbox.x == 50 / 640
+        assert bbox.y == 60 / 480
+        assert bbox.w == 100 / 640
+        assert bbox.h == 150 / 480
+
+    def test_full_frame_bbox_yields_unit_values(self) -> None:
+        """A bbox that exactly covers the frame produces (0, 0, 1, 1)."""
+        runner, frame = self._make_mock_runner_with_pixel_bbox(
+            ox=0, oy=0, w=640, h=480,
+            frame_w=640, frame_h=480,
+        )
+
+        with patch("builtins.__import__"):
+            result = runner.run(frame)
+
+        bbox = result.bounding_boxes[0]
+        assert bbox.x == 0.0
+        assert bbox.y == 0.0
+        assert bbox.w == 1.0
+        assert bbox.h == 1.0
+
+    def test_wrong_no_division_breaks_bounds(self) -> None:
+        """If someone 'simplifies' the code by removing the division,
+        the resulting BoundingBox values will exceed [0, 1] and trigger
+        the dataclass validation error.  This pins the contract."""
+        from proctoring_engine.inference._types import BoundingBox
+
+        # Simulate the WRONG (un-normalised) result: a 640x480 frame
+        # with a 100x150 box at (50, 60).  If the code forgot to
+        # divide, the values would be 50, 60, 100, 150 — well above 1.
+        with pytest.raises(ValueError, match=r"must be in \[0, 1\]"):
+            BoundingBox(x=50, y=60, w=100, h=150)
+
+
 class TestAudioVadRunner:
     """Tests for AudioVadRunner with real webrtcvad."""
 
