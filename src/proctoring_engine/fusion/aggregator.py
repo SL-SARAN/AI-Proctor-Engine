@@ -108,6 +108,7 @@ class PolicySnapshot:
     liveness_check_enabled: bool = False
     liveness_check_action: LivenessAction | None = None
     liveness_score_threshold: float = 0.5
+    liveness_confirmation_frames: int = 3
 
     # Per-rule-code weight for the accumulated-score path.
     # Keys are ``Flag.rule_code`` values; values are the weight
@@ -197,6 +198,15 @@ class SessionAggregator:
 
         # --- Path 3: accumulated score ---
         self._accumulated_score: float = 0.0
+
+        # --- Path 4: liveness / anti-spoofing ---
+        self._liveness_window: collections.deque[LivenessResult] = collections.deque()
+        self._liveness_event_ids_window: collections.deque[uuid.UUID] = collections.deque()
+        # Run length of consecutive spoof frames since the last real
+        # frame (or session start). Fires when this is a multiple of
+        # ``liveness_confirmation_frames`` and the window is full of
+        # spoof frames. A real frame resets this to 0.
+        self._liveness_spoof_run_length: int = 0
 
     # -- Accessors for testing / observability --
 
@@ -292,43 +302,94 @@ class SessionAggregator:
         model returned ``is_real=False`` or its raw confidence was
         below the policy threshold.
 
+        Aggregates frames into a rolling window of length
+        ``PolicyConfig.liveness_confirmation_frames``. If **all** frames
+        in the window are ``is_real=False``, a flag is raised. The
+        confidence interval is computed across the window (mean, min, max
+        of the raw confidence scores).
+
         Branches on ``PolicyConfig.liveness_check_action``:
 
-        - ``CRITICAL_TERMINATE`` (default for institutions that treat
-          spoofing as a hard rule): emit a ``CRITICAL`` flag with
+        - ``CRITICAL_TERMINATE``: emit a ``CRITICAL`` flag with
           ``triggered_termination=True``.
         - ``MEDIUM_ACCUMULATE``: emit a ``MEDIUM`` flag with
           ``score_delta=1.0`` that contributes to the
-          accumulated-score path — ``liveness_check_failed`` follows
-          the same escalation ladder as ``gaze_away_frequency``,
-          ``browser_event``, etc.
+          accumulated-score path.
 
-        Returns ``[]`` if liveness check is disabled on the policy
-        or if the frame passes (``is_real=True``).
+        Returns ``[]`` if liveness check is disabled on the policy,
+        if the window is not yet full of spoof frames, or if the
+        flag has already fired for this session.
         """
 
         if not self._policy.liveness_check_enabled:
             return []
 
+        window_size = self._policy.liveness_confirmation_frames
+
+        # Maintain the rolling window for every result. A real frame
+        # inside the window breaks the spoof streak (the all-spoof
+        # condition in the window check below fails) and resets the
+        # per-streak fire counter.
+        self._liveness_window.append(result)
+        self._liveness_event_ids_window.append(telemetry_event_id)
+        if len(self._liveness_window) > window_size:
+            self._liveness_window.popleft()
+            self._liveness_event_ids_window.popleft()
+
         if result.is_real:
+            self._liveness_spoof_run_length = 0
             return []
+
+        # Count consecutive spoof frames since the last real frame.
+        # We fire once every `window_size` spoof frames — each fire
+        # represents a fully-confirmed window pattern.
+        self._liveness_spoof_run_length += 1
+
+        if len(self._liveness_window) < window_size:
+            return []
+
+        # The flag condition: every frame in the window must be a spoof
+        if any(r.is_real for r in self._liveness_window):
+            return []
+
+        # Fire only when the current run length is a multiple of
+        # `window_size`, so a sustained spoof streak produces one fire
+        # every `window_size` frames rather than one per frame.
+        if self._liveness_spoof_run_length % window_size != 0:
+            return []
+
+        # We have a confirmed spoof window. Compute the interval.
+        scores = [r.confidence.score for r in self._liveness_window]
+        mean_score = sum(scores) / len(scores)
+        min_score = min(scores)
+        max_score = max(scores)
+
+        # Clamp the mean inside [min, max] to defend against floating-point
+        # drift when all scores are equal (e.g. sum of 3 * 0.8 / 3 = 0.800...2).
+        clamped_mean = max(min_score, min(max_score, mean_score))
+
+        interval = ConfidenceInterval(
+            lower=min_score, score=clamped_mean, upper=max_score
+        )
 
         if self._policy.liveness_check_action == LivenessAction.CRITICAL_TERMINATE:
             return [
                 FlagDecision(
                     rule_code=RULE_LIVENESS_CHECK_FAILED,
                     severity=_CRITICAL,
-                    confidence=result.confidence,
+                    confidence=interval,
                     triggered_termination=True,
                     detail={
-                        "model_is_real": result.is_real,
-                        "raw_confidence": result.confidence.score,
+                        "window_size": window_size,
+                        "mean_confidence": clamped_mean,
+                        "min_confidence": min_score,
+                        "max_confidence": max_score,
                         "threshold": self._policy.liveness_score_threshold,
                         "liveness_check_action": (
                             LivenessAction.CRITICAL_TERMINATE.value
                         ),
                     },
-                    contributing_event_ids=(telemetry_event_id,),
+                    contributing_event_ids=tuple(self._liveness_event_ids_window),
                 )
             ]
 
@@ -337,17 +398,19 @@ class SessionAggregator:
         decision = FlagDecision(
             rule_code=RULE_LIVENESS_CHECK_FAILED,
             severity=_MEDIUM,
-            confidence=result.confidence,
+            confidence=interval,
             triggered_termination=False,
             detail={
-                "model_is_real": result.is_real,
-                "raw_confidence": result.confidence.score,
+                "window_size": window_size,
+                "mean_confidence": clamped_mean,
+                "min_confidence": min_score,
+                "max_confidence": max_score,
                 "threshold": self._policy.liveness_score_threshold,
                 "liveness_check_action": (
                     LivenessAction.MEDIUM_ACCUMULATE.value
                 ),
             },
-            contributing_event_ids=(telemetry_event_id,),
+            contributing_event_ids=tuple(self._liveness_event_ids_window),
             score_delta=weight,
         )
 
@@ -355,7 +418,7 @@ class SessionAggregator:
 
         decisions = [decision]
         acc_decision = self._check_accumulated_threshold(
-            contributing_event_ids=(telemetry_event_id,),
+            contributing_event_ids=tuple(self._liveness_event_ids_window),
         )
         if acc_decision is not None:
             decisions.append(acc_decision)

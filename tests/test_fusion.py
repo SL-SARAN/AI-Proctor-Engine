@@ -1273,42 +1273,51 @@ class TestLivenessModality:
         )
         assert decisions == []
 
-    def test_critical_terminate_on_spoof(self) -> None:
-        """``CRITICAL_TERMINATE``: spoof frame raises a CRITICAL flag
-        with ``triggered_termination=True``."""
+    def test_critical_terminate_on_spoof_window(self) -> None:
+        """``CRITICAL_TERMINATE``: spoof frames spanning the confirmation
+        window raise a CRITICAL flag with ``triggered_termination=True``."""
         agg = _make_aggregator(
             policy=_default_policy(
                 liveness_check_enabled=True,
                 liveness_check_action=LivenessAction.CRITICAL_TERMINATE,
+                liveness_confirmation_frames=3,
             )
         )
-        decisions = agg.process_liveness(
-            _make_liveness_result(is_real=False, confidence=0.85),
-            telemetry_event_id=uuid.uuid4(),
-        )
+        decisions: list[FlagDecision] = []
+        for _ in range(3):
+            decisions = agg.process_liveness(
+                _make_liveness_result(is_real=False, confidence=0.85),
+                telemetry_event_id=uuid.uuid4(),
+            )
         assert len(decisions) == 1
         d = decisions[0]
         assert d.rule_code == RULE_LIVENESS_CHECK_FAILED
         assert d.severity == "critical"
         assert d.triggered_termination is True
         assert d.detail["liveness_check_action"] == "critical_terminate"
-        assert d.detail["model_is_real"] is False
-        assert d.detail["raw_confidence"] == 0.85
+        assert d.detail["window_size"] == 3
+        # Degenerate confidence interval because all 3 were exactly 0.85
+        assert d.confidence.score == 0.85
+        assert d.confidence.lower == 0.85
+        assert d.confidence.upper == 0.85
 
-    def test_medium_accumulate_on_spoof(self) -> None:
-        """``MEDIUM_ACCUMULATE``: spoof frame raises a MEDIUM flag
-        that contributes to the accumulated-score path."""
+    def test_medium_accumulate_on_spoof_window(self) -> None:
+        """``MEDIUM_ACCUMULATE``: spoof frames spanning the window raise
+        a MEDIUM flag that contributes to the accumulated-score path."""
         agg = _make_aggregator(
             policy=_default_policy(
                 liveness_check_enabled=True,
                 liveness_check_action=LivenessAction.MEDIUM_ACCUMULATE,
                 medium_score_termination_threshold=3.0,
+                liveness_confirmation_frames=3,
             )
         )
-        decisions = agg.process_liveness(
-            _make_liveness_result(is_real=False),
-            telemetry_event_id=uuid.uuid4(),
-        )
+        decisions: list[FlagDecision] = []
+        for _ in range(3):
+            decisions = agg.process_liveness(
+                _make_liveness_result(is_real=False, confidence=0.8),
+                telemetry_event_id=uuid.uuid4(),
+            )
         assert len(decisions) == 1
         d = decisions[0]
         assert d.rule_code == RULE_LIVENESS_CHECK_FAILED
@@ -1316,6 +1325,57 @@ class TestLivenessModality:
         assert d.triggered_termination is False
         assert d.score_delta == 1.0
         assert d.detail["liveness_check_action"] == "medium_accumulate"
+
+    def test_liveness_confidence_interval_spread(self) -> None:
+        """The flag's confidence interval reflects the min, max, and mean
+        of the raw confidence scores over the confirmation window."""
+        agg = _make_aggregator(
+            policy=_default_policy(
+                liveness_check_enabled=True,
+                liveness_check_action=LivenessAction.CRITICAL_TERMINATE,
+                liveness_confirmation_frames=3,
+            )
+        )
+        decisions: list[FlagDecision] = []
+        scores = [0.8, 0.9, 0.7]
+        for score in scores:
+            decisions = agg.process_liveness(
+                _make_liveness_result(is_real=False, confidence=score),
+                telemetry_event_id=uuid.uuid4(),
+            )
+        assert len(decisions) == 1
+        interval = decisions[0].confidence
+        assert interval.lower == 0.7
+        assert interval.upper == 0.9
+        assert interval.score == sum(scores) / len(scores)
+
+    def test_real_frame_resets_window(self) -> None:
+        """A single ``is_real=True`` frame breaks the spoof streak; the
+        window must start over."""
+        agg = _make_aggregator(
+            policy=_default_policy(
+                liveness_check_enabled=True,
+                liveness_check_action=LivenessAction.CRITICAL_TERMINATE,
+                liveness_confirmation_frames=3,
+            )
+        )
+        # 2 spoof frames
+        for _ in range(2):
+            agg.process_liveness(
+                _make_liveness_result(is_real=False),
+                telemetry_event_id=uuid.uuid4(),
+            )
+        # 1 real frame
+        agg.process_liveness(
+            _make_liveness_result(is_real=True),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        # 1 more spoof frame (should not trigger, window was broken)
+        decisions = agg.process_liveness(
+            _make_liveness_result(is_real=False),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert decisions == []
 
     def test_medium_accumulate_trips_threshold(self) -> None:
         """After three MEDIUM_ACCUMULATE liveness events (each at the
@@ -1328,11 +1388,13 @@ class TestLivenessModality:
                 liveness_check_action=LivenessAction.MEDIUM_ACCUMULATE,
                 medium_score_termination_threshold=3.0,
                 medium_score_action=MediumScoreAction.AUTO_TERMINATE,
+                liveness_confirmation_frames=2, # make the test faster
             )
         )
 
         all_decisions: list[FlagDecision] = []
-        for _ in range(3):
+        # Three flag cycles (each takes 2 spoof frames)
+        for _ in range(6):
             all_decisions.extend(
                 agg.process_liveness(
                     _make_liveness_result(is_real=False),
@@ -1353,25 +1415,26 @@ class TestLivenessModality:
         assert acc_flags[0].triggered_termination is True
 
     def test_threshold_below_real_score_returns_real(self) -> None:
-        """The threshold check is applied by the runner, not the
-        aggregator — but verify the aggregator passes through
-        ``is_real=False`` exactly.  Threshold semantics are tested
-        in ``test_inference.py`` for the runner side."""
+        """Borderline frame: high confidence but still marked spoof
+        by the runner.  Aggregator treats the spoof frame the same as
+        any other spoof — the threshold is applied at the runner, not
+        the aggregator.  Threshold semantics are tested in
+        ``test_inference.py`` for the runner side."""
 
         agg = _make_aggregator(
             policy=_default_policy(
                 liveness_check_enabled=True,
                 liveness_check_action=LivenessAction.CRITICAL_TERMINATE,
+                liveness_confirmation_frames=2,
             )
         )
-        # Borderline frame: high confidence but still marked spoof
-        # by the runner.  Aggregator must treat it as spoof.
-        decisions = agg.process_liveness(
-            _make_liveness_result(
-                is_real=False,
-                confidence=0.49,  # below 0.5 threshold
-            ),
-            telemetry_event_id=uuid.uuid4(),
-        )
+        # Push 2 spoof frames with low confidence; the window is full
+        # of spoof frames so we should fire.
+        decisions: list[FlagDecision] = []
+        for _ in range(2):
+            decisions = agg.process_liveness(
+                _make_liveness_result(is_real=False, confidence=0.49),
+                telemetry_event_id=uuid.uuid4(),
+            )
         assert len(decisions) == 1
         assert decisions[0].severity == "critical"

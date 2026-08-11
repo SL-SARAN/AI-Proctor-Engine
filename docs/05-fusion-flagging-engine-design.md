@@ -122,12 +122,29 @@ is `real / print / replay`; ``is_real`` follows the policy-configured
 underlying model can do reliably; claims about catching deepfakes
 or 3D masks would be overpromising what v1 actually verifies.
 
-**Per-frame classification → multi-frame confidence interval.**
+**Per-frame classification → multi-frame confirmation window.**
 `LivenessRunner` emits a single-frame point estimate; the fusion
-engine collects consecutive frames within a sampling window and
-computes the multi-frame confidence interval (mean ± spread, same
-shape as identity-match). The aggregator makes the policy decision
-from the single-frame `is_real` field plus the per-rule threshold.
+engine collects consecutive frames within a rolling window of
+length `PolicyConfig.liveness_confirmation_frames` (default `3`).
+A flag is raised only when **every frame** in the window is a spoof
+(`is_real=False`) — the noise-filter semantic that prevents a
+single bad frame from triggering a kill-switch.
+
+The flag's `ConfidenceInterval` is computed across the window from
+the raw confidence values: `lower = min(scores)`,
+`score = mean(scores)`, `upper = max(scores)` — the same "mean ±
+spread" pattern the design doc requires for the multi-sample
+identity-match pipeline. (Float-point clamping is applied: when all
+scores are equal, the mean can drift slightly above `max`; the
+aggregator clamps the mean inside `[min, max]` so the
+`ConfidenceInterval` invariants hold.)
+
+A real frame inside the window breaks the spoof streak — the
+window slides forward but the streak isn't "fresh" until the next
+`window_size` consecutive spoof frames. Each fresh streak fires
+once every `window_size` consecutive spoof frames, so a sustained
+spoofing session produces one flag per `window_size` frames rather
+than one per frame. A real frame resets the streak counter.
 
 **Two configured actions — branches on `liveness_check_action`:**
 - **`critical_terminate`** (default for institutions that treat

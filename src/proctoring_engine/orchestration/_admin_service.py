@@ -271,6 +271,7 @@ def create_policy_version(
         liveness_check_enabled=request.liveness_check_enabled,
         liveness_check_action=request.liveness_check_action,
         liveness_score_threshold=request.liveness_score_threshold,
+        liveness_confirmation_frames=request.liveness_confirmation_frames,
         extra_rules=dict(request.extra_rules),
         created_by_id=created_by.id,
     )

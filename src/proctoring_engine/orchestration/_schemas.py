@@ -163,6 +163,7 @@ class CreatePolicyConfigRequest(BaseModel):
     liveness_check_enabled: bool = False
     liveness_check_action: LivenessAction | None = None
     liveness_score_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    liveness_confirmation_frames: int = Field(default=3, ge=1, le=100)
     extra_rules: dict[str, Any] = Field(default_factory=dict)
     is_active: bool = True
     retire_previous: bool = False
@@ -190,6 +191,7 @@ class PolicyConfigResponse(BaseModel):
     liveness_check_enabled: bool
     liveness_check_action: LivenessAction | None
     liveness_score_threshold: float
+    liveness_confirmation_frames: int
     created_by_id: uuid.UUID | None
     created_at: datetime
 
@@ -217,6 +219,7 @@ class PolicyConfigResponse(BaseModel):
             liveness_check_enabled=orm.liveness_check_enabled,
             liveness_check_action=orm.liveness_check_action,
             liveness_score_threshold=float(orm.liveness_score_threshold),
+            liveness_confirmation_frames=orm.liveness_confirmation_frames,
             created_by_id=orm.created_by_id,
             created_at=orm.created_at,
         )

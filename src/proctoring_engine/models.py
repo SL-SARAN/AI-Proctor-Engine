@@ -391,6 +391,10 @@ class PolicyConfig(Base):
             name="ck_policy_confirmation_frames_positive",
         ),
         CheckConstraint(
+            "liveness_confirmation_frames > 0",
+            name="ck_policy_liveness_frames_positive",
+        ),
+        CheckConstraint(
             "medium_score_termination_threshold >= 0",
             name="ck_policy_medium_score_threshold_nonnegative",
         ),
@@ -470,6 +474,9 @@ class PolicyConfig(Base):
     )
     liveness_score_threshold: Mapped[float] = mapped_column(
         Numeric(5, 4), nullable=False, default=0.5
+    )
+    liveness_confirmation_frames: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=3
     )
     extra_rules: Mapped[dict[str, Any]] = mapped_column(
         JsonPayload, nullable=False, default=dict
