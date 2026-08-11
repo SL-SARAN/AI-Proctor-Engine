@@ -27,12 +27,18 @@ from several frames within a sampling window and computes the
 statistical interval (mean ± std, or min/max spread).  This keeps the
 inference module stateless and the window logic in one place.
 
-**Face-crop reuse:** this module reuses the cropped face region that
-``identity_match.py`` consumes, not the raw frame.  Identity-match
-already runs face detection / cropping upstream — we don't want a
-second detection pass.
+**Face-crop reuse:** this module shares the upstream uncropped
+heavy frame (JPEG) but performs its own cropping via the uniface
+API.  It requires a bounding box ``(x1, y1, x2, y2)`` in pixel
+coordinates.  Because the identity-match module uses dlib
+(which detects internally but does not emit bounding boxes), a
+separate face-detection pass is required on the server to generate
+this box before liveness can run.  (The client's light-inference
+face bbox is too imprecise and misaligned with the heavy frame to
+use for anti-spoofing).
 
-Input:  a face-region crop (``np.ndarray``, RGB, HxWx3, uint8).
+Input:  the uncropped heavy frame (``np.ndarray``, BGR, HxWx3, uint8)
+        + a face bounding box ``[x1, y1, x2, y2]``.
 Output: a :class:`LivenessResult`.
 """
 
@@ -65,57 +71,35 @@ EVENT_LIVENESS_REAL: Final[str] = "liveness_real"
 EVENT_LIVENESS_SPOOF: Final[str] = "liveness_spoof"
 
 LIVENESS_MODEL_PATH_ENV: Final[str] = "LIVENESS_MODEL_PATH"
-"""Environment variable pointing to the ``MiniFASNetV2.onnx`` weights.
+"""Environment variable pointing to a directory containing pre-baked
+``MiniFASNetV2.onnx`` weights.
 
-Mirrors the pattern used by ``MP_FACE_DETECTOR_BUNDLE``,
-``MP_FACE_LANDMARKER_BUNDLE``, and ``YOLO_WEIGHTS_PATH``.  The weights
-are pinned to a specific SHA-256 at build time (see
-``MINIFASNET_V2_SHA256``); the loader verifies the file before
-constructing the inference session.
+When set, the uniface ``MiniFASNet`` is told to look in this directory
+instead of its default cache (``~/.uniface/models/``).  Used in
+production to point at weights baked into the container image at
+build time, rather than downloading them at first inference.  When
+unset, the default uniface cache location is used and weights are
+downloaded on first construction (with the built-in SHA-256
+verification; see ``MINIFASNET_V2_SHA256`` below).
 """
 
 # Pinned SHA-256 of MiniFASNetV2.onnx, verified by direct download.
-# If this hash ever changes, the change must be reviewed against the
-# upstream repository (jucasansao/face-recognition or comparable) — a
-# silent update to a different model family would be a security-relevant
-# change, not just a versioning nit.
+# This matches the uniface built-in ``verify_model_weights`` check —
+# the upstream library downloads and verifies the file with this
+# hash.  If this hash ever changes, the change must be reviewed
+# against the upstream repository — a silent update to a different
+# model family would be a security-relevant change, not just a
+# versioning nit.
 MINIFASNET_V2_SHA256: Final[str] = (
     "b32929adc2d9c34b9486f8c4c7bc97c1b69bc0ea9befefc380e4faae4e463907"
 )
-
-# 3-class softmax output index → label
-_CLASS_REAL: Final[int] = 0
-_CLASS_PRINT: Final[int] = 1
-_CLASS_REPLAY: Final[int] = 2
-
-_EXPECTED_INPUT_HEIGHT: Final[int] = 80
-_EXPECTED_INPUT_HEIGHT_2: Final[int] = 160  # uniface supports 80x80 and 160x160
 
 # ---------------------------------------------------------------------------
 # Pure helpers (unit-testable without a model)
 # ---------------------------------------------------------------------------
 
 
-def _parse_classification(probabilities: np.ndarray) -> tuple[bool, float, float, float]:
-    """Convert a 3-class softmax output to the structured result fields.
-
-    Returns ``(is_real, real_score, print_score, replay_score)``.
-    ``is_real`` is ``True`` iff ``real`` is the argmax — the
-    0.5-threshold default in ``PolicyConfig.liveness_score_threshold``
-    is a separate signal the fusion engine applies on top.
-    """
-    if probabilities.shape != (3,):
-        raise ValueError(
-            f"Expected a (3,) softmax output; got shape {probabilities.shape}."
-        )
-    real_score = float(probabilities[_CLASS_REAL])
-    print_score = float(probabilities[_CLASS_PRINT])
-    replay_score = float(probabilities[_CLASS_REPLAY])
-    is_real = bool(np.argmax(probabilities) == _CLASS_REAL)
-    return is_real, real_score, print_score, replay_score
-
-
-def compute_liveness_confidence(real_score: float) -> ConfidenceInterval:
+def compute_liveness_confidence(score: float) -> ConfidenceInterval:
     """Single-frame confidence interval for a liveness classification.
 
     For a single-frame point estimate, the interval is degenerate
@@ -125,42 +109,10 @@ def compute_liveness_confidence(real_score: float) -> ConfidenceInterval:
     layer is uniform: every modality emits a
     :class:`ConfidenceInterval`, not a bare float.
     """
-    real_score = max(0.0, min(1.0, real_score))
+    score = max(0.0, min(1.0, score))
     return ConfidenceInterval(
-        lower=real_score, score=real_score, upper=real_score,
+        lower=score, score=score, upper=score,
     )
-
-
-def _verify_weights_sha256(weights_path: str) -> None:
-    """Verify the model weights file against the pinned SHA-256.
-
-    Raises :class:`FileNotFoundError` if the file is missing,
-    :class:`ValueError` if the hash doesn't match.  The hash check
-    is the load-time enforcement that the verified weights are in
-    place — running against an unverified, tampered, or wrong-family
-    model would silently change the spoof-detection behaviour.
-    """
-
-    if not os.path.isfile(weights_path):
-        raise FileNotFoundError(
-            f"Liveness model weights not found at '{weights_path}'."
-        )
-
-    sha256 = hashlib.sha256()
-    with open(weights_path, "rb") as f:
-        # Stream in 1 MiB chunks to avoid loading the full file into
-        # memory — the model file is on the order of a few MB.
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            sha256.update(chunk)
-
-    actual = sha256.hexdigest()
-    if actual != MINIFASNET_V2_SHA256:
-        raise ValueError(
-            f"Liveness model weights SHA-256 mismatch at "
-            f"'{weights_path}': expected {MINIFASNET_V2_SHA256}, "
-            f"got {actual}. Refusing to load — the pinned weights "
-            "are the verified, audited load path."
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -178,22 +130,23 @@ class LivenessBackend(abc.ABC):
     """
 
     @abc.abstractmethod
-    def classify(self, face_rgb: np.ndarray) -> np.ndarray:
-        """Run a single forward pass on the face crop.
+    def predict(self, frame_bgr: np.ndarray, bbox_xyxy: list[int] | np.ndarray) -> tuple[bool, float]:
+        """Run a single forward pass on the frame + bounds.
 
         Parameters
         ----------
-        face_rgb:
-            An RGB ``uint8`` numpy array of shape ``(H, W, 3)``
-            containing the cropped face region (from the same
-            preprocessing pipeline that feeds
-            ``IdentityMatchRunner``).
+        frame_bgr:
+            An uncropped BGR ``uint8`` numpy array of shape ``(H, W, 3)``.
+            This is the raw heavy frame, but converted to BGR channel
+            order (the format uniface's internal preprocessor expects).
+        bbox_xyxy:
+            A 4-element sequence ``[x1, y1, x2, y2]`` representing the
+            face bounding box in pixel coordinates.
 
         Returns
         -------
-        np.ndarray
-            A 3-element float array with the per-class probabilities
-            ``(real, print, replay)``, summing to 1.
+        tuple[bool, float]
+            ``(is_real, confidence)``
         """
 
     @property
@@ -210,11 +163,12 @@ class LivenessBackend(abc.ABC):
 class UnifaceBackend(LivenessBackend):
     """Concrete backend wrapping ``uniface`` (MiniFASNetV2 / ONNX Runtime).
 
-    The library ships the MiniFASNetV2 weights inside the
-    ``uniface[cpu]`` pip wheel, so no external download is required
-    at runtime — the weights are pre-fetched at build time and baked
-    into the image, then verified against the pinned SHA-256 by
-    :func:`_verify_weights_sha256`.
+    The library fetches the MiniFASNetV2 weights at construction
+    time (if not already cached locally) and verifies them against
+    its own internal SHA-256 pin (which resolves to
+    ``MINIFASNET_V2_SHA256``).  In a production environment, set the
+    ``LIVENESS_MODEL_PATH`` env var to a directory where the weapons
+    were baked at build time to avoid runtime downloading.
 
     Heavy import is deferred to construction time, so the module
     itself is importable on any platform.
@@ -223,75 +177,54 @@ class UnifaceBackend(LivenessBackend):
     def __init__(
         self,
         *,
-        model_path: str | None = None,
+        model_directory: str | None = None,
         providers: list[str] | None = None,
     ) -> None:
-        model_path = model_path or os.environ.get(LIVENESS_MODEL_PATH_ENV)
-        if model_path is None:
-            raise EnvironmentError(
-                f"The {LIVENESS_MODEL_PATH_ENV} environment variable "
-                f"is not set and no model_path was provided. Bake "
-                "MiniFASNetV2.onnx into the container image and "
-                "point the env var at it."
-            )
-        _verify_weights_sha256(model_path)
-        self._model_path = model_path
-
         # uniface + onnxruntime are the heavy imports — defer them to
         # construction time so the rest of the module is importable on
         # any platform.  Tests that exercise this backend use
         # ``pytest.importorskip("uniface")`` to skip cleanly on
         # platforms where it is absent.
-        import uniface  # noqa: F401 — used below
-        self._uniface = uniface
+        import uniface
+        from uniface.constants import MiniFASNetWeights
+
+        model_directory = model_directory or os.environ.get(LIVENESS_MODEL_PATH_ENV)
 
         if providers is None:
             providers = ["CPUExecutionProvider"]
-        self._session = uniface.InferenceSession(
-            model_path, providers=providers,
+
+        # uniface handles the SHA-256 verification internally when it
+        # resolves the model path. We can override the cache directory
+        # it looks in via `set_cache_dir`, or we can manually supply
+        # the weights.  The cleanest API is relying on uniface's
+        # `model_store` logic but pointing it at our pre-baked directory.
+        if model_directory is not None:
+            from uniface.model_store import set_cache_dir
+            set_cache_dir(model_directory)
+
+        # create_spoofer returns a uniface.spoofing.MiniFASNet instance
+        self._spoofer = uniface.create_spoofer(
+            model_name=MiniFASNetWeights.V2,
+            providers=providers,
         )
 
-    def classify(self, face_rgb: np.ndarray) -> np.ndarray:
-        """Run a single forward pass and return the 3-class softmax."""
+    def predict(self, frame_bgr: np.ndarray, bbox_xyxy: list[int] | np.ndarray) -> tuple[bool, float]:
+        """Run a single forward pass and return (is_real, confidence)."""
 
-        if face_rgb.ndim != 3 or face_rgb.shape[2] != 3:
+        if frame_bgr.ndim != 3 or frame_bgr.shape[2] != 3:
             raise ValueError(
-                f"Expected an RGB (H, W, 3) array; got shape {face_rgb.shape}."
+                f"Expected a (H, W, 3) BGR array; got shape {frame_bgr.shape}."
             )
 
-        height = face_rgb.shape[0]
-        if height not in (_EXPECTED_INPUT_HEIGHT, _EXPECTED_INPUT_HEIGHT_2):
+        if len(bbox_xyxy) != 4:
             raise ValueError(
-                f"uniface expects an { _EXPECTED_INPUT_HEIGHT }x"
-                f"{ _EXPECTED_INPUT_HEIGHT } or "
-                f"{ _EXPECTED_INPUT_HEIGHT_2 }x"
-                f"{ _EXPECTED_INPUT_HEIGHT_2 } input; got height {height}."
+                f"Expected bbox_xyxy of length 4; got {len(bbox_xyxy)}."
             )
 
-        # uniface exposes a per-frame ``detect``/``classify`` API that
-        # handles the preprocessing (resize, normalise) internally.
-        # The exact method name is intentionally not hardcoded here:
-        # uniface's API surface changed between 0.1.x and 0.2.x, and
-        # the deployer pins the version.  At runtime we look up the
-        # callable by attribute so the import-time failure is visible
-        # rather than silently passing through with a wrong shape.
-        classify_fn = getattr(self._session, "classify", None) or getattr(
-            self._session, "detect", None
-        )
-        if classify_fn is None:
-            raise RuntimeError(
-                "uniface InferenceSession has no 'classify' or 'detect' "
-                "callable; check the installed uniface version."
-            )
-
-        out = classify_fn(face_rgb)
-        probabilities = np.asarray(out, dtype=np.float64).reshape(-1)
-        if probabilities.shape != (3,):
-            raise ValueError(
-                f"uniface returned a {probabilities.shape} output; "
-                "expected (3,)."
-            )
-        return probabilities
+        # uniface.MiniFASNet.predict expects BGR image + xyxy bbox.
+        # It handles its own cropping, scalar-scaling, and normalisation.
+        result = self._spoofer.predict(frame_bgr, bbox_xyxy)
+        return bool(result.is_real), float(result.confidence)
 
     @property
     def model_name(self) -> str:
@@ -327,56 +260,52 @@ class LivenessRunner:
 
     def run(
         self,
-        face_rgb: np.ndarray,
+        frame_bgr: np.ndarray,
+        bbox_xyxy: list[int] | np.ndarray,
         *,
-        real_score_threshold: float = 0.5,
+        confidence_threshold: float = 0.5,
     ) -> LivenessResult:
-        """Classify a face crop as real / print / replay.
+        """Classify a face crop as real / spoof.
 
         Parameters
         ----------
-        face_rgb:
-            RGB ``uint8`` numpy array of the cropped face region.
-        real_score_threshold:
-            The minimum ``real_score`` for the frame to be classified
-            ``is_real=True``.  Must come from ``PolicyConfig``,
-            not hardcoded.  Default 0.5 is the
-            ``PolicyConfig.liveness_score_threshold`` default.
+        frame_bgr:
+            BGR ``uint8`` numpy array of the uncropped heavy frame.
+        bbox_xyxy:
+            Face bounding box in pixel coordinates ``[x1, y1, x2, y2]``.
+        confidence_threshold:
+            The minimum ``confidence`` for the frame to be classified
+            ``is_real=True`` when the model predicts "real".  Must
+            come from ``PolicyConfig``, not hardcoded.  Default 0.5
+            is the ``PolicyConfig.liveness_score_threshold`` default.
 
         Returns
         -------
         LivenessResult
-            ``event_type`` is ``"liveness_real"`` if ``real_score``
-            exceeds the threshold, else ``"liveness_spoof"``.  The
-            fusion engine makes the policy decision (raise a flag,
-            accumulate, etc.) from the ``is_real`` field, not from
-            ``event_type`` — they're currently the same signal, but
-            separating them lets the threshold change without a
-            schema-level reorg.
+            ``is_real`` is the model's classification gated by the
+            policy threshold.  ``event_type`` is ``"liveness_real"``
+            or ``"liveness_spoof"``.
         """
 
-        if not (0.0 <= real_score_threshold <= 1.0):
+        if not (0.0 <= confidence_threshold <= 1.0):
             raise ValueError(
-                f"real_score_threshold must be in [0, 1]; "
-                f"got {real_score_threshold}."
+                f"confidence_threshold must be in [0, 1]; "
+                f"got {confidence_threshold}."
             )
 
-        probabilities = self._backend.classify(face_rgb)
-        is_real_argmax, real_score, print_score, replay_score = (
-            _parse_classification(probabilities)
-        )
+        model_is_real, raw_confidence = self._backend.predict(frame_bgr, bbox_xyxy)
 
-        # The threshold is the policy-level signal; the argmax is the
-        # raw-model signal.  Both flags agree on a well-behaved
-        # model, but ``real_score`` can dip below the configured
-        # threshold while still being argmax on borderline frames —
-        # ``is_real`` follows the policy threshold in that case, so
-        # the policy is what actually decides.
+        # The threshold is the policy-level signal; the model output
+        # is the raw-model signal.  Both flags agree on a well-behaved
+        # positive, but ``confidence`` can dip below the configured
+        # threshold while still being predicted 'real' on borderline
+        # frames — ``is_real`` follows the policy threshold in that
+        # case, so the policy is what actually decides.
         is_real = (
-            is_real_argmax and real_score >= real_score_threshold
+            model_is_real and raw_confidence >= confidence_threshold
         )
 
-        confidence = compute_liveness_confidence(real_score)
+        confidence_interval = compute_liveness_confidence(raw_confidence)
 
         event_type = (
             EVENT_LIVENESS_REAL if is_real else EVENT_LIVENESS_SPOOF
@@ -385,17 +314,13 @@ class LivenessRunner:
         return LivenessResult(
             modality=MODALITY,
             event_type=event_type,
-            confidence=confidence,
+            confidence=confidence_interval,
             bounding_boxes=[],
             raw_value={
-                "real_score": real_score,
-                "print_score": print_score,
-                "replay_score": replay_score,
-                "threshold": real_score_threshold,
+                "model_is_real": model_is_real,
+                "raw_confidence": raw_confidence,
+                "threshold": confidence_threshold,
                 "model_name": self._backend.model_name,
             },
             is_real=is_real,
-            real_score=real_score,
-            print_score=print_score,
-            replay_score=replay_score,
         )

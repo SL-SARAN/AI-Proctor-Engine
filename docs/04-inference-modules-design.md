@@ -28,13 +28,15 @@ backend raises `EnvironmentError` — same fail-closed contract as the
 other model bundles.
 
 **Contract:**
-- **Input:** the cropped face region from the same preprocessing
-  pipeline that feeds `IdentityMatchRunner` — no second detection
-  pass. RGB `uint8` numpy array of shape `(H, W, 3)`. The uniface
-  API accepts two crop sizes (`80x80` and `160x160`); the
-  preprocessing layer is responsible for emitting one of these.
-- **Output:** a 3-class softmax over `(real, print, replay)` plus a
-  binary `is_real` flag (`true` iff `real` is the argmax **and**
+- **Input:** the uncropped heavy frame (BGR `uint8` numpy array)
+  plus a pixel-space bounding box `[x1, y1, x2, y2]`. The `uniface`
+  API does its own margin scaling (2.7x) and resizing (80x80)
+  internally, taking the raw frame as input. Because the
+  identity-match module uses dlib (which detects faces internally
+  but does not emit bounding boxes), a separate face-detection pass
+  is required on the server side to feed this module.
+- **Output:** a 2-class softmax `(real, spoof)` plus a binary
+  `is_real` flag (`true` iff `real` is the argmax **and**
   `real_score >= PolicyConfig.liveness_score_threshold`).
 - **Confidence:** single-frame point estimate, `(score, score,
   score)` — the multi-frame confidence interval is built by the
@@ -44,11 +46,11 @@ other model bundles.
 
 **Scope, honestly framed.** Catches **print and screen-replay
 spoofing** specifically — not deepfakes, not 3D masks, not
-adversarial perturbations of a live face. The 3-class softmax is the
-underlying model's documented capability; claims about catching
-deepfakes or 3D masks would be overpromising what v1 verifies. If
-that threat surface needs to be covered, it's a v2 candidate
-requiring separate model evaluation and calibration, not a
+adversarial perturbations of a live face. The 2-class `real/fake`
+softmax is the underlying model's documented capability. Claims
+about catching deepfakes or 3D masks would be overpromising what v1
+verifies. If that threat surface needs to be covered, it's a v2
+candidate requiring separate model evaluation and calibration, not a
 configuration change on the v1 model.
 
 **Threshold:** `PolicyConfig.liveness_score_threshold` (default
@@ -74,14 +76,13 @@ heavy-frame interval.
 (~58 MB installed). The Dockerfile builder stage needs to install
 the model file at build time and point `LIVENESS_MODEL_PATH` at it.
 
-**Why server-side, not client-side:** the face crop is already on
-the server (the identity-match pipeline consumes it), so doing the
-inference there avoids a second JPEG upload just for liveness.
-Client-side inference was evaluated and rejected: it would either
-double the heavy-frame upload bandwidth or fork the face-detection
-pipeline into a server-side and a client-side variant. Server-side
-also keeps the model file out of the client bundle (the existing
-design priority, see turn N+9).
+**Why server-side, not client-side:** the heavy frame is already on
+the server (the identity-match pipeline consumes it). Client-side
+inference was evaluated and rejected: it would either double the
+heavy-frame upload bandwidth or fork the face-detection pipeline
+into a server-side and a client-side variant. Server-side also keeps
+the model file out of the client bundle (the existing design
+priority, see turn N+9).
 
 ---
 

@@ -289,8 +289,8 @@ class SessionAggregator:
         The liveness modality catches print and screen-replay spoofing
         specifically — not deepfakes or 3D masks (``docs/04-inference-modules-design.md``
         §7).  A failed check is one where ``is_real=False``: the
-        model's softmax assigned the highest probability to the
-        ``print`` or ``replay`` class rather than ``real``.
+        model returned ``is_real=False`` or its raw confidence was
+        below the policy threshold.
 
         Branches on ``PolicyConfig.liveness_check_action``:
 
@@ -321,9 +321,8 @@ class SessionAggregator:
                     confidence=result.confidence,
                     triggered_termination=True,
                     detail={
-                        "real_score": result.real_score,
-                        "print_score": result.print_score,
-                        "replay_score": result.replay_score,
+                        "model_is_real": result.is_real,
+                        "raw_confidence": result.confidence.score,
                         "threshold": self._policy.liveness_score_threshold,
                         "liveness_check_action": (
                             LivenessAction.CRITICAL_TERMINATE.value
@@ -341,9 +340,8 @@ class SessionAggregator:
             confidence=result.confidence,
             triggered_termination=False,
             detail={
-                "real_score": result.real_score,
-                "print_score": result.print_score,
-                "replay_score": result.replay_score,
+                "model_is_real": result.is_real,
+                "raw_confidence": result.confidence.score,
                 "threshold": self._policy.liveness_score_threshold,
                 "liveness_check_action": (
                     LivenessAction.MEDIUM_ACCUMULATE.value

@@ -1073,20 +1073,17 @@ class TestPackageExports:
 def _make_liveness_result(
     *,
     is_real: bool = False,
-    real_score: float = 0.2,
-    print_score: float = 0.7,
-    replay_score: float = 0.1,
+    confidence: float = 0.8,
 ) -> LivenessResult:
     return LivenessResult(
         modality="liveness",
         event_type="liveness_spoof" if not is_real else "liveness_real",
-        confidence=_CI,
+        confidence=ConfidenceInterval(
+            lower=confidence, score=confidence, upper=confidence
+        ),
         bounding_boxes=[],
         raw_value={},
         is_real=is_real,
-        real_score=real_score,
-        print_score=print_score,
-        replay_score=replay_score,
     )
 
 
@@ -1271,7 +1268,7 @@ class TestLivenessModality:
             )
         )
         decisions = agg.process_liveness(
-            _make_liveness_result(is_real=True, real_score=0.95),
+            _make_liveness_result(is_real=True, confidence=0.95),
             telemetry_event_id=uuid.uuid4(),
         )
         assert decisions == []
@@ -1286,10 +1283,7 @@ class TestLivenessModality:
             )
         )
         decisions = agg.process_liveness(
-            _make_liveness_result(
-                is_real=False, real_score=0.1, print_score=0.85,
-                replay_score=0.05,
-            ),
+            _make_liveness_result(is_real=False, confidence=0.85),
             telemetry_event_id=uuid.uuid4(),
         )
         assert len(decisions) == 1
@@ -1298,8 +1292,8 @@ class TestLivenessModality:
         assert d.severity == "critical"
         assert d.triggered_termination is True
         assert d.detail["liveness_check_action"] == "critical_terminate"
-        assert d.detail["real_score"] == 0.1
-        assert d.detail["print_score"] == 0.85
+        assert d.detail["model_is_real"] is False
+        assert d.detail["raw_confidence"] == 0.85
 
     def test_medium_accumulate_on_spoof(self) -> None:
         """``MEDIUM_ACCUMULATE``: spoof frame raises a MEDIUM flag
@@ -1370,17 +1364,14 @@ class TestLivenessModality:
                 liveness_check_action=LivenessAction.CRITICAL_TERMINATE,
             )
         )
-        # Borderline frame: high real_score but still marked spoof
+        # Borderline frame: high confidence but still marked spoof
         # by the runner.  Aggregator must treat it as spoof.
         decisions = agg.process_liveness(
             _make_liveness_result(
                 is_real=False,
-                real_score=0.49,  # below 0.5 threshold
-                print_score=0.51,
-                replay_score=0.0,
+                confidence=0.49,  # below 0.5 threshold
             ),
             telemetry_event_id=uuid.uuid4(),
         )
         assert len(decisions) == 1
         assert decisions[0].severity == "critical"
-        assert decisions[0].detail["real_score"] == 0.49

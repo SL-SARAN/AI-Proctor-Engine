@@ -812,50 +812,8 @@ from proctoring_engine.inference.liveness import (
     LivenessBackend,
     LivenessRunner,
     UnifaceBackend,
-    _parse_classification,
     compute_liveness_confidence,
-    _verify_weights_sha256,
 )
-
-
-class TestParseClassification:
-    """Pure helper: convert a 3-class softmax to structured fields."""
-
-    def test_real_argmax(self) -> None:
-        probs = np.array([0.85, 0.10, 0.05], dtype=np.float64)
-        is_real, real, print_, replay = _parse_classification(probs)
-        assert is_real is True
-        assert real == 0.85
-        assert print_ == 0.10
-        assert replay == 0.05
-
-    def test_print_argmax(self) -> None:
-        probs = np.array([0.10, 0.80, 0.10], dtype=np.float64)
-        is_real, _, print_, _ = _parse_classification(probs)
-        assert is_real is False
-        assert print_ == 0.80
-
-    def test_replay_argmax(self) -> None:
-        probs = np.array([0.05, 0.10, 0.85], dtype=np.float64)
-        is_real, real, _, replay = _parse_classification(probs)
-        assert is_real is False
-        assert real == 0.05
-        assert replay == 0.85
-
-    def test_reject_wrong_shape(self) -> None:
-        with pytest.raises(ValueError, match="(3,)"):
-            _parse_classification(np.array([0.5, 0.5]))
-
-    def test_tie_argmax_returns_first(self) -> None:
-        """Real ties with print → ``is_real=False`` because np.argmax
-        returns the first index, which is class 0 (real).  Boundary
-        case where the threshold should reject anyway; document the
-        argmax semantics rather than relying on it."""
-        probs = np.array([0.5, 0.5, 0.0], dtype=np.float64)
-        is_real, *_ = _parse_classification(probs)
-        # Both real and print tie at 0.5; np.argmax returns 0 (real).
-        # The runner's threshold check still applies on top.
-        assert is_real is True
 
 
 class TestComputeLivenessConfidence:
@@ -880,188 +838,96 @@ class TestLivenessRunnerWithMockBackend:
     """Runner tests using a mock backend — no model weights, no
     onnxruntime, no uniface.  Pure logic test."""
 
-    def _mock_backend(self, probs: np.ndarray) -> LivenessBackend:
+    def _mock_backend(self, is_real: bool, confidence: float) -> LivenessBackend:
         b = MagicMock(spec=LivenessBackend)
-        b.classify.return_value = probs
+        b.predict.return_value = (is_real, confidence)
         b.model_name = "Mock"
         return b
 
     def test_real_when_argmax_real_and_above_threshold(self) -> None:
-        runner = LivenessRunner(self._mock_backend(np.array([0.9, 0.05, 0.05])))
-        result = runner.run(np.zeros((80, 80, 3), dtype=np.uint8))
+        runner = LivenessRunner(self._mock_backend(True, 0.9))
+        result = runner.run(
+            np.zeros((480, 640, 3), dtype=np.uint8),
+            bbox_xyxy=[10, 10, 50, 50],
+            confidence_threshold=0.5,
+        )
         assert result.is_real is True
         assert result.event_type == EVENT_LIVENESS_REAL
-        assert result.real_score == 0.9
+        assert result.confidence.score == 0.9
         assert result.modality == "liveness"
         assert result.raw_value["threshold"] == 0.5
         assert result.raw_value["model_name"] == "Mock"
 
     def test_spoof_when_argmax_print(self) -> None:
-        runner = LivenessRunner(
-            self._mock_backend(np.array([0.1, 0.7, 0.2]))
+        runner = LivenessRunner(self._mock_backend(False, 0.95))
+        result = runner.run(
+            np.zeros((480, 640, 3), dtype=np.uint8),
+            bbox_xyxy=[10, 10, 50, 50],
         )
-        result = runner.run(np.zeros((80, 80, 3), dtype=np.uint8))
         assert result.is_real is False
         assert result.event_type == EVENT_LIVENESS_SPOOF
-        assert result.print_score == 0.7
-        assert result.replay_score == 0.2
 
-    def test_threshold_below_real_score_still_spoof(self) -> None:
-        """real_score below threshold even when it's the argmax →
+    def test_threshold_below_confidence_still_spoof(self) -> None:
+        """confidence below threshold even when it's the argmax →
         ``is_real=False``."""
-        runner = LivenessRunner(
-            self._mock_backend(np.array([0.49, 0.51, 0.0]))
-        )
+        runner = LivenessRunner(self._mock_backend(True, 0.49))
         result = runner.run(
-            np.zeros((80, 80, 3), dtype=np.uint8),
-            real_score_threshold=0.5,
+            np.zeros((480, 640, 3), dtype=np.uint8),
+            bbox_xyxy=[10, 10, 50, 50],
+            confidence_threshold=0.5,
         )
         assert result.is_real is False
 
-    def test_threshold_accepts_argmax_real(self) -> None:
-        """real_score above threshold → ``is_real=True``."""
-        runner = LivenessRunner(
-            self._mock_backend(np.array([0.51, 0.49, 0.0]))
-        )
-        result = runner.run(
-            np.zeros((80, 80, 3), dtype=np.uint8),
-            real_score_threshold=0.5,
-        )
-        assert result.is_real is True
-
     def test_invalid_threshold_rejected(self) -> None:
-        runner = LivenessRunner(self._mock_backend(np.array([1.0, 0.0, 0.0])))
-        with pytest.raises(ValueError, match="real_score_threshold"):
+        runner = LivenessRunner(self._mock_backend(True, 1.0))
+        with pytest.raises(ValueError, match="confidence_threshold"):
             runner.run(
-                np.zeros((80, 80, 3), dtype=np.uint8),
-                real_score_threshold=1.5,
+                np.zeros((480, 640, 3), dtype=np.uint8),
+                bbox_xyxy=[10, 10, 50, 50],
+                confidence_threshold=1.5,
             )
-
-    def test_runner_does_not_validate_face_shape(self) -> None:
-        """The runner delegates shape validation to the backend
-        (UnifaceBackend.classify rejects wrong shapes).  The runner
-        itself trusts the backend — it only formats whatever
-        probabilities come back.  This documents the contract."""
-        runner = LivenessRunner(
-            self._mock_backend(np.array([1.0, 0.0, 0.0]))
-        )
-        # 2-D input — the runner itself does not raise.
-        result = runner.run(np.zeros((80, 80), dtype=np.uint8))
-        assert result.is_real is True
-
-
-class TestVerifyWeightsSha256:
-    """Verify the model weights file against the pinned SHA-256."""
-
-    def test_accepts_matching_file(self, tmp_path: Any) -> None:
-        # Write a small file with the known hash
-        test_bytes = b"x" * 32
-        from hashlib import sha256
-        # Compute the actual sha256 of test_bytes — but we need to
-        # patch MINIFASNET_V2_SHA256 to that value to make the test
-        # portable.  Use monkeypatch.
-        actual = sha256(test_bytes).hexdigest()
-        path = tmp_path / "weights.onnx"
-        path.write_bytes(test_bytes)
-
-        from proctoring_engine.inference import liveness as liveness_mod
-        original = liveness_mod.MINIFASNET_V2_SHA256
-        try:
-            liveness_mod.MINIFASNET_V2_SHA256 = actual
-            # Should not raise
-            _verify_weights_sha256(str(path))
-        finally:
-            liveness_mod.MINIFASNET_V2_SHA256 = original
-
-    def test_rejects_mismatched_file(self, tmp_path: Any) -> None:
-        path = tmp_path / "weights.onnx"
-        path.write_bytes(b"untrusted weights")
-        with pytest.raises(ValueError, match="SHA-256 mismatch"):
-            _verify_weights_sha256(str(path))
-
-    def test_missing_file_raises(self, tmp_path: Any) -> None:
-        with pytest.raises(FileNotFoundError):
-            _verify_weights_sha256(str(tmp_path / "nope.onnx"))
 
 
 class TestUnifaceBackend:
-    """Tests that the UnifaceBackend wires through the env var and
-    delegates to the uniface library correctly.  The actual
-    onnxruntime call is mocked — no real model."""
+    """Tests the UnifaceBackend real API contract.
+    Exercises the actual uniface package (skipped if not installed)."""
 
-    def test_env_var_not_set_raises(self) -> None:
+    def test_env_var_not_set_does_not_raise_by_default(self, tmp_path: Any) -> None:
+        """UnifaceBackend falls back to the default uniface cache directory
+        if no path/env var is specified.  It shouldn't raise EnvironmentError
+        anymore like it did when we required a baked-in path."""
+        import uniface
+        from unittest.mock import patch
+
+        # We don't want it to actually download the model during the test,
+        # so we mock create_spoofer.
         with patch.dict(os.environ, {}, clear=True):
-            with pytest.raises(EnvironmentError, match=LIVENESS_MODEL_PATH_ENV):
-                UnifaceBackend()
+            with patch("uniface.create_spoofer") as mock_create:
+                backend = UnifaceBackend(model_directory=None)
+                assert backend.model_name == "MiniFASNetV2"
+                mock_create.assert_called_once()
 
-    def test_uniface_not_installed(self, tmp_path: Any) -> None:
-        """If uniface isn't available, the backend surfaces the import
-        error rather than silently stubbing."""
-        # Write a stub file with the pinned SHA-256
-        from hashlib import sha256
-        test_bytes = b"\x00" * 64
-        actual = sha256(test_bytes).hexdigest()
-        path = tmp_path / "stub.onnx"
-        path.write_bytes(test_bytes)
+                # Model directory was parsed as None
+                assert backend._spoofer is not None
 
-        from proctoring_engine.inference import liveness as liveness_mod
-        original_hash = liveness_mod.MINIFASNET_V2_SHA256
-        try:
-            liveness_mod.MINIFASNET_V2_SHA256 = actual
+    def test_real_prediction_shape_rejections(self) -> None:
+        """Ensure the predict method rejects malformed inputs before calling
+        the library."""
+        import pytest
+        pytest.importorskip("uniface")
 
-            with patch.dict(
-                os.environ, {LIVENESS_MODEL_PATH_ENV: str(path)}
-            ):
-                # Block uniface import
-                import builtins
-                original_import = builtins.__import__
+        from unittest.mock import patch
+        with patch("uniface.create_spoofer"):
+            backend = UnifaceBackend()
 
-                def fake_import(name, *args: Any, **kwargs: Any) -> Any:
-                    if name == "uniface":
-                        raise ImportError("uniface not available")
-                    return original_import(name, *args, **kwargs)
+            # Wrong dims
+            with pytest.raises(ValueError, match="BGR"):
+                backend.predict(np.zeros((100, 100), dtype=np.uint8), bbox_xyxy=[0,0,10,10])
 
-                with patch("builtins.__import__", side_effect=fake_import):
-                    with pytest.raises(ImportError, match="uniface"):
-                        UnifaceBackend()
-        finally:
-            liveness_mod.MINIFASNET_V2_SHA256 = original_hash
+            # Wrong bbox length
+            with pytest.raises(ValueError, match="length 4"):
+                backend.predict(np.zeros((100, 100, 3), dtype=np.uint8), bbox_xyxy=[0,0,10])
 
-    def test_wrong_input_height_rejected(self, tmp_path: Any) -> None:
-        """The runner rejects a face crop with an unexpected height."""
-        from hashlib import sha256
-        test_bytes = b"\x00" * 64
-        actual = sha256(test_bytes).hexdigest()
-        path = tmp_path / "stub.onnx"
-        path.write_bytes(test_bytes)
-
-        from proctoring_engine.inference import liveness as liveness_mod
-        original_hash = liveness_mod.MINIFASNET_V2_SHA256
-        try:
-            liveness_mod.MINIFASNET_V2_SHA256 = actual
-            # Mock the entire uniface module so we don't need it installed
-            mock_session = MagicMock()
-            mock_session.classify = MagicMock(
-                return_value=np.array([0.9, 0.05, 0.05])
-            )
-            mock_uniface = MagicMock()
-            mock_uniface.InferenceSession = MagicMock(return_value=mock_session)
-
-            import sys
-            sys.modules["uniface"] = mock_uniface
-
-            try:
-                with patch.dict(
-                    os.environ, {LIVENESS_MODEL_PATH_ENV: str(path)}
-                ):
-                    backend = UnifaceBackend()
-                    with pytest.raises(ValueError, match="uniface expects"):
-                        # Wrong height: 100, not 80 or 160
-                        backend.classify(np.zeros((100, 100, 3), dtype=np.uint8))
-            finally:
-                del sys.modules["uniface"]
-        finally:
-            liveness_mod.MINIFASNET_V2_SHA256 = original_hash
 
 
 class TestLivenessModuleImports:

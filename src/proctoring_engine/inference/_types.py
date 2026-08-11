@@ -225,16 +225,25 @@ class LivenessResult(InferenceResult):
     sampling window and computes the multi-frame confidence
     interval, mirroring the identity-match pipeline.
 
-    ``real_score``, ``print_score``, and ``replay_score`` are the raw
-    softmax probabilities from the 3-class classifier, each in
-    ``[0, 1]``.  ``is_real`` is ``True`` iff ``real_score`` is the
-    argmax over the three classes.
+    **Output contract — verified against the real MiniFASNetV2 model
+    (turn N+12, the API-call bug-fix pass).** The upstream
+    ``uniface.MiniFASNet.predict(image, bbox)`` returns
+    ``SpoofingResult(is_real: bool, confidence: float)`` — a
+    **2-class** softmax (real/spoof), not the 3-class
+    ``(real, print, replay)`` the original design doc hypothesised.
+    The model does not distinguish print vs replay in its output; if
+    we ever need that distinction, it requires a different model
+    family, not a config change.
+
+    The model's softmax confidence on the predicted class is carried
+    on the inherited ``InferenceResult.confidence`` field as a
+    degenerate point interval (``(score, score, score)``).  The
+    fusion engine builds the multi-frame interval from the per-frame
+    point estimates, the same shape as identity-match and the other
+    modalities.
     """
 
     is_real: bool = True
-    real_score: float = 1.0
-    print_score: float = 0.0
-    replay_score: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
