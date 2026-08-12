@@ -640,21 +640,23 @@ class TestModalitySchedulerDefaults:
         assert periods[InferenceModality.HEAD_POSE_GAZE] == 1
         assert periods[InferenceModality.OBJECT_DETECTION] == 1
         assert periods[InferenceModality.IDENTITY_MATCH] == 5
+        assert periods[InferenceModality.LIVENESS] == 5
 
     def test_frame_0_runs_all(self) -> None:
         """Frame 0 is a multiple of every period, so all modalities run."""
         sched = ModalityScheduler()
         decision = sched.decide_for_frame(0)
-        assert len(decision.modalities_to_run()) == 3
+        assert len(decision.modalities_to_run()) == 4
         assert len(decision.modalities_to_skip()) == 0
 
-    def test_frame_1_skips_identity(self) -> None:
+    def test_frame_1_skips_identity_and_liveness(self) -> None:
         sched = ModalityScheduler()
         decision = sched.decide_for_frame(1)
         to_run = decision.modalities_to_run()
         assert InferenceModality.HEAD_POSE_GAZE in to_run
         assert InferenceModality.OBJECT_DETECTION in to_run
         assert InferenceModality.IDENTITY_MATCH not in to_run
+        assert InferenceModality.LIVENESS not in to_run
 
     def test_frame_5_runs_all(self) -> None:
         sched = ModalityScheduler()
@@ -681,10 +683,11 @@ class TestModalitySchedulerCustom:
             head_pose_period=2,
             object_detection_period=3,
             identity_match_period=5,
+            liveness_period=5,
         )
         decision = sched.decide_for_frame(1)
         assert len(decision.modalities_to_run()) == 0
-        assert len(decision.modalities_to_skip()) == 3
+        assert len(decision.modalities_to_skip()) == 4
 
     def test_period_for(self) -> None:
         sched = ModalityScheduler(head_pose_period=4)
@@ -697,6 +700,10 @@ class TestModalitySchedulerValidation:
     def test_zero_head_pose_period(self) -> None:
         with pytest.raises(ValueError, match="head_pose_period"):
             ModalityScheduler(head_pose_period=0)
+
+    def test_zero_liveness_period(self) -> None:
+        with pytest.raises(ValueError, match="liveness_period"):
+            ModalityScheduler(liveness_period=0)
 
     def test_negative_object_detection_period(self) -> None:
         with pytest.raises(ValueError, match="object_detection_period"):
@@ -761,9 +768,10 @@ class TestInferenceModalityEnum:
         assert InferenceModality.HEAD_POSE_GAZE.value == "head_pose_gaze"
         assert InferenceModality.OBJECT_DETECTION.value == "object_detection"
         assert InferenceModality.IDENTITY_MATCH.value == "identity_match"
+        assert InferenceModality.LIVENESS.value == "liveness"
 
-    def test_all_three(self) -> None:
-        assert len(InferenceModality) == 3
+    def test_all_four(self) -> None:
+        assert len(InferenceModality) == 4
 
 
 # ======================================================================

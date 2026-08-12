@@ -51,6 +51,7 @@ class InferenceModality(str, enum.Enum):
     HEAD_POSE_GAZE = "head_pose_gaze"
     OBJECT_DETECTION = "object_detection"
     IDENTITY_MATCH = "identity_match"
+    LIVENESS = "liveness"
 
 
 class ScheduleDecision(str, enum.Enum):
@@ -112,12 +113,13 @@ class InferenceDecision:
 _DEFAULT_HEAD_POSE_PERIOD: Final[int] = 1        # Every heavy frame.
 _DEFAULT_OBJECT_DETECTION_PERIOD: Final[int] = 1  # Every heavy frame.
 _DEFAULT_IDENTITY_MATCH_PERIOD: Final[int] = 5    # Every 5th heavy frame.
+_DEFAULT_LIVENESS_PERIOD: Final[int] = 5          # Same as identity match.
 
 
 class ModalityScheduler:
     """Stateless per-session scheduler for heavy-frame inference ordering.
 
-    The scheduler wraps three independent "every Nth-frame" counters
+    The scheduler wraps independent "every Nth-frame" counters
     (one per modality).  It is constructed once per session with
     the desired N values, then used by calling
     :meth:`decide_for_frame` on each arriving heavy-frame sequence
@@ -136,6 +138,9 @@ class ModalityScheduler:
         Default 5 — five frames at the 2-3 s cadence is roughly 10-15 s
         between identity checks, which is plenty for detecting an
         identity swap.
+    liveness_period:
+        Run liveness anti-spoofing check.  Default matches identity check
+        since it uses the same face crop.
     """
 
     def __init__(
@@ -144,6 +149,7 @@ class ModalityScheduler:
         head_pose_period: int = _DEFAULT_HEAD_POSE_PERIOD,
         object_detection_period: int = _DEFAULT_OBJECT_DETECTION_PERIOD,
         identity_match_period: int = _DEFAULT_IDENTITY_MATCH_PERIOD,
+        liveness_period: int = _DEFAULT_LIVENESS_PERIOD,
     ) -> None:
         if head_pose_period <= 0:
             raise ValueError("head_pose_period must be a positive integer.")
@@ -151,11 +157,14 @@ class ModalityScheduler:
             raise ValueError("object_detection_period must be a positive integer.")
         if identity_match_period <= 0:
             raise ValueError("identity_match_period must be a positive integer.")
+        if liveness_period <= 0:
+            raise ValueError("liveness_period must be a positive integer.")
 
         self._periods = {
             InferenceModality.HEAD_POSE_GAZE: head_pose_period,
             InferenceModality.OBJECT_DETECTION: object_detection_period,
             InferenceModality.IDENTITY_MATCH: identity_match_period,
+            InferenceModality.LIVENESS: liveness_period,
         }
 
     @property
@@ -185,6 +194,7 @@ class ModalityScheduler:
             InferenceModality.HEAD_POSE_GAZE,
             InferenceModality.OBJECT_DETECTION,
             InferenceModality.IDENTITY_MATCH,
+            InferenceModality.LIVENESS,
         ):
             period = self._periods[modality]
             if frame_seq % period == 0:

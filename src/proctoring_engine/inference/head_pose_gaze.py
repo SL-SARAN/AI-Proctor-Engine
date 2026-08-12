@@ -442,6 +442,16 @@ class FaceLandmarkerRunner:
                 "yaw_threshold": self._yaw_threshold,
                 "iris_threshold": self._iris_threshold,
                 "ear_threshold": self._ear_threshold,
+                # Landmarks as a list of (x, y, z) tuples in [0,1]
+                # normalised image coordinates.  Required by the
+                # identity-match dispatcher (it needs the bbox to
+                # crop the face before passing it to the dlib
+                # embedder); included for all frames so the
+                # dispatcher's cropping logic is uniform.
+                "landmarks": [
+                    (float(lm[0]), float(lm[1]), float(lm[2]))
+                    for lm in landmarks
+                ],
             },
             off_screen=off_screen,
             yaw=yaw,
