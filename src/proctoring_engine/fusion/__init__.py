@@ -38,8 +38,10 @@ from proctoring_engine.fusion._types import (
 # --- Aggregator ---
 from proctoring_engine.fusion.aggregator import (
     RULE_ACCUMULATED_SCORE,
+    RULE_AUDIO_ANOMALY,
     RULE_BROWSER_EVENT,
     RULE_GAZE_AWAY_FREQUENCY,
+    RULE_IDENTITY_MISMATCH,
     RULE_LIVENESS_CHECK_FAILED,
     RULE_OBJECT_DETECTED,
     RULE_SECOND_PERSON,
@@ -68,8 +70,10 @@ __all__ = [
     "GazeAwayEvent",
     # Aggregator
     "RULE_ACCUMULATED_SCORE",
+    "RULE_AUDIO_ANOMALY",
     "RULE_BROWSER_EVENT",
     "RULE_GAZE_AWAY_FREQUENCY",
+    "RULE_IDENTITY_MISMATCH",
     "RULE_LIVENESS_CHECK_FAILED",
     "RULE_OBJECT_DETECTED",
     "RULE_SECOND_PERSON",

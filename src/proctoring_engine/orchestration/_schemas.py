@@ -164,6 +164,10 @@ class CreatePolicyConfigRequest(BaseModel):
     liveness_check_action: LivenessAction | None = None
     liveness_score_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     liveness_confirmation_frames: int = Field(default=3, ge=1, le=100)
+    identity_similarity_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    identity_confirmation_frames: int = Field(default=3, ge=1, le=100)
+    audio_noise_floor_dbfs: float = Field(default=-30.0)
+    audio_speech_ratio_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
     extra_rules: dict[str, Any] = Field(default_factory=dict)
     is_active: bool = True
     retire_previous: bool = False
@@ -192,6 +196,10 @@ class PolicyConfigResponse(BaseModel):
     liveness_check_action: LivenessAction | None
     liveness_score_threshold: float
     liveness_confirmation_frames: int
+    identity_similarity_threshold: float
+    identity_confirmation_frames: int
+    audio_noise_floor_dbfs: float
+    audio_speech_ratio_threshold: float
     created_by_id: uuid.UUID | None
     created_at: datetime
 
@@ -220,6 +228,10 @@ class PolicyConfigResponse(BaseModel):
             liveness_check_action=orm.liveness_check_action,
             liveness_score_threshold=float(orm.liveness_score_threshold),
             liveness_confirmation_frames=orm.liveness_confirmation_frames,
+            identity_similarity_threshold=float(orm.identity_similarity_threshold),
+            identity_confirmation_frames=orm.identity_confirmation_frames,
+            audio_noise_floor_dbfs=float(orm.audio_noise_floor_dbfs),
+            audio_speech_ratio_threshold=float(orm.audio_speech_ratio_threshold),
             created_by_id=orm.created_by_id,
             created_at=orm.created_at,
         )

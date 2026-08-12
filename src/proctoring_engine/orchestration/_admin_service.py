@@ -141,6 +141,18 @@ def _validate_policy_request(request: CreatePolicyConfigRequest) -> None:
         raise PolicyVersioningError(
             "liveness_score_threshold must be in [0, 1]"
         )
+    if not (
+        0.0 <= request.identity_similarity_threshold <= 1.0
+    ):
+        raise PolicyVersioningError(
+            "identity_similarity_threshold must be in [0, 1]"
+        )
+    if not (
+        0.0 <= request.audio_speech_ratio_threshold <= 1.0
+    ):
+        raise PolicyVersioningError(
+            "audio_speech_ratio_threshold must be in [0, 1]"
+        )
 
 
 def _validate_exemption_request(
@@ -272,6 +284,10 @@ def create_policy_version(
         liveness_check_action=request.liveness_check_action,
         liveness_score_threshold=request.liveness_score_threshold,
         liveness_confirmation_frames=request.liveness_confirmation_frames,
+        identity_similarity_threshold=request.identity_similarity_threshold,
+        identity_confirmation_frames=request.identity_confirmation_frames,
+        audio_noise_floor_dbfs=request.audio_noise_floor_dbfs,
+        audio_speech_ratio_threshold=request.audio_speech_ratio_threshold,
         extra_rules=dict(request.extra_rules),
         created_by_id=created_by.id,
     )

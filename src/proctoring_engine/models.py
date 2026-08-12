@@ -395,6 +395,18 @@ class PolicyConfig(Base):
             name="ck_policy_liveness_frames_positive",
         ),
         CheckConstraint(
+            "identity_similarity_threshold >= 0 AND identity_similarity_threshold <= 1",
+            name="ck_policy_identity_threshold_in_unit_interval",
+        ),
+        CheckConstraint(
+            "identity_confirmation_frames > 0",
+            name="ck_policy_identity_frames_positive",
+        ),
+        CheckConstraint(
+            "audio_speech_ratio_threshold >= 0 AND audio_speech_ratio_threshold <= 1",
+            name="ck_policy_audio_ratio_in_unit_interval",
+        ),
+        CheckConstraint(
             "medium_score_termination_threshold >= 0",
             name="ck_policy_medium_score_threshold_nonnegative",
         ),
@@ -477,6 +489,18 @@ class PolicyConfig(Base):
     )
     liveness_confirmation_frames: Mapped[int] = mapped_column(
         Integer, nullable=False, default=3
+    )
+    identity_similarity_threshold: Mapped[float] = mapped_column(
+        Numeric(5, 4), nullable=False, default=0.6
+    )
+    identity_confirmation_frames: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=3
+    )
+    audio_noise_floor_dbfs: Mapped[float] = mapped_column(
+        Float, nullable=False, default=-30.0
+    )
+    audio_speech_ratio_threshold: Mapped[float] = mapped_column(
+        Numeric(5, 4), nullable=False, default=0.3
     )
     extra_rules: Mapped[dict[str, Any]] = mapped_column(
         JsonPayload, nullable=False, default=dict

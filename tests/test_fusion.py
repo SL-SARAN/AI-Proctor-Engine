@@ -23,19 +23,23 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from proctoring_engine.inference._types import (
+    AudioVadResult,
     BoundingBox,
     BrowserEventResult,
     ConfidenceInterval,
     FacePresenceResult,
     HeadPoseGazeResult,
+    IdentityMatchResult,
     LivenessResult,
     ObjectDetectionResult,
 )
 from proctoring_engine.fusion._types import FlagDecision, GazeAwayEvent
 from proctoring_engine.fusion.aggregator import (
     RULE_ACCUMULATED_SCORE,
+    RULE_AUDIO_ANOMALY,
     RULE_BROWSER_EVENT,
     RULE_GAZE_AWAY_FREQUENCY,
+    RULE_IDENTITY_MISMATCH,
     RULE_LIVENESS_CHECK_FAILED,
     RULE_OBJECT_DETECTED,
     RULE_SECOND_PERSON,
@@ -131,6 +135,25 @@ def _make_object_result(detected_class: str = "cell phone") -> ObjectDetectionRe
         confidence=_CI,
         bounding_boxes=[BoundingBox(x=0.1, y=0.2, w=0.3, h=0.4)],
         detected_class=detected_class,
+    )
+
+
+def _make_identity_result(similarity: float = 0.5) -> IdentityMatchResult:
+    return IdentityMatchResult(
+        modality="identity",
+        event_type="identity_mismatch" if similarity < 0.6 else "identity_match",
+        confidence=ConfidenceInterval(lower=similarity, score=similarity, upper=similarity),
+        similarity=similarity,
+    )
+
+
+def _make_audio_result(event_type: str = "speech_detected") -> AudioVadResult:
+    return AudioVadResult(
+        modality="audio",
+        event_type=event_type,
+        confidence=_CI,
+        speech_ratio=0.8 if event_type == "speech_detected" else 0.0,
+        rms_db=-10.0,
     )
 
 
@@ -1042,7 +1065,159 @@ class TestExemptionSuppression:
 class TestPackageExports:
     """Verify the fusion package re-exports the expected symbols."""
 
-    def test_types_importable(self) -> None:
+# ===========================================================================
+# Turn 8: Identity Match
+# ===========================================================================
+
+
+class TestIdentityMatchPath:
+    """Test the identity-mismatch path (zero-tolerance, like second-person)."""
+
+    def test_match_breaks_streak(self) -> None:
+        agg = _make_aggregator(
+            policy=_default_policy(identity_confirmation_frames=3)
+        )
+        # 2 mismatch frames
+        for _ in range(2):
+            agg.process_identity_match(
+                _make_identity_result(similarity=0.4),
+                telemetry_event_id=uuid.uuid4(),
+            )
+        # 1 match frame
+        agg.process_identity_match(
+            _make_identity_result(similarity=0.9),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        # 1 more mismatch frame (streak broken, no fire)
+        decisions = agg.process_identity_match(
+            _make_identity_result(similarity=0.4),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert decisions == []
+
+    def test_consecutive_mismatches_fire_critical(self) -> None:
+        agg = _make_aggregator(
+            policy=_default_policy(
+                identity_confirmation_frames=3,
+                identity_similarity_threshold=0.6,
+            )
+        )
+        decisions: list[FlagDecision] = []
+        for _ in range(3):
+            decisions = agg.process_identity_match(
+                _make_identity_result(similarity=0.4),
+                telemetry_event_id=uuid.uuid4(),
+            )
+        assert len(decisions) == 1
+        d = decisions[0]
+        assert d.rule_code == RULE_IDENTITY_MISMATCH
+        assert d.severity == "critical"
+        assert d.triggered_termination is True
+        assert len(d.contributing_event_ids) == 3
+
+    def test_fires_only_once(self) -> None:
+        agg = _make_aggregator(
+            policy=_default_policy(identity_confirmation_frames=2)
+        )
+        for _ in range(2):
+            agg.process_identity_match(
+                _make_identity_result(similarity=0.2),
+                telemetry_event_id=uuid.uuid4(),
+            )
+        # Next frame is also a mismatch, but we already fired
+        decisions = agg.process_identity_match(
+            _make_identity_result(similarity=0.2),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert decisions == []
+
+    def test_interval_computation(self) -> None:
+        agg = _make_aggregator(
+            policy=_default_policy(identity_confirmation_frames=3)
+        )
+        # Scores: 0.3, 0.5, 0.4 (mean 0.4)
+        scores = [0.3, 0.5, 0.4]
+        decisions: list[FlagDecision] = []
+        for s in scores:
+            decisions = agg.process_identity_match(
+                _make_identity_result(similarity=s),
+                telemetry_event_id=uuid.uuid4(),
+            )
+        assert len(decisions) == 1
+        interval = decisions[0].confidence
+        assert interval.lower == 0.3
+        assert interval.upper == 0.5
+        assert interval.score == pytest.approx(0.4)
+
+
+# ===========================================================================
+# Turn 8: Audio VAD
+# ===========================================================================
+
+
+class TestAudioVadPath:
+    """Test the audio anomaly path."""
+
+    def test_silence_no_flag(self) -> None:
+        agg = _make_aggregator(policy=_default_policy())
+        decisions = agg.process_audio_vad(
+            _make_audio_result(event_type="silence"),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert decisions == []
+        assert agg.accumulated_score == 0.0
+
+    def test_speech_detected_accumulates(self) -> None:
+        agg = _make_aggregator(
+            policy=_default_policy(medium_score_termination_threshold=10.0)
+        )
+        decisions = agg.process_audio_vad(
+            _make_audio_result(event_type="speech_detected"),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert len(decisions) == 1
+        d = decisions[0]
+        assert d.rule_code == RULE_AUDIO_ANOMALY
+        assert d.severity == "medium"
+        assert d.triggered_termination is False
+        assert d.score_delta == 1.0
+        assert agg.accumulated_score == 1.0
+
+    def test_elevated_rms_accumulates(self) -> None:
+        agg = _make_aggregator(
+            policy=_default_policy(
+                medium_score_termination_threshold=10.0,
+                score_weights={"audio_anomaly": 2.5},
+            )
+        )
+        decisions = agg.process_audio_vad(
+            _make_audio_result(event_type="elevated_rms"),
+            telemetry_event_id=uuid.uuid4(),
+        )
+        assert len(decisions) == 1
+        assert decisions[0].severity == "medium"
+        assert decisions[0].score_delta == 2.5
+        assert agg.accumulated_score == 2.5
+
+    def test_audio_trips_threshold(self) -> None:
+        agg = _make_aggregator(
+            policy=_default_policy(
+                medium_score_termination_threshold=1.5,
+                medium_score_action=MediumScoreAction.AUTO_TERMINATE,
+            )
+        )
+        decisions: list[FlagDecision] = []
+        for _ in range(2):
+            decisions = agg.process_audio_vad(
+                _make_audio_result(event_type="speech_detected"),
+                telemetry_event_id=uuid.uuid4(),
+            )
+        # The second call emits the medium flag AND the accumulated-score flag
+        assert len(decisions) == 2
+        assert decisions[0].severity == "medium"
+        assert decisions[1].rule_code == RULE_ACCUMULATED_SCORE
+        assert decisions[1].severity == "critical"
+        assert decisions[1].triggered_termination is True
         from proctoring_engine.fusion import FlagDecision, GazeAwayEvent
         assert FlagDecision is not None
         assert GazeAwayEvent is not None
@@ -1078,8 +1253,10 @@ class TestPackageExports:
     def test_rule_constants_importable(self) -> None:
         from proctoring_engine.fusion import (
             RULE_ACCUMULATED_SCORE,
+            RULE_AUDIO_ANOMALY,
             RULE_BROWSER_EVENT,
             RULE_GAZE_AWAY_FREQUENCY,
+            RULE_IDENTITY_MISMATCH,
             RULE_LIVENESS_CHECK_FAILED,
             RULE_OBJECT_DETECTED,
             RULE_SECOND_PERSON,
@@ -1090,7 +1267,8 @@ class TestPackageExports:
         assert RULE_OBJECT_DETECTED == "object_detected"
         assert RULE_BROWSER_EVENT == "browser_event"
         assert RULE_LIVENESS_CHECK_FAILED == "liveness_check_failed"
-
+        assert RULE_IDENTITY_MISMATCH == "identity_mismatch"
+        assert RULE_AUDIO_ANOMALY == "audio_anomaly"
 
 # ===========================================================================
 # Item 4: medium_score_action branching (auto_terminate vs flag_for_review)

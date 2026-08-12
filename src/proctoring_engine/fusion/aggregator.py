@@ -35,10 +35,12 @@ from dataclasses import dataclass, field
 from typing import Any, Final
 
 from proctoring_engine.inference._types import (
+    AudioVadResult,
     BrowserEventResult,
     ConfidenceInterval,
     FacePresenceResult,
     HeadPoseGazeResult,
+    IdentityMatchResult,
     LivenessResult,
     ObjectDetectionResult,
 )
@@ -68,6 +70,8 @@ RULE_ACCUMULATED_SCORE: Final[str] = "accumulated_score"
 RULE_OBJECT_DETECTED: Final[str] = "object_detected"
 RULE_BROWSER_EVENT: Final[str] = "browser_event"
 RULE_LIVENESS_CHECK_FAILED: Final[str] = "liveness_check_failed"
+RULE_IDENTITY_MISMATCH: Final[str] = "identity_mismatch"
+RULE_AUDIO_ANOMALY: Final[str] = "audio_anomaly"
 
 # Severity constants (match FlagSeverity enum values)
 _CRITICAL: Final[str] = "critical"
@@ -109,6 +113,12 @@ class PolicySnapshot:
     liveness_check_action: LivenessAction | None = None
     liveness_score_threshold: float = 0.5
     liveness_confirmation_frames: int = 3
+
+    identity_similarity_threshold: float = 0.6
+    identity_confirmation_frames: int = 3
+
+    audio_noise_floor_dbfs: float = -30.0
+    audio_speech_ratio_threshold: float = 0.3
 
     # Per-rule-code weight for the accumulated-score path.
     # Keys are ``Flag.rule_code`` values; values are the weight
@@ -207,6 +217,16 @@ class SessionAggregator:
         # ``liveness_confirmation_frames`` and the window is full of
         # spoof frames. A real frame resets this to 0.
         self._liveness_spoof_run_length: int = 0
+
+        # --- Path 5: identity match ---
+        self._identity_window: collections.deque[IdentityMatchResult] = collections.deque()
+        self._identity_event_ids_window: collections.deque[uuid.UUID] = collections.deque()
+        self._identity_mismatch_fired: bool = False
+
+        # --- Path 6: audio ---
+        # Audio anomalies just accumulate score, they don't have a multi-frame
+        # window here (the audio chunk itself is already a window).
+        pass
 
     # -- Accessors for testing / observability --
 
@@ -555,8 +575,84 @@ class SessionAggregator:
         return decisions
 
     # -----------------------------------------------------------------
-    # Object detection
+    # Path 5: identity match
     # -----------------------------------------------------------------
+
+    def process_identity_match(
+        self,
+        result: IdentityMatchResult,
+        *,
+        telemetry_event_id: uuid.UUID,
+    ) -> list[FlagDecision]:
+        """Process an identity-match inference result.
+
+        Aggregates frames into a rolling window of length
+        ``PolicyConfig.identity_confirmation_frames``. If **all** frames
+        in the window fail the similarity threshold
+        (``similarity < PolicyConfig.identity_similarity_threshold``),
+        a flag is raised.  The confidence interval is computed across
+        the window (mean, min, max of the raw similarity scores).
+
+        A failed check always results in a ``CRITICAL`` flag with
+        ``triggered_termination=True`` (zero-tolerance rule, similar
+        to second_person detection).
+
+        Returns ``[]`` if the window is not yet full of mismatch
+        frames, or if the flag has already fired for this session.
+        """
+
+        if self._identity_mismatch_fired:
+            return []
+
+        window_size = self._policy.identity_confirmation_frames
+        threshold = self._policy.identity_similarity_threshold
+
+        # Maintain the rolling window. A matching frame breaks the
+        # mismatch streak; we don't clear the window, but the all-fail
+        # condition below will catch it.
+        self._identity_window.append(result)
+        self._identity_event_ids_window.append(telemetry_event_id)
+        if len(self._identity_window) > window_size:
+            self._identity_window.popleft()
+            self._identity_event_ids_window.popleft()
+
+        if len(self._identity_window) < window_size:
+            return []
+
+        # The flag condition: every frame in the window must be a mismatch
+        if any(r.similarity >= threshold for r in self._identity_window):
+            return []
+
+        # We have a confirmed mismatch window. Compute the interval.
+        scores = [r.similarity for r in self._identity_window]
+        mean_score = sum(scores) / len(scores)
+        min_score = min(scores)
+        max_score = max(scores)
+
+        clamped_mean = max(min_score, min(max_score, mean_score))
+
+        interval = ConfidenceInterval(
+            lower=min_score, score=clamped_mean, upper=max_score
+        )
+
+        self._identity_mismatch_fired = True
+
+        return [
+            FlagDecision(
+                rule_code=RULE_IDENTITY_MISMATCH,
+                severity=_CRITICAL,
+                confidence=interval,
+                triggered_termination=True,
+                detail={
+                    "window_size": window_size,
+                    "mean_similarity": clamped_mean,
+                    "min_similarity": min_score,
+                    "max_similarity": max_score,
+                    "threshold": threshold,
+                },
+                contributing_event_ids=tuple(self._identity_event_ids_window),
+            )
+        ]
 
     def process_object_detection(
         self,
@@ -713,7 +809,62 @@ class SessionAggregator:
         return decisions
 
     # -----------------------------------------------------------------
-    # Path 3: accumulated-score threshold check
+    # Path 6: Audio VAD
+    # -----------------------------------------------------------------
+
+    def process_audio_vad(
+        self,
+        result: AudioVadResult,
+        *,
+        telemetry_event_id: uuid.UUID,
+    ) -> list[FlagDecision]:
+        """Process an audio-vad inference result.
+
+        Audio anomalies (``speech_detected`` or ``elevated_rms``)
+        contribute to the accumulated-score path as ``MEDIUM`` flags.
+        The inference runner has already performed the aggregation within
+        the chunk (computing speech_ratio across frames, checking against
+        ``PolicyConfig.audio_speech_ratio_threshold``, dropping
+        intermittent frames).  This aggregator method evaluates the chunk
+        level result.
+
+        Returns ``[]`` if the chunk is silence.
+        """
+
+        # Using result.event_type == "silence" per AudioVadRunner.run.
+        if result.event_type == "silence":
+            return []
+
+        weight = self._policy.weight_for(RULE_AUDIO_ANOMALY)
+
+        decision = FlagDecision(
+            rule_code=RULE_AUDIO_ANOMALY,
+            severity=_MEDIUM,
+            confidence=result.confidence,
+            triggered_termination=False,
+            detail={
+                "audio_event_type": result.event_type,
+                "speech_ratio": result.speech_ratio,
+                "rms_db": result.rms_db,
+                "speech_ratio_threshold": self._policy.audio_speech_ratio_threshold,
+                "noise_floor_dbfs": self._policy.audio_noise_floor_dbfs,
+            },
+            contributing_event_ids=(telemetry_event_id,),
+            score_delta=weight,
+        )
+
+        self._accumulated_score += weight
+
+        decisions: list[FlagDecision] = [decision]
+        acc_decision = self._check_accumulated_threshold(
+            contributing_event_ids=(telemetry_event_id,),
+        )
+        if acc_decision is not None:
+            decisions.append(acc_decision)
+        return decisions
+
+    # -----------------------------------------------------------------
+    # Path 7: accumulated-score threshold check
     # -----------------------------------------------------------------
 
     def _check_accumulated_threshold(
