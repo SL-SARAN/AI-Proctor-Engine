@@ -83,6 +83,7 @@ class SealEvidenceResult:
     capture_started_at: datetime
     capture_ended_at: datetime | None
     retention_expires_at: datetime
+    artifact_type: str
 
     def to_orm_kwargs(self, flag_id: uuid.UUID) -> dict[str, Any]:
         """Convert to kwargs suitable for ``EvidenceArtifact(**kwargs)``.
@@ -113,8 +114,6 @@ class SealEvidenceResult:
             "event_export": "event_export",
         }
         return type_to_kind.get(self.artifact_type, self.artifact_type)
-
-    artifact_type: str
 
 
 class EvidenceSealError(Exception):

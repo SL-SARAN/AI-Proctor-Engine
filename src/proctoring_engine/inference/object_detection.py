@@ -111,14 +111,20 @@ def filter_denylist_detections(
 
         conf = float(boxes.conf[i].item())
 
-        # xyxyn is normalised [x1, y1, x2, y2].
+        # xyxyn is normalised [x1, y1, x2, y2]. Let it safely clamp
+        # to [0, 1] before computing width/height so x + w never
+        # exceeds 1.0 even on edge-case predictions that spill
+        # out of frame.
         xyxyn = boxes.xyxyn[i].tolist()
-        x1, y1, x2, y2 = xyxyn[0], xyxyn[1], xyxyn[2], xyxyn[3]
+        x1 = max(0.0, min(1.0, float(xyxyn[0])))
+        y1 = max(0.0, min(1.0, float(xyxyn[1])))
+        x2 = max(0.0, min(1.0, float(xyxyn[2])))
+        y2 = max(0.0, min(1.0, float(xyxyn[3])))
         bbox = {
-            "x": max(0.0, min(1.0, x1)),
-            "y": max(0.0, min(1.0, y1)),
-            "w": max(0.0, min(1.0, x2 - x1)),
-            "h": max(0.0, min(1.0, y2 - y1)),
+            "x": x1,
+            "y": y1,
+            "w": x2 - x1,
+            "h": y2 - y1,
         }
         results.append({
             "class_name": cls_name,
