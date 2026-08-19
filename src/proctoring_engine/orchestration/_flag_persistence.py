@@ -172,7 +172,7 @@ def persist_flag_decision(
     try:
         db.flush()  # populate flag.id before the FlagTelemetryEvent links
     except IntegrityError as exc:
-        db.rollback()
+        print("ORIG:", exc.orig); db.rollback()
         raise FlagPersistenceError(
             "Flag insert violated an integrity constraint", original=exc
         ) from exc

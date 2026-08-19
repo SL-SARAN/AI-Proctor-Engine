@@ -37,6 +37,8 @@ session ends.
         (now exposed in ``raw_value["landmarks"]`` as of Turn 9a)
         to crop a face → ``IdentityMatchRunner.run(...)`` →
         ``aggregator.process_identity_match``.
+      - ``LIVENESS`` → ``LivenessRunner.run(frame, bbox, threshold)`` →
+        ``aggregator.process_liveness``.
 3. For each ``TelemetryAudioChunk`` event:
    a. Decode the base64 PCM → ``np.ndarray`` of int16 samples + ``rms_db``.
    b. Split into ``AudioFrame`` list.
@@ -47,10 +49,15 @@ session ends.
 5. For each ``TelemetryBrowserEvent``: build a ``BrowserEventResult``
    directly → ``aggregator.process_browser_event``.
 
-**Flag persistence:** *not* wired in this turn.  The dispatcher
-collects ``FlagDecision`` objects from the aggregator and pushes them
-onto ``self.flag_decisions`` (a thread-safe ``queue.Queue``).  Turn 9b
-will drain that queue and write ``Flag`` rows to the database.
+**Flag persistence (turn 9b):** the dispatcher tracks each
+``BufferedEvent`` alongside the synthetic UUID it minted for the
+``telemetry_event_id``.  When the aggregator emits a ``FlagDecision``,
+the dispatcher wraps it in a ``PersistedFlag`` that carries the
+underlying events.  The ``flag_decisions`` queue holds
+``PersistedFlag`` objects.  The ``FlagPersistenceWorker`` (separate
+class) drains this queue, inserts the missing ``TelemetryEvent``
+rows, and calls ``_flag_persistence.persist_flag_decision`` to
+write the immutable ``Flag`` row.
 """
 
 from __future__ import annotations
@@ -120,6 +127,28 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# PersistedFlag — queue item linking decision to source events
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedFlag:
+    """A ``FlagDecision`` paired with the source ``BufferedEvent``s
+    the aggregator consumed to produce it.
+
+    The ``contributing_events`` tuple is the full set of
+    ``BufferedEvent``s whose synthetic UUIDs appear in
+    ``decision.contributing_event_ids``.  The persistence layer
+    (turn 9b) uses these to insert the corresponding
+    ``TelemetryEvent`` rows (with the same IDs) before persisting
+    the ``Flag`` row itself.
+    """
+
+    decision: FlagDecision
+    contributing_events: tuple[BufferedEvent, ...]
+
+
+# ---------------------------------------------------------------------------
 # FrameDispatcherConfig — constructor arguments
 # ---------------------------------------------------------------------------
 
@@ -140,6 +169,7 @@ class FrameDispatcherConfig:
     head_pose_period: int = 1
     object_detection_period: int = 1
     identity_match_period: int = 5
+    liveness_period: int = 5
 
     # The enrollment embedding for identity match.  None disables
     # identity-match (the dispatcher still wires the aggregator
@@ -164,15 +194,16 @@ class FrameDispatcher:
       first use (heavy model load) and disposed via ``close()`` when
       the session ends.
     - A ``TelemetryEventBuffer`` reference (per-session).
-    - A ``queue.Queue`` of emitted ``FlagDecision``s — the persistence
-      layer (Turn 9b) will drain this.
+    - A ``queue.Queue`` of emitted ``PersistedFlag`` — the persistence
+      worker (turn 9b) drains this and writes the corresponding
+      ``TelemetryEvent`` + ``Flag`` rows to the database.
 
-    **Thread model.** The dispatcher runs in a background thread that
-    drains the WebSocket handler's ``TelemetryEventBuffer``.  The WS
-    handler pushes events into the buffer (which is thread-safe); the
-    dispatcher's background thread calls ``drain()`` and processes the
-    returned batch.  ``FlagDecision`` outputs are pushed onto a
-    thread-safe queue.
+    **Thread model.** The dispatcher runs in a background thread
+    that drains the WebSocket handler's ``TelemetryEventBuffer``.
+    The WS handler pushes events into the buffer (which is
+    thread-safe); the dispatcher's background thread calls
+    ``drain()`` and processes the returned batch.  ``PersistedFlag``
+    outputs are pushed onto a thread-safe queue.
 
     **Termination.** ``stop()`` flips a flag the background loop
     checks at the top of each iteration, then joins the thread.
@@ -196,6 +227,7 @@ class FrameDispatcher:
             head_pose_period=config.head_pose_period,
             object_detection_period=config.object_detection_period,
             identity_match_period=config.identity_match_period,
+            liveness_period=config.liveness_period,
         )
 
         # Heavy-frame sequence counter (incremented on each heavy
@@ -247,22 +279,36 @@ class FrameDispatcher:
         else:
             self._liveness_runner = None
 
+        # Map: synthetic telemetry_event_id (UUID) → BufferedEvent.
+        # Filled in by _dispatch_event; consumed by the persistence
+        # layer via the ``PersistedFlag`` queue item.  The map is
+        # bounded by the session's lifetime (a few KB per frame
+        # entry); for very long sessions, pruning on a "decisions
+        # drained" callback would be a follow-up improvement.
+        self._event_id_to_buffered: dict[uuid.UUID, BufferedEvent] = {}
+
         # Flag decision queue (drained by the persistence layer in
         # turn 9b — this turn only emits to it).
-        self.flag_decisions: queue.Queue[FlagDecision] = queue.Queue()
-
-        # Mapping from per-event synthetic UUID to the original
-        # BufferedEvent.seq — kept so persistence can correlate
-        # TelemetryEvent rows back to the WS-layer arrival order
-        # in turn 9b.  Not currently consumed; provided for future
-        # use.
-        self._event_id_for_seq: dict[int, uuid.UUID] = {}
+        self.flag_decisions: queue.Queue[PersistedFlag] = queue.Queue()
 
         # Lifecycle
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._processed_count = 0
         self._error_count = 0
+
+    def _take_buffered_for_ids(
+        self,
+        event_ids: tuple[uuid.UUID, ...],
+    ) -> tuple[BufferedEvent, ...]:
+        """Look up the BufferedEvent for each event_id and remove
+        from the internal map."""
+        out = []
+        for eid in event_ids:
+            ev = self._event_id_to_buffered.pop(eid, None)
+            if ev is not None:
+                out.append(ev)
+        return tuple(out)
 
     # -----------------------------------------------------------------
     # Public lifecycle
@@ -390,7 +436,10 @@ class FrameDispatcher:
         # before reusing seq numbers (monotonic counter in the
         # buffer).
         telemetry_event_id = uuid.uuid4()
-        self._event_id_for_seq[event.seq] = telemetry_event_id
+        # Attach the synthetic id to the BufferedEvent so the
+        # persistence layer can use it as the TelemetryEvent.id PK.
+        event.synthetic_id = telemetry_event_id
+        self._event_id_to_buffered[telemetry_event_id] = event
 
         if isinstance(message, TelemetryLight):
             self._dispatch_light(message, telemetry_event_id)
@@ -431,11 +480,10 @@ class FrameDispatcher:
             confidence=_confidence_from_float(message.payload.confidence),
             face_count=message.payload.face_count,
         )
-        self._emit(
-            self.aggregator.process_face_presence(
-                result, telemetry_event_id=telemetry_event_id
-            )
+        decisions = self.aggregator.process_face_presence(
+            result, telemetry_event_id=telemetry_event_id
         )
+        self._emit(decisions)
 
     def _dispatch_heavy_frame(
         self,
@@ -461,11 +509,14 @@ class FrameDispatcher:
         self._heavy_frame_seq += 1
         decision = self._scheduler.decide_for_frame(seq)
 
-        # Run the face landmarker when either HEAD_POSE_GAZE or
-        # IDENTITY_MATCH is scheduled — both need the landmarks.
+        # Run the face landmarker when either HEAD_POSE_GAZE,
+        # IDENTITY_MATCH, or LIVENESS is scheduled — all three need
+        # the landmarks.
         landmarker_result = None
-        if decision.should_run(InferenceModality.HEAD_POSE_GAZE) or decision.should_run(
-            InferenceModality.IDENTITY_MATCH
+        if (
+            decision.should_run(InferenceModality.HEAD_POSE_GAZE)
+            or decision.should_run(InferenceModality.IDENTITY_MATCH)
+            or decision.should_run(InferenceModality.LIVENESS)
         ):
             landmarker = self._ensure_face_landmarker()
             try:
@@ -476,13 +527,12 @@ class FrameDispatcher:
                 landmarker_result = None
 
         if decision.should_run(InferenceModality.HEAD_POSE_GAZE) and landmarker_result is not None:
-            self._emit(
-                self.aggregator.process_gaze(
-                    landmarker_result,
-                    telemetry_event_id=telemetry_event_id,
-                    frame_timestamp_ms=_captured_at_ms(message),
-                )
+            decisions = self.aggregator.process_gaze(
+                landmarker_result,
+                telemetry_event_id=telemetry_event_id,
+                frame_timestamp_ms=_captured_at_ms(message),
             )
+            self._emit(decisions)
 
         if decision.should_run(InferenceModality.OBJECT_DETECTION):
             detector = self._ensure_object_detector()
@@ -493,13 +543,12 @@ class FrameDispatcher:
                 self._error_count += 1
                 detections = []
             for det in detections:
-                self._emit(
-                    self.aggregator.process_object_detection(
-                        det,
-                        telemetry_event_id=telemetry_event_id,
-                        now=datetime.now(timezone.utc),
-                    )
+                decisions = self.aggregator.process_object_detection(
+                    det,
+                    telemetry_event_id=telemetry_event_id,
+                    now=datetime.now(timezone.utc),
                 )
+                self._emit(decisions)
 
         if decision.should_run(InferenceModality.IDENTITY_MATCH):
             # If the landmarker didn't run this frame, skip identity
@@ -527,11 +576,10 @@ class FrameDispatcher:
                 self._error_count += 1
                 return
 
-            self._emit(
-                self.aggregator.process_identity_match(
-                    identity_result, telemetry_event_id=telemetry_event_id
-                )
+            decisions = self.aggregator.process_identity_match(
+                identity_result, telemetry_event_id=telemetry_event_id
             )
+            self._emit(decisions)
 
         if decision.should_run(InferenceModality.LIVENESS) and self._liveness_runner is not None:
             # Liveness needs the uncropped BGR frame and a pixel bbox
@@ -553,11 +601,10 @@ class FrameDispatcher:
                 self._error_count += 1
                 return
 
-            self._emit(
-                self.aggregator.process_liveness(
-                    liveness_result, telemetry_event_id=telemetry_event_id
-                )
+            decisions = self.aggregator.process_liveness(
+                liveness_result, telemetry_event_id=telemetry_event_id
             )
+            self._emit(decisions)
 
     def _dispatch_audio_chunk(
         self,
@@ -601,11 +648,10 @@ class FrameDispatcher:
         if audio_result.event_type == EVENT_SILENCE:
             return
 
-        self._emit(
-            self.aggregator.process_audio_vad(
-                audio_result, telemetry_event_id=telemetry_event_id
-            )
+        decisions = self.aggregator.process_audio_vad(
+            audio_result, telemetry_event_id=telemetry_event_id
         )
+        self._emit(decisions)
 
     def _dispatch_browser_event(
         self,
@@ -621,20 +667,46 @@ class FrameDispatcher:
             raw_value={},
             detail=dict(message.payload.detail),
         )
-        self._emit(
-            self.aggregator.process_browser_event(
-                result, telemetry_event_id=telemetry_event_id
-            )
+        decisions = self.aggregator.process_browser_event(
+            result, telemetry_event_id=telemetry_event_id
         )
+        self._emit(decisions)
 
     # -----------------------------------------------------------------
     # Helpers
     # -----------------------------------------------------------------
 
-    def _emit(self, decisions: list[FlagDecision]) -> None:
-        """Push all decisions from an aggregator call onto the queue."""
-        for d in decisions:
-            self.flag_decisions.put(d)
+    def _emit(
+        self,
+        decisions: list[FlagDecision],
+    ) -> None:
+        """Build ``PersistedFlag`` objects and push them onto the queue.
+
+        Note: each call to ``_emit`` already passed the event_id and
+        its underlying ``BufferedEvent`` so the persistence layer can
+        reconstruct the original payload.  This design keeps the
+        decision and the source data paired through the queue, even
+        if the dispatcher stops before the persistence worker
+        drains the queue.
+        """
+        # Each decision carries its own subset of contributing IDs
+        # (multi-frame windows).  Match the order of the IDs to
+        # pull the right BufferedEvents.
+        for decision in decisions:
+            ids = list(decision.contributing_event_ids)
+            events = []
+            for eid in ids:
+                ev = self._event_id_to_buffered.pop(eid, None)
+                if ev is not None:
+                    events.append(ev)
+            # If any ID was missing (e.g. window spanned events
+            # whose events we no longer have cached), the persistence
+            # layer will need to drop the link for that ID — the
+            # Flag row itself still persists.
+            self.flag_decisions.put(
+                PersistedFlag(decision=decision, contributing_events=tuple(events))
+            )
+
 
 
 # ---------------------------------------------------------------------------

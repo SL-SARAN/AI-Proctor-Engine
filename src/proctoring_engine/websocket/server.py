@@ -184,11 +184,20 @@ class BufferedEvent:
     """A parsed client message with server-side arrival metadata.
 
     This is the unit the preprocessing layer consumes.
+
+    ``synthetic_id`` is a per-event synthetic UUID minted by the
+    FrameDispatcher when the event is consumed.  The persistence
+    layer (turn 9b) uses this as the primary key for the
+    corresponding ``TelemetryEvent`` row, so the dispatcher's flag
+    decisions and the DB rows share the same identifier.  ``None``
+    before the dispatcher has assigned one (e.g. the message is
+    still in the buffer).
     """
 
     message: ClientMessage
     received_at: datetime
     seq: int
+    synthetic_id: "uuid.UUID | None" = None
 
 
 class TelemetryEventBuffer:
