@@ -329,6 +329,91 @@ def build_ws_router(deps: _WsRouterDeps) -> APIRouter:
             ack_grace_seconds=deps.heartbeat_timeout_seconds,
         )
 
+        # ------------------------------------------------------------------
+        # 3a. Spin up the dispatcher + persistence worker
+        # ------------------------------------------------------------------
+        # The FrameDispatcher is per-session.  It runs in its own thread,
+        # draining the shared TelemetryEventBuffer, invoking the
+        # inference runners, and pushing FlagDecision objects to the
+        # FlagPersistenceWorker.  The persistence worker then writes
+        # the Flag + TelemetryEvent rows to Postgres and fires the
+        # kill-switch callback if a CRITICAL flag with
+        # triggered_termination=True was raised.
+        from proctoring_engine.fusion.aggregator import (
+            PolicySnapshot,
+            SessionContext,
+        )
+        from proctoring_engine.orchestration._flag_persistence_worker import (
+            FlagPersistenceWorker,
+        )
+        from proctoring_engine.orchestration._frame_dispatcher import (
+            FrameDispatcher,
+            FrameDispatcherConfig,
+        )
+
+        policy_snapshot = PolicySnapshot(
+            terminate_on_second_face=True,
+            second_face_confirmation_frames=3,
+            gaze_min_duration_ms=800,
+            gaze_window_seconds=300,
+            gaze_warning_limit=3,
+            gaze_termination_limit=8,
+            medium_score_termination_threshold=10.0,
+            medium_score_action="auto_terminate",
+            liveness_check_enabled=False,
+            liveness_check_action=None,
+            liveness_score_threshold=0.5,
+            liveness_confirmation_frames=3,
+            identity_similarity_threshold=0.6,
+            identity_confirmation_frames=3,
+            audio_noise_floor_dbfs=-30.0,
+            audio_speech_ratio_threshold=0.3,
+        )
+        context = SessionContext(
+            exam_session_id=_uuid.UUID(claims.session_id),
+            participant_id=exam_session.participant_id,
+            exam_reference=exam_session.exam_reference,
+            policy_config_id=exam_session.policy_config_id,
+        )
+        dispatcher_config = FrameDispatcherConfig(
+            policy_snapshot=policy_snapshot,
+            context=context,
+        )
+        dispatcher = FrameDispatcher(
+            config=dispatcher_config,
+            event_buffer=deps.event_buffer,
+        )
+
+        # The kill-switch callback runs on the persistence-worker
+        # thread; it must hand the kill-switch back to the asyncio
+        # loop without awaiting (no event loop on that thread).
+        # ``loop.call_soon_threadsafe`` enqueues the delivery on the
+        # asyncio loop running the WS handler.  ``_kill_switch_queue``
+        # is drained by the ``_kill_switch_drain_loop`` task.
+        import asyncio as _asyncio
+
+        loop = _asyncio.get_running_loop()
+        kill_switch_queue: _asyncio.Queue = _asyncio.Queue()
+
+        def _on_kill_switch(flag_id: str, reason: str) -> None:
+            try:
+                loop.call_soon_threadsafe(
+                    kill_switch_queue.put_nowait, (flag_id, reason)
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to enqueue kill-switch for flag %s.", flag_id
+                )
+
+        persistence_worker = FlagPersistenceWorker(
+            dispatcher=dispatcher,
+            get_db=deps.get_db,
+            on_kill_switch=_on_kill_switch,
+        )
+
+        dispatcher.start()
+        persistence_worker.start()
+
         # Start the heartbeat task.
         heartbeat_task = asyncio.create_task(
             _heartbeat_loop(
@@ -336,6 +421,17 @@ def build_ws_router(deps: _WsRouterDeps) -> APIRouter:
                 interval=deps.heartbeat_interval_seconds,
                 timeout=deps.heartbeat_timeout_seconds,
             )
+        )
+
+        # Spawn the kill-switch drain task.  It reads from
+        # ``kill_switch_queue`` (populated by the persistence worker
+        # via ``call_soon_threadsafe``) and sends the kill-switch
+        # message over the WS using the existing ``DeliveryService``
+        # for ``flag_id`` tracking.
+        kill_switch_drain_task = _start_kill_switch_drain(
+            websocket=websocket,
+            delivery=delivery,
+            kill_switch_queue=kill_switch_queue,
         )
 
         try:
@@ -355,6 +451,18 @@ def build_ws_router(deps: _WsRouterDeps) -> APIRouter:
                 claims.session_id,
             )
         finally:
+            # Cancel the kill-switch drain task first so it stops
+            # trying to send on a closing WS.
+            kill_switch_drain_task.cancel()
+            try:
+                await kill_switch_drain_task
+            except asyncio.CancelledError:
+                pass
+            # Stop the dispatcher + persistence worker.  These run
+            # in their own threads and have a bounded drain timeout
+            # to prevent blocking shutdown.
+            persistence_worker.stop(timeout=5.0)
+            dispatcher.stop(timeout=5.0)
             heartbeat_task.cancel()
             try:
                 await heartbeat_task
@@ -412,6 +520,50 @@ async def _heartbeat_loop(
 # ---------------------------------------------------------------------------
 # Message loop
 # ---------------------------------------------------------------------------
+
+def _start_kill_switch_drain(
+    *,
+    websocket: WebSocket,
+    delivery: DeliveryService,
+    kill_switch_queue: asyncio.Queue,
+) -> asyncio.Task:
+    """Spawn a task that drains ``kill_switch_queue`` and sends the
+    kill-switch messages over the WebSocket.
+
+    Each queue item is a ``(flag_id, reason)`` tuple.  The drain
+    task:
+
+    1. Calls ``delivery.prepare_kill_switch(flag_id, reason)`` to
+       build the kill-switch message and register it as pending.
+    2. Sends the message via ``websocket.send_json(...)``.
+
+    Returns the task handle so the caller can cancel it on disconnect.
+    """
+
+    async def _drain() -> None:
+        while True:
+            flag_id, reason = await kill_switch_queue.get()
+            try:
+                msg = delivery.prepare_kill_switch(flag_id, reason)
+            except Exception:
+                logger.exception(
+                    "Failed to prepare kill-switch for flag %s.", flag_id,
+                )
+                continue
+            try:
+                await websocket.send_json(msg.to_json_dict())
+                logger.info(
+                    "Kill-switch sent for flag %s (reason=%s).",
+                    flag_id, reason,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to send kill-switch for flag %s; "
+                    "WS is likely closed.", flag_id,
+                )
+
+    return asyncio.create_task(_drain(), name="KillSwitchDrain")
+
 
 async def _message_loop(
     *,

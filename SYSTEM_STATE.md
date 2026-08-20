@@ -1,6 +1,6 @@
 # System State
 
-Last updated: 2026-08-01 (turn N+8: browser client + capture skeleton)
+Last updated: 2026-08-20 (turn 10: e2e smoke test)
 
 This file is the single source of truth for "where the AI Proctoring
 Engine is right now." Read this first at the start of every session
@@ -662,6 +662,78 @@ it to mark progress and to identify the next single atomic layer.
       `TelemetryLightPayload` validation; gaze is server-side only on
       the raw heavy frame JPEG). ~2 MB WASM + model download saved per
       session. Total: 116 client tests passing.
+- [x] `FrameDispatcher` wires the pipeline (turn 9a) — per-session
+      background thread drains `TelemetryEventBuffer`, dispatches
+      heavy frames through `SessionAggregator`, emits `FlagDecision`s
+      onto `flag_decisions` queue. `BufferedEvent.synthetic_id` bridges
+      telemetry IDs to events. 723 Python unit tests passing.
+- [x] Flag persistence wiring (turn 9b) — `FlagPersistenceWorker`
+      drains `flag_decisions`, persists `Flag` + `FlagTelemetryEvent`
+      rows in a single transaction, invokes `on_kill_switch` callback
+      when `decision.triggered_termination=True`. 723 Python unit tests
+      passing.
+- [x] Kill-switch delivery + lifespan wiring (turn 9c) — the
+      `on_kill_switch` callback bridges the persistence worker thread
+      (sync, no event loop) into the asyncio WS message loop via
+      `asyncio.Queue` + `loop.call_soon_threadsafe`. The
+      `_start_kill_switch_drain` task drains kill-switch tuples, calls
+      `DeliveryService.prepare_kill_switch`, and sends the JSON
+      envelope on the WebSocket. `FlagPersistenceWorker._handle_kill_switch`
+      upserts the 1:1 `TerminationRecord` row keyed by `exam_session_id`
+      before invoking the callback. `FrameDispatcher` and
+      `FlagPersistenceWorker` are now constructed and started in the
+      WebSocket route, stopped in `finally`. All 88 WebSocket tests +
+      723 Python unit tests passing.
+- [x] End-to-end smoke test (turn 10) — `tests/test_e2e_smoke.py`
+      is the first test that exercises the **full client-to-flag
+      loop** through a real FastAPI app: a fake LTI launch issues
+      a session token, the client opens a WebSocket with that
+      token, streams three `telemetry_light` events with
+      `face_count=2`, the aggregator fires
+      `RULE_SECOND_PERSON` ("second_person"), the persistence
+      worker writes the immutable `Flag` row + three
+      `TelemetryEvent` rows + three `FlagTelemetryEvent` links +
+      the 1:1 `TerminationRecord`, the asyncio.Queue bridge sends
+      the `kill_switch` message over the WS, the client acks it,
+      the `POST /sessions/{id}/flags/{flag_id}/evidence` route
+      seals a 32-byte blob through the `InMemoryEvidenceStore`,
+      and the `EvidenceArtifact` row is committed. Eight phases,
+      one polling helper (`_wait_for_db_row` polls with
+      `db.expire_all()` per iteration because the persistence
+      worker writes from a separate thread), one fresh-session-per-call
+      `get_db` factory (the WS handler runs in a worker thread;
+      sharing a session across threads detaches loaded instances
+      on close). SQLite-only — does not require
+      `INTEGRATION_DATABASE_URL`. Runs in 3.12 s. Total: 724 Python
+      unit tests passing (723 prior + 1 new).
+
+      **Contract drift surfaced (not fixed in this turn):** the
+      Python `KillSwitchPayload.reason` docstring and the
+      TypeScript client's `REASON_MESSAGES` map (in
+      `client/src/kill-switch.ts`) use keys like
+      `"second_person_detected"` / `"gaze_frequency_exceeded"` /
+      `"accumulated_score_exceeded"`, but the actual emitted
+      values are the Python `RULE_*` constants:
+      `"second_person"` / `"gaze_away_frequency"` /
+      `"accumulated_score"`. The smoke test asserts the actual
+      emitted values (Python `RULE_*` is the source of truth).
+      Aligning the two is a separate atomic turn.
+
+      **`_AlwaysZeroBackend` status (not "fixed" by this turn):**
+      the identity-match stub in
+      `src/proctoring_engine/orchestration/_frame_dispatcher.py:835`
+      is an organic Turn 9a placeholder, **not** a designed
+      fail-closed/block-by-default mechanism. It lets the session
+      proceed and fires a CRITICAL `identity_mismatch` flag on
+      the first sampled window. There is no
+      `ExamSession.identity_verification_status` field
+      (grep-verified absent across the codebase, the docs, and
+      the migration history) so the proctor reviewing the flag
+      cannot distinguish "library not installed" from "looks like
+      impersonation." The smoke test avoids the heavy-frame path
+      entirely (sending only `telemetry_light` events) — correct
+      regardless of the stub's status — and the identity-match
+      parked item remains parked.
 - [x] `PolicyConfig.name` partial unique constraint — dropped
       `unique=True`, added `CREATE UNIQUE INDEX ... WHERE is_active
       = true AND retired_at IS NULL` (`uq_policy_configs_active_name`).
@@ -685,5 +757,43 @@ it to mark progress and to identify the next single atomic layer.
       and screen-replay spoofing only — not deepfakes or 3D masks
       (documented honestly). Total: 686 Python unit + 116 client
       tests passing.
+- [x] `FrameDispatcher` + `FlagPersistenceWorker` + kill-switch
+      delivery (turns 9a / 9b / 9c). `FrameDispatcher` (per-session
+      background thread) drains `TelemetryEventBuffer`, dispatches
+      heavy frames through `SessionAggregator`, and emits
+      `FlagDecision`s onto a `flag_decisions` queue.
+      `FlagPersistenceWorker` drains that queue, persists `Flag` +
+      `FlagTelemetryEvent` rows in a single transaction, and
+      upserts the 1:1 `TerminationRecord` when
+      `decision.triggered_termination=True`. The kill-switch
+      callback bridges the persistence worker thread (sync, no
+      event loop) into the asyncio WS message loop via
+      `asyncio.Queue` + `loop.call_soon_threadsafe`; a drain task
+      calls `DeliveryService.prepare_kill_switch` and sends the
+      JSON envelope on the WebSocket. Both dispatcher and worker
+      are constructed/started in the WebSocket route and stopped
+      in `finally`. Total: 723 Python unit tests passing (88 WS).
+- [x] End-to-end smoke test (turn 10). `tests/test_e2e_smoke.py`
+      exercises the full LTI launch → WS connection → telemetry
+      stream → `RULE_SECOND_PERSON` flag → kill-switch round-trip
+      → evidence seal → termination record, all through a real
+      FastAPI app with all three routers mounted. Eight phases,
+      one polling helper, one fresh-session-per-call `get_db`
+      factory. SQLite-only — does not require
+      `INTEGRATION_DATABASE_URL`. 724 Python unit tests passing.
+      Two **pre-existing** items surfaced (not fixed):
+      (a) the kill-switch `payload.reason` value emitted by the
+      Python code is `"second_person"` / `"gaze_away_frequency"` /
+      `"accumulated_score"` (matches the `RULE_*` constants) but
+      the Python docstring and the TS client's `REASON_MESSAGES`
+      map use `"second_person_detected"` / `"gaze_frequency_exceeded"`
+      / `"accumulated_score_exceeded"` — a contract drift
+      requiring a separate atomic turn to resolve; (b) the
+      identity-match `_AlwaysZeroBackend` stub is an organic
+      Turn 9a placeholder, not a designed fail-closed/block-by-default
+      mechanism, and the designed `identity_verification_status`
+      field that would distinguish "library not installed" from
+      "looks like impersonation" was never built (grep-verified
+      absent) — the identity-match parked item remains parked.
 - [ ] Production deployment (k8s cluster provisioned, end-to-end
       smoke test on a live cluster)

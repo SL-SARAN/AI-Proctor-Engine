@@ -48,8 +48,10 @@ from sqlalchemy.orm import Session
 from proctoring_engine.fusion.aggregator import FlagDecision
 from proctoring_engine.models import (
     ExamSession,
+    Flag,
     TelemetryEvent,
     TelemetryModality,
+    TerminationRecord,
 )
 from proctoring_engine.orchestration._flag_persistence import (
     FlagPersistenceError,
@@ -213,9 +215,24 @@ class FlagPersistenceWorker:
         *,
         dispatcher: Any,  # FrameDispatcher (avoids circular import)
         get_db: Callable[[], Session],
+        on_kill_switch: "Callable[[str, str], None] | None" = None,
     ) -> None:
+        """Construct the persistence worker.
+
+        Parameters
+        ----------
+        on_kill_switch:
+            Optional callback invoked when a persisted Flag has
+            ``triggered_termination=True``.  The callback receives
+            ``(flag_id, reason)``.  It is intended to enqueue the
+            kill-switch for delivery over the WebSocket (handled
+            asynchronously by the WS message loop).  ``None`` means
+            the worker runs but no kill-switch is fired (e.g. in
+            headless test environments without a WS).
+        """
         self._dispatcher = dispatcher
         self._get_db = get_db
+        self._on_kill_switch = on_kill_switch
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._persisted_count = 0
@@ -298,14 +315,25 @@ class FlagPersistenceWorker:
             # Persist the Flag itself.  This will also create the
             # FlagTelemetryEvent links using the IDs the dispatcher
             # placed in contributing_event_ids.
-            persist_flag_decision(db, decision, exam_session=exam_session)
+            flag = persist_flag_decision(
+                db, decision, exam_session=exam_session
+            )
             db.commit()
+            db.refresh(flag)
+
+            # If this flag triggers termination, build the
+            # TerminationRecord and fire the kill-switch callback.
+            # The callback is the WS-layer handler that delivers the
+            # message to the client; we don't await here because
+            # we're in a sync DB worker thread.
+            if decision.triggered_termination:
+                self._handle_kill_switch(db, flag, decision)
         except FlagPersistenceError as exc:
-            print("EXC", exc); db.rollback()
+            db.rollback()
             logger.error("Flag persistence raised FlagPersistenceError: %s", exc)
             raise
         except IntegrityError as exc:
-            print("EXC", exc); db.rollback()
+            db.rollback()
             logger.warning(
                 "Flag insert hit an integrity error (likely a duplicate "
                 "TelemetryEvent or a race); dropping the decision. %s",
@@ -313,11 +341,66 @@ class FlagPersistenceWorker:
             )
             raise
         except Exception as exc:
-            print("EXC", exc); db.rollback()
+            db.rollback()
             logger.exception("Flag persistence failed: %s", exc)
             raise
         finally:
             db.close()
+
+    def _handle_kill_switch(
+        self,
+        db: Session,
+        flag: Flag,
+        decision: FlagDecision,
+    ) -> None:
+        """Build a TerminationRecord and fire the kill-switch callback.
+
+        The TerminationRecord is a 1:1 row keyed by ``exam_session_id``;
+        if one already exists (e.g. the dispatcher fires two
+        triggered_termination flags back-to-back), we update the
+        ``triggering_flag_id`` to point at the latest one rather than
+        failing the duplicate insert.
+
+        The kill-switch callback is invoked last, after the
+        TerminationRecord is committed.  If the callback raises, we
+        log and continue — the record is the durable evidence;
+        callback failure is not a persistence failure.
+        """
+        # Build the TerminationRecord row.
+        termination = (
+            db.query(TerminationRecord)
+            .filter(
+                TerminationRecord.exam_session_id
+                == self._dispatcher._config.context.exam_session_id
+            )
+            .one_or_none()
+        )
+        if termination is None:
+            termination = TerminationRecord(
+                exam_session_id=self._dispatcher._config.context.exam_session_id,
+                triggering_flag_id=flag.id,
+                reason=decision.rule_code,
+            )
+            db.add(termination)
+        else:
+            # Update the existing record (append-only flag_id means we
+            # don't replace — but the TerminationRecord has no
+            # immutability trigger, so updating the trigger is allowed).
+            termination.triggering_flag_id = flag.id
+            termination.reason = decision.rule_code
+        db.commit()
+        db.refresh(termination)
+
+        # Fire the kill-switch callback (which sends the WS message).
+        # The flag_id is a string in the DeliveryService contract.
+        if self._on_kill_switch is not None:
+            try:
+                self._on_kill_switch(str(flag.id), decision.rule_code)
+            except Exception:
+                logger.exception(
+                    "Kill-switch callback raised; TerminationRecord row "
+                    "was committed but the WS message was not delivered."
+                )
 
     def _resolve_session(self, db: Session) -> ExamSession | None:
         """Look up the ExamSession by id; return None if missing."""
