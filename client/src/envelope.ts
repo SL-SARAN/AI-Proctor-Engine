@@ -143,7 +143,14 @@ export interface SessionAcknowledgePayload {
 }
 
 export interface KillSwitchPayload {
-  reason: 'second_person_detected' | 'gaze_frequency_exceeded' | 'accumulated_score_exceeded' | 'retry';
+  reason:
+    | 'second_person'
+    | 'gaze_away_frequency'
+    | 'accumulated_score'
+    | 'liveness_check_failed'
+    | 'identity_mismatch'
+    | 'retry'
+    | string;
   flag_id: string;
 }
 

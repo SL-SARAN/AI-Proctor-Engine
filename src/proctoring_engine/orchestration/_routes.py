@@ -65,22 +65,30 @@ from proctoring_engine.evidence._protocol import EvidenceStore
 from proctoring_engine.evidence.service import SealEvidenceRequest
 from proctoring_engine.lti.config import LtiSettings
 from proctoring_engine.models import (
+    AdminUser,
     ExamSession,
+    OverrideRequestStatus,
     SessionStatus,
     TerminationRecord,
 )
 from proctoring_engine.orchestration._admin_service import (
     ExemptionValidationError,
     FlagNotFoundError,
+    OverrideNotFoundError,
     PolicyVersioningError,
     ReviewTransitionError,
+    SelfApprovalOrRoleError,
+    approve_identity_override_request,
     assert_session_exists,
     create_exemption,
+    create_identity_override_request,
     create_policy_version,
     list_exemptions,
     list_flags_for_session,
+    list_identity_override_requests,
     list_policy_configs,
     record_proctor_review,
+    reject_identity_override_request,
 )
 from proctoring_engine.orchestration._auth import (
     parse_bearer,
@@ -104,11 +112,13 @@ from proctoring_engine.orchestration._flag_persistence import (
 from proctoring_engine.orchestration._schemas import (
     AccommodationExemptionResponse,
     CreateExemptionRequest,
+    CreateIdentityOverrideRequest,
     CreatePolicyConfigRequest,
     CreateProctorReviewRequest,
     ErrorBody,
     FlagListResponse,
     FlagReviewResponse,
+    IdentityOverrideResponse,
     PolicyConfigResponse,
     ProctorReviewCreatedResponse,
     SealEvidenceApiRequest,
@@ -154,6 +164,9 @@ _ERROR_HTTP: dict[str, int] = {
     "evidence_already_sealed": status.HTTP_409_CONFLICT,
     "evidence_blob_too_large": 413,
     "evidence_seal_failed": status.HTTP_500_INTERNAL_SERVER_ERROR,
+    "identity_override_not_found": status.HTTP_404_NOT_FOUND,
+    "self_approval_rejected": status.HTTP_403_FORBIDDEN,
+    "role_unauthorized": status.HTTP_403_FORBIDDEN,
 }
 
 
@@ -489,6 +502,99 @@ def build_orchestration_router(deps: _OrchestrationDeps) -> APIRouter:
             decision=request.decision,
             session_status=result.session_status.value,
         )
+
+    # ------------------------------------------------------------------
+    # /admin/identity-override-requests
+    # ------------------------------------------------------------------
+
+    @router.post(
+        "/admin/identity-override-requests",
+        response_model=IdentityOverrideResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def post_create_identity_override_request(
+        request: CreateIdentityOverrideRequest = Body(...),
+        admin: AdminUser = Depends(admin_role_dep),
+    ) -> IdentityOverrideResponse:
+        try:
+            override = create_identity_override_request(
+                deps.get_db(),
+                request,
+                admin,
+            )
+        except ExemptionValidationError as exc:
+            raise _http_error("exemption_validation_error", str(exc)) from exc
+        return IdentityOverrideResponse.from_orm(override)
+
+    @router.get(
+        "/admin/identity-override-requests",
+        response_model=list[IdentityOverrideResponse],
+        status_code=status.HTTP_200_OK,
+    )
+    def get_list_identity_override_requests(
+        exam_session_id: _uuid.UUID | None = Query(default=None),
+        department: str | None = Query(default=None),
+        status_filter: str | None = Query(default=None, alias="status"),
+        admin: AdminUser = Depends(admin_role_dep),
+    ) -> list[IdentityOverrideResponse]:
+        status_enum = None
+        if status_filter is not None:
+            try:
+                status_enum = OverrideRequestStatus(status_filter)
+            except ValueError:
+                pass
+        results = list_identity_override_requests(
+            deps.get_db(),
+            exam_session_id=exam_session_id,
+            department=department,
+            status=status_enum,
+        )
+        return [IdentityOverrideResponse.from_orm(o) for o in results]
+
+    @router.post(
+        "/admin/identity-override-requests/{override_id}/approve",
+        response_model=IdentityOverrideResponse,
+        status_code=status.HTTP_200_OK,
+    )
+    def post_approve_identity_override_request(
+        override_id: _uuid.UUID = Path(...),
+        admin: AdminUser = Depends(admin_role_dep),
+    ) -> IdentityOverrideResponse:
+        try:
+            override = approve_identity_override_request(
+                deps.get_db(),
+                override_id,
+                admin,
+            )
+        except OverrideNotFoundError as exc:
+            raise _http_error("identity_override_not_found", str(exc)) from exc
+        except SelfApprovalOrRoleError as exc:
+            code = (
+                "self_approval_rejected"
+                if ("self" in str(exc).lower() or "own" in str(exc).lower())
+                else "role_unauthorized"
+            )
+            raise _http_error(code, str(exc)) from exc
+        return IdentityOverrideResponse.from_orm(override)
+
+    @router.post(
+        "/admin/identity-override-requests/{override_id}/reject",
+        response_model=IdentityOverrideResponse,
+        status_code=status.HTTP_200_OK,
+    )
+    def post_reject_identity_override_request(
+        override_id: _uuid.UUID = Path(...),
+        admin: AdminUser = Depends(admin_role_dep),
+    ) -> IdentityOverrideResponse:
+        try:
+            override = reject_identity_override_request(
+                deps.get_db(),
+                override_id,
+                admin,
+            )
+        except OverrideNotFoundError as exc:
+            raise _http_error("identity_override_not_found", str(exc)) from exc
+        return IdentityOverrideResponse.from_orm(override)
 
     # ------------------------------------------------------------------
     # /sessions/{session_id}/flags/{flag_id}/evidence  (deferred §7 gap)

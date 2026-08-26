@@ -41,6 +41,9 @@ _ERROR_HTTP: dict[str, int] = {
     "evidence_already_sealed": 409,
     "evidence_blob_too_large": 413,
     "evidence_seal_failed": 500,
+    "identity_override_not_found": 404,
+    "self_approval_rejected": 403,
+    "role_unauthorized": 403,
 }
 
 

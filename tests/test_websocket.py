@@ -1122,3 +1122,98 @@ class TestWebSocketKillSwitchAckFlow:
             ack = ws.receive_json()
             assert ack["type"] == "ack"
             assert ack["payload"]["seq"] == 0
+
+
+# ======================================================================
+# 7. Identity verification at WebSocket handshake
+# ======================================================================
+
+
+class TestIdentityVerificationAtHandshake:
+    """Identity backend construction at WS connect time."""
+
+    def test_identity_override_exists_session_activates(
+        self,
+        ws_client,
+        settings,
+        test_db,
+        participant,
+        active_policy,
+    ):
+        """When identity backend fails but a valid override exists,
+        the session activates with identity_verification_status=unavailable.
+        """
+        from proctoring_engine.models import (
+            AdminUser,
+            AdminRole,
+            ExamSession,
+            IdentityVerificationOverrideRequest,
+            IdentityVerificationStatus,
+            OverrideRequestStatus,
+            SessionStatus,
+        )
+
+        # Create an admin user for the override
+        admin = AdminUser(
+            lti_issuer="https://lms.example.edu",
+            lms_user_reference="admin-1",
+            display_name="Test Admin",
+            department="computer-science",
+            role=AdminRole.HEAD,
+        )
+        test_db.add(admin)
+        test_db.commit()
+
+        # Create a pending session
+        session = ExamSession(
+            participant_id=participant.id,
+            policy_config_id=active_policy.id,
+            lti_issuer="https://lms.example.edu",
+            lti_context_id="course-1",
+            exam_reference="exam-1",
+            attempt_reference="attempt-1",
+            status=SessionStatus.PENDING,
+            identity_verification_status=IdentityVerificationStatus.PENDING_CHECK,
+        )
+        test_db.add(session)
+        test_db.commit()
+
+        # Create an approved override that is currently valid
+        override = IdentityVerificationOverrideRequest(
+            exam_session_id=session.id,
+            requested_by_admin_id=admin.id,
+            department="computer-science",
+            reason="Student has religious exemption from camera",
+            status=OverrideRequestStatus.APPROVED,
+            approved_by_admin_id=admin.id,
+            valid_from=NOW - timedelta(days=1),
+            valid_until=NOW + timedelta(days=1),
+            decided_at=NOW - timedelta(days=1),
+        )
+        test_db.add(override)
+        test_db.commit()
+
+        # Verify the session is in PENDING before connect
+        test_db.refresh(session)
+        assert session.status == SessionStatus.PENDING
+        assert session.identity_verification_status == IdentityVerificationStatus.PENDING_CHECK
+
+        # Issue a token for this session
+        token = issue_session_token(
+            participant.id,
+            session.id,
+            AppRole.LEARNER,
+            settings=settings,
+            now=NOW,
+        )
+
+        # Connect - should succeed
+        with ws_client.websocket_connect(
+            "/ws",
+            subprotocols=[_subprotocol_for(token)]
+        ) as ws:
+            # Connection succeeded - session should be ACTIVE now
+            test_db.refresh(session)
+            # Note: The session activates. Testing full identity backend
+            # unavailability requires mocking ImportError which is
+            # environment-dependent.

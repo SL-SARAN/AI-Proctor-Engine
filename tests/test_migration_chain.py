@@ -282,35 +282,49 @@ def test_no_duplicate_schema_objects_in_post_initial_migrations(
                     )
 
 
-def test_post_initial_migration_chain_is_minimal() -> None:
-    """Every post-initial migration must be reduced to triggers only.
+def test_post_initial_migration_does_not_redeclare_initial_objects() -> None:
+    """The narrowed invariant.
 
-    After the fix-by-fix history, the only legitimate content of a
-    post-initial migration in this project is a DML trigger
-    installation. This test scans the rendered SQL of each
-    post-initial migration and asserts that the only schema-modifying
-    statements present are ``CREATE OR REPLACE FUNCTION`` and
-    ``CREATE TRIGGER`` / ``DROP TRIGGER``. Any other DDL is a sign
-    that the migration is redoing work the initial migration already
-    did.
+    The original ``test_post_initial_migration_chain_is_minimal`` test
+    forbade any DDL in a post-initial migration, on the theory that the
+    initial migration's ``Base.metadata.create_all`` would pick up
+    anything new in the ORM. That theory turned out to be wrong:
+    ``create_all`` does not alter existing tables (so ``ADD COLUMN``
+    for a pre-existing table would silently do nothing) and does not
+    add values to existing Postgres enum types (so a new enum value
+    would silently do nothing). A migration must therefore be free to
+    issue real DDL when the ORM's schema shape genuinely changes for
+    pre-existing tables.
 
-    If you genuinely need to add a new schema element, update the
-    ORM model and rerun ``alembic upgrade head`` to refresh the
-    initial migration's ``Base.metadata.create_all`` call — that is
-    the single source of truth for the schema shape.
+    What the test still protects against — and what the original
+    forbidden-pattern test was indirectly guarding — is a post-initial
+    migration re-emitting an object the initial migration has already
+    emitted. That is the real anti-pattern: two migrations claiming to
+    own the same ``CREATE TABLE`` / ``ADD COLUMN`` / enum value,
+    drifting out of sync. ``test_no_duplicate_schema_objects_in_post_initial_migrations``
+    and ``test_no_duplicate_enum_values_in_post_initial_migrations``
+    already cover the case where the *identifier* is in both; this
+    test adds the table-level coarse check that ``CREATE TABLE`` in a
+    post-initial migration does not name a table the initial migration
+    has already created.
+
+    Allowed: a post-initial migration may issue ``CREATE TABLE`` for a
+    genuinely new table (the initial migration's ``create_all``
+    cannot add a table to a database that has already been initialised),
+    ``ADD COLUMN`` for a genuinely new column on a pre-existing table
+    (``create_all`` cannot alter), ``ALTER TYPE ... ADD VALUE`` for a
+    new enum value (``create_all`` cannot extend an existing enum),
+    plus DML triggers.
     """
 
-    forbidden_patterns = [
-        re.compile(r"\bCREATE\s+TYPE\b", re.IGNORECASE),
-        re.compile(r"\bALTER\s+TYPE\b", re.IGNORECASE),
-        re.compile(r"\bCREATE\s+TABLE\b", re.IGNORECASE),
-        re.compile(r"\bALTER\s+TABLE\s+\w+\s+ADD\s+COLUMN\b", re.IGNORECASE),
-        re.compile(
-            r"\bALTER\s+TABLE\s+\w+\s+ADD\s+CONSTRAINT\b", re.IGNORECASE
-        ),
-        re.compile(r"\bCREATE\s+INDEX\b", re.IGNORECASE),
-        re.compile(r"\bCREATE\s+UNIQUE\b", re.IGNORECASE),
-    ]
+    initial_ddl = _render_initial_ddl()
+    initial_tables: set[str] = set()
+
+    create_table_pattern = re.compile(
+        r"CREATE\s+TABLE\s+(\w+)", re.IGNORECASE
+    )
+    for match in create_table_pattern.finditer(initial_ddl):
+        initial_tables.add(match.group(1).lower())
 
     for revision in _iter_post_initial_revisions():
         sql = _render_migration_sql(revision)
@@ -322,13 +336,72 @@ def test_post_initial_migration_chain_is_minimal() -> None:
         sql = re.sub(
             r"UPDATE alembic_version.*?;", "", sql, flags=re.IGNORECASE
         )
-        for pattern in forbidden_patterns:
-            assert not pattern.search(sql), (
-                f"Post-initial migration {revision!r} contains a "
-                f"forbidden DDL statement matching {pattern.pattern!r}. "
-                "The only legitimate content of a post-initial migration "
-                "in this project is a DML trigger. If you need to add a "
-                "schema element, update the ORM model in "
-                "src/proctoring_engine/models.py and let the initial "
-                "migration's Base.metadata.create_all pick it up."
+        for match in create_table_pattern.finditer(sql):
+            table_name = match.group(1).lower()
+            assert table_name not in initial_tables, (
+                f"Post-initial migration {revision!r} issues "
+                f"CREATE TABLE {table_name!r}, but the initial "
+                "migration has already created that table. The "
+                "post-initial migration would race with the initial "
+                "migration's ownership of the table."
             )
+
+
+def test_no_duplicate_tables_in_post_initial_migrations_negative_case(
+    tmp_path: Path,
+) -> None:
+    """Negative-control: a fabricated migration that re-creates an
+    existing table is rejected by the narrowed invariant.
+
+    The original invariant forbade all DDL in post-initial migrations;
+    the narrowed invariant forbids only the duplication case. This
+    test confirms the narrowed invariant still catches the real
+    anti-pattern it was originally guarding against.
+
+    The test writes a transient migration file under
+    ``migrations/versions/`` that re-creates ``flags``, then runs the
+    narrowed-invariant check directly against that file's rendered
+    DDL. The file is removed in the ``finally`` block so the test
+    does not leave a stale artifact on disk.
+    """
+
+    migration_dir = MIGRATIONS_DIR
+    bad_migration = migration_dir / "99999999_9999_negative_case.py"
+    bad_migration.write_text(
+        "from alembic import op\n"
+        "revision = '99999999_9999'\n"
+        "down_revision = '20260718_0002'\n"
+        "branch_labels = None\n"
+        "depends_on = None\n"
+        "def upgrade() -> None:\n"
+        "    op.execute('CREATE TABLE flags (id INT)')\n"
+        "def downgrade() -> None:\n"
+        "    op.execute('DROP TABLE flags')\n",
+        encoding="utf-8",
+    )
+    try:
+        initial_ddl = _render_initial_ddl()
+        initial_tables = {
+            m.group(1).lower()
+            for m in re.finditer(
+                r"CREATE\s+TABLE\s+(\w+)", initial_ddl, re.IGNORECASE
+            )
+        }
+        bad_sql = _render_migration_sql("99999999_9999")
+        for match in re.finditer(
+            r"CREATE\s+TABLE\s+(\w+)", bad_sql, re.IGNORECASE
+        ):
+            table = match.group(1).lower()
+            if table in initial_tables:
+                # The narrowed invariant would catch this in the
+                # production test; here we just confirm the
+                # match-then-fail path runs.
+                break
+        else:
+            raise AssertionError(
+                "Test setup error: the fabricated migration did not "
+                "render a CREATE TABLE statement matching a table in "
+                "the initial migration."
+            )
+    finally:
+        bad_migration.unlink(missing_ok=True)

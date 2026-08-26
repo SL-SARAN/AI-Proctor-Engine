@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Sequence
 
 from sqlalchemy import select
@@ -46,9 +46,12 @@ from sqlalchemy.orm import Session
 
 from proctoring_engine.models import (
     AccommodationExemption,
+    AdminRole,
     AdminUser,
     ExamSession,
     Flag,
+    IdentityVerificationOverrideRequest,
+    OverrideRequestStatus,
     PolicyConfig,
     ProctorReview,
     SessionStatus,
@@ -56,8 +59,10 @@ from proctoring_engine.models import (
 from proctoring_engine.orchestration._schemas import (
     AccommodationExemptionResponse,
     CreateExemptionRequest,
+    CreateIdentityOverrideRequest,
     CreatePolicyConfigRequest,
     FlagReviewResponse,
+    IdentityOverrideResponse,
     PolicyConfigResponse,
 )
 from proctoring_engine.orchestration._state_machine import (
@@ -93,6 +98,14 @@ class FlagNotFoundError(AdminServiceError):
 
 class ReviewTransitionError(AdminServiceError):
     """Raised when a review cannot be applied (state-machine reject)."""
+
+
+class OverrideNotFoundError(AdminServiceError):
+    """Raised when the referenced identity override request does not exist."""
+
+
+class SelfApprovalOrRoleError(AdminServiceError):
+    """Raised when an override approval fails role or self-approval guards."""
 
 
 # ---------------------------------------------------------------------------
@@ -549,19 +562,133 @@ def record_proctor_review(
     return ReviewResult(review=review, session_status=new_status)
 
 
+def create_identity_override_request(
+    db: Session,
+    request: CreateIdentityOverrideRequest,
+    admin: AdminUser,
+) -> IdentityVerificationOverrideRequest:
+    """INSERT a new IdentityVerificationOverrideRequest in PENDING status."""
+    assert_session_exists(db, request.exam_session_id)
+    if request.valid_until <= request.valid_from:
+        raise ExemptionValidationError("valid_until must be after valid_from")
+
+    override = IdentityVerificationOverrideRequest(
+        exam_session_id=request.exam_session_id,
+        requested_by_admin_id=admin.id,
+        department=request.department,
+        reason=request.reason,
+        status=OverrideRequestStatus.PENDING,
+        valid_from=request.valid_from,
+        valid_until=request.valid_until,
+    )
+    db.add(override)
+    db.commit()
+    db.refresh(override)
+    return override
+
+
+def list_identity_override_requests(
+    db: Session,
+    *,
+    exam_session_id: uuid.UUID | None = None,
+    department: str | None = None,
+    status: OverrideRequestStatus | None = None,
+) -> list[IdentityVerificationOverrideRequest]:
+    """SELECT IdentityVerificationOverrideRequest rows with optional filters."""
+    stmt = select(IdentityVerificationOverrideRequest)
+    if exam_session_id is not None:
+        stmt = stmt.where(
+            IdentityVerificationOverrideRequest.exam_session_id == exam_session_id
+        )
+    if department is not None:
+        stmt = stmt.where(
+            IdentityVerificationOverrideRequest.department == department
+        )
+    if status is not None:
+        stmt = stmt.where(
+            IdentityVerificationOverrideRequest.status == status
+        )
+    stmt = stmt.order_by(IdentityVerificationOverrideRequest.created_at.desc())
+    return list(db.execute(stmt).scalars().all())
+
+
+def approve_identity_override_request(
+    db: Session,
+    override_id: uuid.UUID,
+    admin: AdminUser,
+) -> IdentityVerificationOverrideRequest:
+    """Approve an override request (requires AdminRole.HEAD and admin.id != requester)."""
+    stmt = select(IdentityVerificationOverrideRequest).where(
+        IdentityVerificationOverrideRequest.id == override_id
+    )
+    override = db.execute(stmt).scalar_one_or_none()
+    if override is None:
+        raise OverrideNotFoundError(
+            f"Identity override request '{override_id}' not found."
+        )
+
+    if admin.role != AdminRole.HEAD:
+        raise SelfApprovalOrRoleError(
+            "HEAD role required to approve identity override requests."
+        )
+
+    if admin.id == override.requested_by_admin_id:
+        raise SelfApprovalOrRoleError(
+            "Admin cannot approve their own override request."
+        )
+
+    now = datetime.now(timezone.utc)
+    override.status = OverrideRequestStatus.APPROVED
+    override.approved_by_admin_id = admin.id
+    override.decided_at = now
+    db.commit()
+    db.refresh(override)
+    return override
+
+
+def reject_identity_override_request(
+    db: Session,
+    override_id: uuid.UUID,
+    admin: AdminUser,
+) -> IdentityVerificationOverrideRequest:
+    """Reject an override request."""
+    stmt = select(IdentityVerificationOverrideRequest).where(
+        IdentityVerificationOverrideRequest.id == override_id
+    )
+    override = db.execute(stmt).scalar_one_or_none()
+    if override is None:
+        raise OverrideNotFoundError(
+            f"Identity override request '{override_id}' not found."
+        )
+
+    now = datetime.now(timezone.utc)
+    override.status = OverrideRequestStatus.REJECTED
+    override.approved_by_admin_id = admin.id
+    override.decided_at = now
+    db.commit()
+    db.refresh(override)
+    return override
+
+
 __all__ = [
     "AdminServiceError",
     "ExemptionValidationError",
     "FlagNotFoundError",
+    "OverrideNotFoundError",
     "PolicyVersioningError",
     "PolicyVersionResult",
     "ReviewResult",
     "ReviewTransitionError",
+    "SelfApprovalOrRoleError",
+    "approve_identity_override_request",
+    "assert_session_exists",
     "create_exemption",
+    "create_identity_override_request",
     "create_policy_version",
     "list_exemptions",
     "list_flags_for_session",
+    "list_identity_override_requests",
     "list_policy_configs",
     "record_proctor_review",
-    "assert_session_exists",
+    "reject_identity_override_request",
 ]

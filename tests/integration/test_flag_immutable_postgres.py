@@ -38,6 +38,7 @@ from proctoring_engine.models import (
     PolicyConfig,
     SessionStatus,
 )
+# pyrefly: ignore [missing-import]
 from tests.integration.conftest import _is_postgres, _reset_database
 
 

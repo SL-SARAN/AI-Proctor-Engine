@@ -37,7 +37,7 @@ describe('handleKillSwitch', () => {
     buffer.push({ data: 'frame-2', timestamp: now + 100 });
 
     const payload: KillSwitchPayload = {
-      reason: 'second_person_detected',
+      reason: 'second_person',
       flag_id: 'flag-abc',
     };
 
@@ -49,7 +49,7 @@ describe('handleKillSwitch', () => {
 
   it('sends a kill_switch_ack envelope via the WebSocket', () => {
     const payload: KillSwitchPayload = {
-      reason: 'gaze_frequency_exceeded',
+      reason: 'gaze_away_frequency',
       flag_id: 'flag-xyz',
     };
 
@@ -64,18 +64,18 @@ describe('handleKillSwitch', () => {
 
   it('returns the flag_id and reason', () => {
     const payload: KillSwitchPayload = {
-      reason: 'accumulated_score_exceeded',
+      reason: 'accumulated_score',
       flag_id: 'flag-999',
     };
 
     const result = handleKillSwitch(payload, deps);
     expect(result.flagId).toBe('flag-999');
-    expect(result.reason).toBe('accumulated_score_exceeded');
+    expect(result.reason).toBe('accumulated_score');
   });
 
   it('handles empty rolling buffer gracefully', () => {
     const payload: KillSwitchPayload = {
-      reason: 'second_person_detected',
+      reason: 'second_person',
       flag_id: 'flag-empty',
     };
 
@@ -86,7 +86,7 @@ describe('handleKillSwitch', () => {
 
   it('creates a lockout overlay in the DOM', () => {
     const payload: KillSwitchPayload = {
-      reason: 'second_person_detected',
+      reason: 'second_person',
       flag_id: 'flag-overlay',
     };
 
@@ -102,7 +102,7 @@ describe('handleKillSwitch', () => {
   });
 
   it('uses "pending review" message for all reason types', () => {
-    for (const reason of ['second_person_detected', 'gaze_frequency_exceeded', 'accumulated_score_exceeded'] as const) {
+    for (const reason of ['second_person', 'gaze_away_frequency', 'accumulated_score'] as const) {
       // Reset the dedup guard so each reason processes fresh
       _resetHandledFlagIds();
       // Reset the DOM
@@ -121,7 +121,7 @@ describe('handleKillSwitch', () => {
   describe('dedup guard (item 8 fix)', () => {
     it('does not stack a second overlay for the same flag_id', () => {
       const payload: KillSwitchPayload = {
-        reason: 'second_person_detected',
+        reason: 'second_person',
         flag_id: 'flag-dedup',
       };
 
@@ -157,7 +157,7 @@ describe('handleKillSwitch', () => {
 
     it('sends ack on retry even when already handled', () => {
       const payload: KillSwitchPayload = {
-        reason: 'gaze_frequency_exceeded',
+        reason: 'gaze_away_frequency',
         flag_id: 'flag-retry-ack',
       };
 

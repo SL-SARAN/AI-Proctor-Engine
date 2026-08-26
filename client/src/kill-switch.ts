@@ -41,9 +41,11 @@ export interface KillSwitchDeps {
  * not the client UI, is where a disputed termination gets adjudicated.
  */
 const REASON_MESSAGES: Record<string, string> = {
-  second_person_detected: 'This session has ended and is pending review.',
-  gaze_frequency_exceeded: 'This session has ended and is pending review.',
-  accumulated_score_exceeded: 'This session has ended and is pending review.',
+  second_person: 'This session has ended and is pending review.',
+  gaze_away_frequency: 'This session has ended and is pending review.',
+  accumulated_score: 'This session has ended and is pending review.',
+  liveness_check_failed: 'This session has ended and is pending review.',
+  identity_mismatch: 'This session has ended and is pending review.',
 };
 
 const DEFAULT_MESSAGE = 'This session has ended and is pending review.';

@@ -436,6 +436,52 @@ class CreateProctorReviewRequest(BaseModel):
     notes: str | None = Field(default=None, max_length=10_000)
 
 
+class CreateIdentityOverrideRequest(BaseModel):
+    """Body for ``POST /admin/identity-override-requests``."""
+
+    model_config = _CLOSED_CONFIG
+
+    exam_session_id: uuid.UUID
+    department: str = Field(min_length=1, max_length=512)
+    reason: str = Field(min_length=1, max_length=5000)
+    valid_from: datetime
+    valid_until: datetime
+
+
+class IdentityOverrideResponse(BaseModel):
+    """Response model for identity override requests."""
+
+    model_config = _CLOSED_CONFIG
+
+    id: uuid.UUID
+    exam_session_id: uuid.UUID
+    requested_by_admin_id: uuid.UUID
+    department: str
+    reason: str
+    status: str
+    approved_by_admin_id: uuid.UUID | None
+    valid_from: datetime
+    valid_until: datetime
+    decided_at: datetime | None
+    created_at: datetime
+
+    @classmethod
+    def from_orm(cls, orm: Any) -> IdentityOverrideResponse:
+        return cls(
+            id=orm.id,
+            exam_session_id=orm.exam_session_id,
+            requested_by_admin_id=orm.requested_by_admin_id,
+            department=orm.department,
+            reason=orm.reason,
+            status=orm.status.value if hasattr(orm.status, "value") else str(orm.status),
+            approved_by_admin_id=orm.approved_by_admin_id,
+            valid_from=orm.valid_from,
+            valid_until=orm.valid_until,
+            decided_at=orm.decided_at,
+            created_at=orm.created_at,
+        )
+
+
 class ProctorReviewCreatedResponse(BaseModel):
     """The 201 response from the review endpoint."""
 
@@ -496,6 +542,7 @@ class SealEvidenceApiResponse(BaseModel):
 __all__ = [
     "AccommodationExemptionResponse",
     "CreateExemptionRequest",
+    "CreateIdentityOverrideRequest",
     "CreatePolicyConfigRequest",
     "CreateProctorReviewRequest",
     "ErrorBody",
@@ -503,6 +550,7 @@ __all__ = [
     "EvidenceArtifactResponse",
     "FlagListResponse",
     "FlagReviewResponse",
+    "IdentityOverrideResponse",
     "PolicyConfigResponse",
     "ProctorReviewCreatedResponse",
     "ProctorReviewResponse",

@@ -49,6 +49,7 @@ def alembic_config() -> Config:
     if url is None:
         pytest.skip("INTEGRATION_DATABASE_URL is not set")
 
+    os.environ["DATABASE_URL"] = url
     root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
     config = Config(os.path.join(root, "alembic.ini"))
     config.set_main_option("script_location", os.path.join(root, "migrations"))
@@ -116,11 +117,11 @@ def integration_engine_session(db_session: Session) -> Generator[Session, None, 
 
 
 def _reset_database(url: str) -> None:
-    """Drop and recreate the target database.
+    """Drop and recreate the target database or wipe schema tables.
 
-    The URL is parsed with a small hand-rolled parser rather than pulling
-    in ``sqlalchemy.engine.url.make_url`` so the test fixture has no
-    hidden dependency on the rest of the package's import-time state.
+    First attempts admin database reconnection/recreation. If connecting to
+    the admin database fails (e.g. single-database container environments),
+    falls back to dropping all tables and types directly on the target engine.
     """
 
     from urllib.parse import urlparse
@@ -131,8 +132,8 @@ def _reset_database(url: str) -> None:
         raise RuntimeError("INTEGRATION_DATABASE_URL must include a database name")
 
     admin_url = url.replace(f"/{db_name}", "/postgres", 1)
-    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
     try:
+        admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
         with admin_engine.connect() as conn:
             conn.execute(
                 text(
@@ -143,8 +144,13 @@ def _reset_database(url: str) -> None:
             )
             conn.execute(text(f'DROP DATABASE IF EXISTS "{db_name}"'))
             conn.execute(text(f'CREATE DATABASE "{db_name}"'))
-    finally:
         admin_engine.dispose()
+    except Exception:
+        target_engine = create_engine(url, pool_pre_ping=True, future=True)
+        try:
+            _drop_schema(target_engine)
+        finally:
+            target_engine.dispose()
 
 
 def _drop_schema(engine: Engine) -> None:
@@ -158,6 +164,7 @@ def _drop_schema(engine: Engine) -> None:
         conn.execute(text("DROP FUNCTION IF EXISTS prevent_termination_record_mutation()"))
         # Let the rest cascade via the schema.
         for stmt in (
+            "DROP TABLE IF EXISTS alembic_version CASCADE",
             "DROP TABLE IF EXISTS proctor_reviews CASCADE",
             "DROP TABLE IF EXISTS termination_records CASCADE",
             "DROP TABLE IF EXISTS evidence_artifacts CASCADE",
@@ -170,14 +177,14 @@ def _drop_schema(engine: Engine) -> None:
             "DROP TABLE IF EXISTS policy_configs CASCADE",
             "DROP TABLE IF EXISTS participants CASCADE",
             "DROP TABLE IF EXISTS admin_users CASCADE",
-            "DROP TYPE IF EXISTS admin_role",
-            "DROP TYPE IF EXISTS reference_material_policy",
-            "DROP TYPE IF EXISTS session_status",
-            "DROP TYPE IF EXISTS telemetry_modality",
-            "DROP TYPE IF EXISTS flag_severity",
-            "DROP TYPE IF EXISTS flag_status",
-            "DROP TYPE IF EXISTS evidence_kind",
-            "DROP TYPE IF EXISTS delivery_status",
-            "DROP TYPE IF EXISTS review_decision",
+            "DROP TYPE IF EXISTS admin_role CASCADE",
+            "DROP TYPE IF EXISTS reference_material_policy CASCADE",
+            "DROP TYPE IF EXISTS session_status CASCADE",
+            "DROP TYPE IF EXISTS telemetry_modality CASCADE",
+            "DROP TYPE IF EXISTS flag_severity CASCADE",
+            "DROP TYPE IF EXISTS flag_status CASCADE",
+            "DROP TYPE IF EXISTS evidence_kind CASCADE",
+            "DROP TYPE IF EXISTS delivery_status CASCADE",
+            "DROP TYPE IF EXISTS review_decision CASCADE",
         ):
             conn.execute(text(stmt))

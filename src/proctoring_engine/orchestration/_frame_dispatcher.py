@@ -88,6 +88,9 @@ from proctoring_engine.inference.audio_vad import (
     AudioVadRunner,
     EVENT_SILENCE,
 )
+from proctoring_engine.inference.browser_events import (
+    classify_browser_event,
+)
 from proctoring_engine.inference.head_pose_gaze import (
     FaceLandmarkerRunner,
 )
@@ -706,15 +709,16 @@ class FrameDispatcher:
         message: TelemetryBrowserEvent,
         telemetry_event_id: uuid.UUID,
     ) -> None:
-        result = BrowserEventResult(
-            modality="browser",
-            event_type=message.payload.event_type,
-            confidence=ConfidenceInterval(
-                lower=1.0, score=1.0, upper=1.0,
-            ),
-            raw_value={},
-            detail=dict(message.payload.detail),
-        )
+        try:
+            result = classify_browser_event(
+                event_type=message.payload.event_type,
+                detail=dict(message.payload.detail),
+            )
+        except ValueError as exc:
+            logger.warning("Invalid browser event type: %s", exc)
+            self._error_count += 1
+            return
+
         decisions = self.aggregator.process_browser_event(
             result, telemetry_event_id=telemetry_event_id
         )

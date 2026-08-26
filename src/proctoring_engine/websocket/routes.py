@@ -391,6 +391,25 @@ def build_ws_router(deps: _WsRouterDeps) -> APIRouter:
             db.add(termination_record)
             db.commit()
 
+            # Structured observability log line at INFO level.
+            #
+            # This is the one explicit signal that fires when this path
+            # is hit.  It is distinguishable from generic termination
+            # messages because it carries the specific ``reason``
+            # field — searchable and filterable in the standard
+            # platform log aggregator.  No metrics or alerting
+            # pipeline is built here; that work is tracked under
+            # DEPLOYMENT.md §7 (observability), which remains
+            # unimplemented.
+            logger.warning(
+                "termination.session_blocked session_id=%s reason=%s "
+                "detail=%s",
+                str(exam_session.id),
+                "identity_backend_unavailable_no_override",
+                "identity backend could not be constructed and no "
+                "IdentityVerificationOverrideRequest covers this session",
+            )
+
             # Close WebSocket with specific close code
             await websocket.close(
                 code=WS_CLOSE_IDENTITY_BACKEND_UNAVAILABLE,

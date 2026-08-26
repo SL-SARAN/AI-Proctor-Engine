@@ -211,4 +211,37 @@ describe('WsClient', () => {
     // Should not throw
     lastCreatedWs!.simulateMessage('not valid json{');
   });
+
+  it('routes close code 4008 (identity backend unavailable) to handleTerminalDisconnect', () => {
+    // Regression test: the server-side identity verification handshake
+    // can close the WebSocket with code 4008 when the identity backend
+    // could not be constructed AND no valid override exists. The
+    // client must surface this through the existing 4000–4999
+    // terminal-disconnect path so the application's "session
+    // unavailable" page renders — the entire reason Option 1 was
+    // chosen over failing at LTI launch time.
+    //
+    // The 4000–4999 handling is shared (no per-code branching in
+    // ws-client.ts). This test confirms that 4008 in particular lands
+    // in handleTerminalDisconnect, NOT the reconnect path.
+    let disconnectReason = '';
+    const statuses: WSStatus[] = [];
+    const client = makeClient({
+      onStatusChange: (s: WSStatus) => statuses.push(s),
+      onDisconnect: (reason: string) => { disconnectReason = reason; },
+    });
+    client.connect();
+    lastCreatedWs!.simulateOpen();
+    lastCreatedWs!.simulateClose(4008, 'Identity backend unavailable');
+
+    // Status must be 'disconnected_terminal', not 'reconnecting'.
+    expect(client.getStatus()).toBe('disconnected_terminal');
+    expect(statuses).toContain('disconnected_terminal');
+    expect(statuses).not.toContain('reconnecting');
+
+    // The disconnect reason must include the close code so the UI
+    // layer can render the right page.
+    expect(disconnectReason).toContain('4008');
+    expect(disconnectReason).toContain('Identity backend unavailable');
+  });
 });
