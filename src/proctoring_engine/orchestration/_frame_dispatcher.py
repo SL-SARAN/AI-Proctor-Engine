@@ -177,6 +177,11 @@ class FrameDispatcherConfig:
     # provided).
     enrollment_embedding: list[float] | None = None
 
+    # Flag indicating identity backend was unavailable at session start
+    # but a valid override exists. When True, the dispatcher emits a
+    # mandatory-review flag for identity_check_unavailable.
+    identity_backend_unavailable: bool = False
+
 
 # ---------------------------------------------------------------------------
 # FrameDispatcher
@@ -330,6 +335,12 @@ class FrameDispatcher:
             self._config.context.exam_session_id,
         )
 
+        # Emit mandatory-review flag for identity backend unavailable at session start.
+        # This happens when the identity backend couldn't be constructed but a valid
+        # override exists - the session proceeds but requires proctor review.
+        if self._config.identity_backend_unavailable:
+            self._emit_identity_unavailable_flag()
+
     def stop(self, timeout: float = 5.0) -> None:
         """Stop the dispatch loop and wait for the thread to exit."""
         self._stop_event.set()
@@ -426,6 +437,43 @@ class FrameDispatcher:
             # reducing thread overhead.
             if not batch:
                 self._stop_event.wait(0.05)
+
+    def _emit_identity_unavailable_flag(self) -> None:
+        """Emit the identity_check_unavailable mandatory-review flag.
+
+        Called once at dispatcher start when the identity backend was
+        unavailable at session start but a valid override exists.
+        The session proceeds but requires proctor review.
+        """
+        from proctoring_engine.fusion.aggregator import (
+            RULE_IDENTITY_CHECK_UNAVAILABLE,
+        )
+        from proctoring_engine.fusion._types import FlagDecision
+        from proctoring_engine.inference._types import ConfidenceInterval
+        import uuid as _uuid
+
+        telemetry_event_id = _uuid.uuid4()
+
+        decision = FlagDecision(
+            rule_code=RULE_IDENTITY_CHECK_UNAVAILABLE,
+            severity="medium",
+            confidence=ConfidenceInterval(lower=1.0, score=1.0, upper=1.0),
+            triggered_termination=False,
+            detail={
+                "reason": (
+                    "identity backend unavailable at session start; "
+                    "override exists, mandatory review required"
+                ),
+            },
+            contributing_event_ids=(telemetry_event_id,),
+        )
+
+        # Push directly to the decision queue (same as _dispatch_event does)
+        self._decision_queue.put_nowait(decision)
+        logger.info(
+            "Emitted identity_check_unavailable flag for session %s.",
+            self._config.context.exam_session_id,
+        )
 
     def _dispatch_event(self, event: BufferedEvent) -> None:
         message = event.message

@@ -55,6 +55,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from proctoring_engine.lti.session_token import (
@@ -66,7 +67,7 @@ from proctoring_engine.lti.session_token import (
 )
 from proctoring_engine.lti.config import LtiSettings
 from proctoring_engine.lti.roles import AppRole
-from proctoring_engine.models import ExamSession, SessionStatus
+from proctoring_engine.models import DeliveryStatus, ExamSession, SessionStatus
 from proctoring_engine.websocket.client import (
     ClientMessageType,
     EnvelopeValidationError,
@@ -106,6 +107,9 @@ WS_CLOSE_PROTOCOL_ERROR = 4006
 
 WS_CLOSE_HEARTBEAT_TIMEOUT = 4007
 """No pong received within the grace window."""
+
+WS_CLOSE_IDENTITY_BACKEND_UNAVAILABLE = 4008
+"""Identity backend could not be constructed and no valid override exists."""
 
 
 # ---------------------------------------------------------------------------
@@ -311,11 +315,8 @@ def build_ws_router(deps: _WsRouterDeps) -> APIRouter:
             )
             return
 
-        # Transition PENDING → ACTIVE on first connect.
-        _activate_session(db, exam_session)
-
         # ------------------------------------------------------------------
-        # 3. Accept the WebSocket and start the message loop
+        # 3. Accept the WebSocket before attempting identity verification
         # ------------------------------------------------------------------
         # Echo the selected subprotocol back to the client (RFC 6455
         # §4.2.2 — the server may accept at most one of the client's
@@ -324,6 +325,78 @@ def build_ws_router(deps: _WsRouterDeps) -> APIRouter:
         # actually validated the token rather than silently accepting
         # the connection.
         await websocket.accept(subprotocol=_echo_subprotocol(websocket))
+
+        # ------------------------------------------------------------------
+        # 4. Attempt identity backend construction after WebSocket accept
+        # ------------------------------------------------------------------
+        from proctoring_engine.inference.identity_match import (
+            FaceRecognitionBackend,
+        )
+        from proctoring_engine.models import (
+            IdentityVerificationStatus,
+            IdentityVerificationOverrideRequest,
+            OverrideRequestStatus,
+        )
+        from sqlalchemy import select
+
+        identity_backend_available = False
+        valid_override_exists = False
+        identity_backend_unavailable = False  # Signal to dispatcher
+
+        try:
+            # Attempt to construct the identity backend
+            FaceRecognitionBackend()
+            identity_backend_available = True
+        except ImportError:
+            # face_recognition library not available
+            identity_backend_available = False
+            # Check for valid approved override
+            stmt = select(IdentityVerificationOverrideRequest).where(
+                IdentityVerificationOverrideRequest.exam_session_id == exam_session.id,
+                IdentityVerificationOverrideRequest.status == OverrideRequestStatus.APPROVED,
+                IdentityVerificationOverrideRequest.valid_from <= func.now(),
+                IdentityVerificationOverrideRequest.valid_until >= func.now(),
+            )
+            override_result = db.execute(stmt).scalar_one_or_none()
+            valid_override_exists = override_result is not None
+
+        # Handle the three cases based on identity backend availability and override status
+        if identity_backend_available:
+            # Case 1: Backend available - proceed normally
+            _activate_session(db, exam_session)
+            # Note: identity_verification_status will be set to PENDING_CHECK by default
+            # and updated to VERIFIED/FAILED_TO_MATCH by the aggregator later
+        elif valid_override_exists:
+            # Case 2: Backend unavailable but valid override exists
+            exam_session.identity_verification_status = IdentityVerificationStatus.UNAVAILABLE
+            _activate_session(db, exam_session)
+            # Signal to the dispatcher that identity backend is unavailable
+            # so it emits the mandatory-review flag
+            identity_backend_unavailable = True
+        else:
+            # Case 3: Backend unavailable and no valid override
+            # Transition session to TERMINATED with specific reason
+            exam_session.status = SessionStatus.TERMINATED
+            # We need to add a termination reason column or use existing mechanism
+            # Looking at TerminationRecord, it has a 'reason' field
+            # But we need to create a TerminationRecord entry
+            from proctoring_engine.models import TerminationRecord
+            termination_record = TerminationRecord(
+                exam_session_id=exam_session.id,
+                triggering_flag_id=None,  # No flag triggered this termination
+                reason="identity_backend_unavailable_no_override",
+                client_delivery_status=DeliveryStatus.SENT,  # We're about to send the close
+                lms_delivery_status=DeliveryStatus.SENT,
+            )
+            db.add(termination_record)
+            db.commit()
+
+            # Close WebSocket with specific close code
+            await websocket.close(
+                code=WS_CLOSE_IDENTITY_BACKEND_UNAVAILABLE,
+                reason="Identity backend unavailable and no valid override exists.",
+            )
+            return
 
         delivery = DeliveryService(
             ack_grace_seconds=deps.heartbeat_timeout_seconds,
@@ -378,6 +451,7 @@ def build_ws_router(deps: _WsRouterDeps) -> APIRouter:
         dispatcher_config = FrameDispatcherConfig(
             policy_snapshot=policy_snapshot,
             context=context,
+            identity_backend_unavailable=identity_backend_unavailable,
         )
         dispatcher = FrameDispatcher(
             config=dispatcher_config,

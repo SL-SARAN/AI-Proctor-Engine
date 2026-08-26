@@ -228,11 +228,59 @@ class AdminRole(str, enum.Enum):
     system-level configuration; a proctor-role launch routes to the review
     queue. The role stored here is the *highest* applicable tier at the
     time the admin was first seen.
+
+    ``HEAD`` is the per-department approver for the identity-verification
+    override flow (see ``docs/01-data-models-design.md`` §"New entity:
+    IdentityVerificationOverrideRequest" and the identity-match fail-closed
+    fix). A HEAD is *not* a higher privilege tier than ADMIN — they hold
+    a different authority (per-department approval rights, not system-level
+    configuration). The role is set explicitly via an admin-side tool;
+    LTI launches do not promote to HEAD.
     """
 
     INSTRUCTOR = "instructor"
     ADMIN = "admin"
     PROCTOR = "proctor"
+    HEAD = "head"
+
+
+class IdentityVerificationStatus(str, enum.Enum):
+    """The structural distinction between "we couldn't check" and "we
+    checked and it didn't match."
+
+    Set once per session at the PENDING → ACTIVE transition, when the
+    FaceRecognitionBackend construction attempt either succeeds (the
+    normal flow will run a real match later, so ``pending_check``) or
+    fails (and either an override exists — ``unavailable`` — or the
+    session is blocked entirely, in which case the row does not exist
+    in ``ACTIVE``). The ``failed_to_match`` value is reserved for a
+    real, completed comparison that scored below threshold (set by the
+    aggregator when ``RULE_IDENTITY_MISMATCH`` fires); the runner must
+    never write it as a side effect of construction failure.
+
+    The backfill default for sessions predating this column is
+    ``unavailable`` — see migration ``20260820_0003_identity_verification``
+    for the rationale.
+    """
+
+    PENDING_CHECK = "pending_check"
+    VERIFIED = "verified"
+    UNAVAILABLE = "unavailable"
+    FAILED_TO_MATCH = "failed_to_match"
+
+
+class OverrideRequestStatus(str, enum.Enum):
+    """Workflow status for an ``IdentityVerificationOverrideRequest``.
+
+    The ``expired`` status is **derived at read time** — if
+    ``status == pending`` and ``now > valid_until``, the request reads
+    as expired. No background sweeper is needed because the read path
+    performs the derivation.
+    """
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
 
 
 class Base(DeclarativeBase):
@@ -290,6 +338,7 @@ class AdminUser(Base):
     role: Mapped[AdminRole] = mapped_column(
         enum_type(AdminRole, "admin_role"), nullable=False
     )
+    department: Mapped[str | None] = mapped_column(String(512))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -307,6 +356,14 @@ class AdminUser(Base):
     reviewed_flags: Mapped[list["ProctorReview"]] = relationship(
         back_populates="reviewer_admin",
         foreign_keys="ProctorReview.reviewer_admin_id",
+    )
+    requested_overrides: Mapped[list["IdentityVerificationOverrideRequest"]] = relationship(
+        back_populates="requested_admin",
+        foreign_keys="[IdentityVerificationOverrideRequest.requested_by_admin_id]"
+    )
+    approved_overrides: Mapped[list["IdentityVerificationOverrideRequest"]] = relationship(
+        back_populates="approved_admin",
+        foreign_keys="[IdentityVerificationOverrideRequest.approved_by_admin_id]"
     )
 
 
@@ -593,6 +650,11 @@ class ExamSession(Base):
     accumulated_medium_score: Mapped[float] = mapped_column(
         Numeric(10, 4), nullable=False, default=0
     )
+    identity_verification_status: Mapped[IdentityVerificationStatus] = mapped_column(
+        enum_type(IdentityVerificationStatus, "identity_verification_status"),
+        nullable=False,
+        default=IdentityVerificationStatus.PENDING_CHECK,
+    )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -609,6 +671,9 @@ class ExamSession(Base):
     )
     termination_record: Mapped["TerminationRecord | None"] = relationship(
         back_populates="exam_session"
+    )
+    identity_overrides: Mapped[list["IdentityVerificationOverrideRequest"]] = relationship(
+        back_populates="exam_session", cascade="all, delete-orphan"
     )
 
     @validates("accumulated_medium_score")
@@ -979,8 +1044,8 @@ class TerminationRecord(Base):
     exam_session_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("exam_sessions.id", ondelete="RESTRICT"), nullable=False, unique=True
     )
-    triggering_flag_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("flags.id", ondelete="RESTRICT"), nullable=False
+    triggering_flag_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("flags.id", ondelete="RESTRICT"), nullable=True
     )
     reason: Mapped[str] = mapped_column(String(512), nullable=False)
     client_delivery_status: Mapped[DeliveryStatus] = mapped_column(
@@ -1039,6 +1104,68 @@ class ProctorReview(Base):
     reviewer_admin: Mapped["AdminUser | None"] = relationship(
         back_populates="reviewed_flags",
         foreign_keys=[reviewer_admin_id],
+    )
+
+
+class IdentityVerificationOverrideRequest(Base):
+    """Scoped, time-bounded, two-person-approved admin override.
+
+    Needed for the identity-match fail-closed default
+    (``docs/04-inference-modules-design.md`` §2): if the identity-match
+    backend can't construct, the exam session blocks entirely by default.
+    The override lifts the session block only — it never suppresses
+    ``ExamSession.identity_verification_status`` or the mandatory-review
+    ``Flag`` that still gets raised.
+
+    ``approved_by_admin_id`` must hold the ``HEAD`` role for the
+    ``department``, and must not equal ``requested_by_admin_id``
+    (enforced at the service layer).
+    """
+
+    __tablename__ = "identity_verification_override_requests"
+    __table_args__ = (
+        CheckConstraint(
+            "valid_until > valid_from",
+            name="ck_ident_override_valid_until_after_from",
+        ),
+        Index("ix_ident_override_status_dept", "status", "department"),
+        Index("ix_ident_override_exam_session", "exam_session_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    exam_session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("exam_sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    requested_by_admin_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"), nullable=False
+    )
+    department: Mapped[str] = mapped_column(String(512), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[OverrideRequestStatus] = mapped_column(
+        enum_type(OverrideRequestStatus, "override_request_status"),
+        nullable=False,
+        default=OverrideRequestStatus.PENDING,
+    )
+    approved_by_admin_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT")
+    )
+    valid_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    valid_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    exam_session: Mapped[ExamSession] = relationship(
+        back_populates="identity_overrides"
+    )
+    requested_admin: Mapped[AdminUser] = relationship(
+        back_populates="requested_overrides",
+        foreign_keys=[requested_by_admin_id],
+    )
+    approved_admin: Mapped[AdminUser | None] = relationship(
+        back_populates="approved_overrides",
+        foreign_keys=[approved_by_admin_id],
     )
 
 

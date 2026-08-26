@@ -71,6 +71,7 @@ RULE_OBJECT_DETECTED: Final[str] = "object_detected"
 RULE_BROWSER_EVENT: Final[str] = "browser_event"
 RULE_LIVENESS_CHECK_FAILED: Final[str] = "liveness_check_failed"
 RULE_IDENTITY_MISMATCH: Final[str] = "identity_mismatch"
+RULE_IDENTITY_CHECK_UNAVAILABLE: Final[str] = "identity_check_unavailable"
 RULE_AUDIO_ANOMALY: Final[str] = "audio_anomaly"
 
 # Severity constants (match FlagSeverity enum values)
@@ -217,11 +218,13 @@ class SessionAggregator:
         # ``liveness_confirmation_frames`` and the window is full of
         # spoof frames. A real frame resets this to 0.
         self._liveness_spoof_run_length: int = 0
+        self._identity_unavailable_fired: bool = False
 
         # --- Path 5: identity match ---
         self._identity_window: collections.deque[IdentityMatchResult] = collections.deque()
         self._identity_event_ids_window: collections.deque[uuid.UUID] = collections.deque()
         self._identity_mismatch_fired: bool = False
+        self._identity_unavailable_fired: bool = False
 
         # --- Path 6: audio ---
         # Audio anomalies just accumulate score, they don't have a multi-frame
@@ -651,6 +654,40 @@ class SessionAggregator:
                     "threshold": threshold,
                 },
                 contributing_event_ids=tuple(self._identity_event_ids_window),
+            )
+        ]
+
+    def process_identity_check_unavailable(
+        self,
+        *,
+        telemetry_event_id: uuid.UUID,
+    ) -> list[FlagDecision]:
+        """Emit a mandatory-review flag for identity-check unavailability.
+
+        Called when the identity backend could not be constructed at
+        WebSocket handshake time (e.g., ``face_recognition`` library
+        not installed) but a valid ``IdentityVerificationOverrideRequest``
+        exists. The session proceeds with ``identity_verification_status
+        = unavailable`` but a proctor must review the session.
+
+        This is a synthetic event — no inference result to aggregate.
+        Emits a single ``MEDIUM`` severity flag for mandatory review,
+        not auto-termination.
+        """
+        # Always emit exactly one flag when called.
+        return [
+            FlagDecision(
+                rule_code=RULE_IDENTITY_CHECK_UNAVAILABLE,
+                severity=_MEDIUM,
+                confidence=ConfidenceInterval(lower=1.0, score=1.0, upper=1.0),
+                triggered_termination=False,
+                detail={
+                    "reason": (
+                        "identity backend unavailable at session start; "
+                        "override exists, mandatory review required"
+                    ),
+                },
+                contributing_event_ids=(telemetry_event_id,),
             )
         ]
 
