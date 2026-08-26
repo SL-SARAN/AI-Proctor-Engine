@@ -102,6 +102,8 @@ priority, see turn N+9).
 > equivalent contract — don't assume the Python package applies
 > unmodified to the browser runtime.
 
+> **Server-side Python implementation note:** `FaceDetectorRunner` in `src/proctoring_engine/inference/face_presence.py` exists as an offline/manual-verification utility for Python testing and standalone frame inspection. It is intentionally not wired into `FrameDispatcher` because live face-presence telemetry arrives via client-side `TelemetryLight` events, while server-side heavy-frame face detection and landmarking are handled by `FaceLandmarkerRunner`.
+
 **Contract:** input is a single video frame; output is a list of detected faces, each with a bounding box and a detection confidence score.
 
 **Second-person logic (ties to the zero-tolerance rule):** a face count ≥ 2 for 2–3 consecutive frames (the noise-filter window from the spec, not a leniency window) is what actually constitutes a confirmed second-person `TelemetryEvent`. A single frame reading 2 faces is not enough on its own — it could be a reflection or a compression artifact reading as face-like, which is exactly the noise category the confirmation window exists to filter, not tolerance for a person being briefly present.

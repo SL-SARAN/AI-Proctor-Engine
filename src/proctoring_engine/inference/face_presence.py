@@ -67,6 +67,13 @@ _MODALITY: Final[str] = "face"
 class FaceDetectorRunner:
     """Stateless per-frame face detector backed by MediaPipe Tasks API.
 
+    **Architectural note on live dispatch:** This class is an offline/manual-verification
+    utility for backend testing and standalone Python frame inspection. It is intentionally
+    not wired into the live WebSocket dispatch path (``FrameDispatcher``). In production,
+    face-presence telemetry is produced client-side via ``TelemetryLight`` events, while
+    server-side heavy-frame face detection and landmarking are handled by
+    ``FaceLandmarkerRunner``.
+
     Parameters
     ----------
     model_bundle_path:
