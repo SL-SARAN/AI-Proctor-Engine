@@ -6,3 +6,6 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .claude/
+node_modules/
+client/dist/
+*.pt
