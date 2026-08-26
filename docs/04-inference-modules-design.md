@@ -177,6 +177,21 @@ Already fully speced in the original document (§3.1) — restating the module c
 
 **Output:** a per-frame `off_screen: bool` classification, which Stage 2 (in the fusion engine, not this module) aggregates into `GazeAwayEvent`s. This module's responsibility ends at the per-frame classification — the event-aggregation and escalation-ladder logic belongs to the fusion engine, not here, to keep this module a stateless per-frame classifier rather than something that has to track rolling windows itself.
 
+> **Architectural exception — CV sensor geometry thresholds vs PolicyConfig:**
+> Per-frame computer vision geometric calibration parameters (`high_yaw_bypass_deg`,
+> `yaw_threshold_deg`, `iris_offset_threshold`, `ear_blink_threshold`) live as constructor
+> arguments on `FaceLandmarkerRunner` (with calibrated defaults 45.0°, 30.0°, 0.35, 0.20), rather
+> than dynamic columns on `PolicyConfig`.
+>
+> *Rationale:* `PolicyConfig` models institutional exam governance rules (such as
+> `gaze_warning_limit`, `gaze_termination_limit`, `gaze_min_duration_ms`, `gaze_window_seconds`)
+> which vary across universities, courses, and exam formats without code redeployment.
+> In contrast, CV geometric parameters are model-intrinsic sensor calibration constants tied
+> directly to the 3D perspective projection model (`solvePnP` canonical face coordinates) and
+> MediaPipe FaceMesh eye/iris landmark geometry. Recalibration of these constants occurs only
+> alongside vision model upgrades, validation benchmarks, or camera pipeline refactors, where a
+> code release cycle is expected and desired for regression testing.
+
 ---
 
 ## 4. Object detection
