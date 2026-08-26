@@ -237,3 +237,14 @@ def test_identity_override_full_loop(test_setup):
     override_row = db.execute(stmt).scalar_one_or_none()
     assert override_row is not None
     assert override_row.status == OverrideRequestStatus.APPROVED
+
+    # 6. Assert WS handshake check evaluates valid_override_exists == True
+    from sqlalchemy import func
+    ws_check_stmt = select(IdentityVerificationOverrideRequest).where(
+        IdentityVerificationOverrideRequest.exam_session_id == session.id,
+        IdentityVerificationOverrideRequest.status == OverrideRequestStatus.APPROVED,
+        IdentityVerificationOverrideRequest.valid_from <= func.now(),
+        IdentityVerificationOverrideRequest.valid_until >= func.now(),
+    )
+    valid_override_exists = db.execute(ws_check_stmt).scalar_one_or_none() is not None
+    assert valid_override_exists is True
