@@ -65,6 +65,7 @@ from proctoring_engine.evidence._protocol import EvidenceStore
 from proctoring_engine.evidence.service import SealEvidenceRequest
 from proctoring_engine.lti.config import LtiSettings
 from proctoring_engine.models import (
+    AdminRole,
     AdminUser,
     ExamSession,
     OverrideRequestStatus,
@@ -72,6 +73,7 @@ from proctoring_engine.models import (
     TerminationRecord,
 )
 from proctoring_engine.orchestration._admin_service import (
+    AdminUserNotFoundError,
     ExemptionValidationError,
     FlagNotFoundError,
     OverrideNotFoundError,
@@ -89,6 +91,7 @@ from proctoring_engine.orchestration._admin_service import (
     list_policy_configs,
     record_proctor_review,
     reject_identity_override_request,
+    update_admin_user_role,
 )
 from proctoring_engine.orchestration._auth import (
     parse_bearer,
@@ -111,6 +114,7 @@ from proctoring_engine.orchestration._flag_persistence import (
 )
 from proctoring_engine.orchestration._schemas import (
     AccommodationExemptionResponse,
+    AdminUserResponse,
     CreateExemptionRequest,
     CreateIdentityOverrideRequest,
     CreatePolicyConfigRequest,
@@ -126,6 +130,7 @@ from proctoring_engine.orchestration._schemas import (
     SessionStatusResponse,
     TerminateRequest,
     TerminateResponse,
+    UpdateAdminRoleRequest,
 )
 from proctoring_engine.orchestration._settings import OrchestrationSettings
 from proctoring_engine.orchestration._state_machine import (
@@ -594,7 +599,42 @@ def build_orchestration_router(deps: _OrchestrationDeps) -> APIRouter:
             )
         except OverrideNotFoundError as exc:
             raise _http_error("identity_override_not_found", str(exc)) from exc
-        return IdentityOverrideResponse.from_orm(override)
+    # ------------------------------------------------------------------
+    # /admin/users/{admin_user_id}/role
+    # ------------------------------------------------------------------
+
+    @router.post(
+        "/admin/users/{admin_user_id}/role",
+        response_model=AdminUserResponse,
+        status_code=status.HTTP_200_OK,
+    )
+    def post_update_admin_role(
+        admin_user_id: _uuid.UUID = Path(...),
+        request: UpdateAdminRoleRequest = Body(...),
+        admin: AdminUser = Depends(admin_role_dep),
+    ) -> AdminUserResponse:
+        try:
+            target_role = AdminRole(request.role)
+        except ValueError as exc:
+            raise _http_error("role_unauthorized", f"Invalid role: {request.role}") from exc
+
+        try:
+            updated_user = update_admin_user_role(
+                deps.get_db(),
+                target_admin_id=admin_user_id,
+                new_role=target_role,
+                caller_admin=admin,
+            )
+        except AdminUserNotFoundError as exc:
+            raise _http_error("admin_user_not_found", str(exc)) from exc
+        except SelfApprovalOrRoleError as exc:
+            code = (
+                "self_approval_rejected"
+                if ("self" in str(exc).lower() or "own" in str(exc).lower())
+                else "role_unauthorized"
+            )
+            raise _http_error(code, str(exc)) from exc
+        return AdminUserResponse.from_orm(updated_user)
 
     # ------------------------------------------------------------------
     # /sessions/{session_id}/flags/{flag_id}/evidence  (deferred §7 gap)

@@ -1393,6 +1393,42 @@ class TestProctorReviewEndpoint:
         db.refresh(session)
         assert session.status == SessionStatus.ACTIVE
 
+    def test_overturned_review_reinstates_terminated_session(
+        self,
+        app_factory: Callable[[], tuple[FastAPI, Session]],
+        lti_settings: LtiSettings,
+    ) -> None:
+        """Fast-track undo: overturned review on a TERMINATED session transitions to REINSTATED."""
+        app, db = app_factory()
+        participant, admin = _make_admin_participant_pair(
+            db, role=AdminRole.PROCTOR, lms_user_reference="pr_reinstate"
+        )
+        session = _make_exam_session(
+            db,
+            participant=participant,
+            policy=_make_minimal_policy(db),
+            status=SessionStatus.TERMINATED,
+        )
+        flag = _make_flag(
+            db, exam_session=session, policy=session.policy_config
+        )
+        token = _admin_token(
+            lti_settings, admin_participant=participant, session_id=session.id,
+            role=AppRole.PROCTOR,
+        )
+        client = TestClient(app)
+        r = client.post(
+            f"/admin/flags/{flag.id}/review",
+            json={"decision": "overturned", "notes": "fast-track undo accidental trigger"},
+            headers={"Authorization": "Bearer " + token},
+        )
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["decision"] == "overturned"
+        assert body["session_status"] == "reinstated"
+        db.refresh(session)
+        assert session.status == SessionStatus.REINSTATED
+
     def test_unknown_flag_returns_404(
         self,
         app_factory: Callable[[], tuple[FastAPI, Session]],
@@ -1417,6 +1453,92 @@ class TestProctorReviewEndpoint:
         )
         assert r.status_code == 404
         assert r.json()["detail"]["code"] == "flag_not_found"
+
+
+class TestUpdateAdminRoleEndpoint:
+    def test_admin_can_promote_target_to_head(
+        self,
+        app_factory: Callable[[], tuple[FastAPI, Session]],
+        lti_settings: LtiSettings,
+    ) -> None:
+        app, db = app_factory()
+        part_admin, admin_caller = _make_admin_participant_pair(
+            db, role=AdminRole.ADMIN, lms_user_reference="admin_super"
+        )
+        part_target, target_admin = _make_admin_participant_pair(
+            db, role=AdminRole.INSTRUCTOR, lms_user_reference="target_user"
+        )
+        session = _make_exam_session(
+            db, participant=part_admin, policy=_make_minimal_policy(db)
+        )
+        token = _admin_token(
+            lti_settings, admin_participant=part_admin, session_id=session.id,
+            role=AppRole.ADMIN,
+        )
+        client = TestClient(app)
+        r = client.post(
+            f"/admin/users/{target_admin.id}/role",
+            json={"role": "head"},
+            headers={"Authorization": "Bearer " + token},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["role"] == "head"
+        db.refresh(target_admin)
+        assert target_admin.role == AdminRole.HEAD
+
+    def test_self_promotion_rejected(
+        self,
+        app_factory: Callable[[], tuple[FastAPI, Session]],
+        lti_settings: LtiSettings,
+    ) -> None:
+        app, db = app_factory()
+        part_admin, admin_caller = _make_admin_participant_pair(
+            db, role=AdminRole.ADMIN, lms_user_reference="admin_self"
+        )
+        session = _make_exam_session(
+            db, participant=part_admin, policy=_make_minimal_policy(db)
+        )
+        token = _admin_token(
+            lti_settings, admin_participant=part_admin, session_id=session.id,
+            role=AppRole.ADMIN,
+        )
+        client = TestClient(app)
+        r = client.post(
+            f"/admin/users/{admin_caller.id}/role",
+            json={"role": "head"},
+            headers={"Authorization": "Bearer " + token},
+        )
+        assert r.status_code == 403
+        assert r.json()["detail"]["code"] == "self_approval_rejected"
+
+    def test_proctor_cannot_promote_role(
+        self,
+        app_factory: Callable[[], tuple[FastAPI, Session]],
+        lti_settings: LtiSettings,
+    ) -> None:
+        app, db = app_factory()
+        part_proctor, admin_proctor = _make_admin_participant_pair(
+            db, role=AdminRole.PROCTOR, lms_user_reference="proctor_unauth"
+        )
+        part_target, target_admin = _make_admin_participant_pair(
+            db, role=AdminRole.INSTRUCTOR, lms_user_reference="target_user2"
+        )
+        session = _make_exam_session(
+            db, participant=part_proctor, policy=_make_minimal_policy(db)
+        )
+        token = _admin_token(
+            lti_settings, admin_participant=part_proctor, session_id=session.id,
+            role=AppRole.PROCTOR,
+        )
+        client = TestClient(app)
+        r = client.post(
+            f"/admin/users/{target_admin.id}/role",
+            json={"role": "head"},
+            headers={"Authorization": "Bearer " + token},
+        )
+        assert r.status_code == 403
+        assert r.json()["detail"]["code"] == "role_unauthorized"
 
 
 # ---------------------------------------------------------------------------

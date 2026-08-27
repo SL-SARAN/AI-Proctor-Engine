@@ -104,6 +104,10 @@ class OverrideNotFoundError(AdminServiceError):
     """Raised when the referenced identity override request does not exist."""
 
 
+class AdminUserNotFoundError(AdminServiceError):
+    """Raised when the referenced admin user does not exist."""
+
+
 class SelfApprovalOrRoleError(AdminServiceError):
     """Raised when an override approval fails role or self-approval guards."""
 
@@ -556,6 +560,13 @@ def record_proctor_review(
             raise ReviewTransitionError(str(exc)) from exc
         session.status = SessionStatus.UNDER_REVIEW
         new_status = session.status
+    elif decision_value == "overturned" and session.status == SessionStatus.TERMINATED:
+        try:
+            assert_transition(session.status, SessionStatus.REINSTATED)
+        except InvalidSessionTransition as exc:
+            raise ReviewTransitionError(str(exc)) from exc
+        session.status = SessionStatus.REINSTATED
+        new_status = session.status
 
     db.commit()
     db.refresh(review)
@@ -670,8 +681,37 @@ def reject_identity_override_request(
     return override
 
 
+def update_admin_user_role(
+    db: Session,
+    target_admin_id: uuid.UUID,
+    new_role: AdminRole,
+    caller_admin: AdminUser,
+) -> AdminUser:
+    """Promote or update an AdminUser role out-of-band.
+
+    Guards:
+    1. Caller must hold ADMIN or HEAD role.
+    2. Caller cannot modify their own role (self-promotion / demotion rejected).
+    """
+    if caller_admin.role not in (AdminRole.ADMIN, AdminRole.HEAD):
+        raise SelfApprovalOrRoleError("Only ADMIN or HEAD role may update admin roles.")
+
+    if caller_admin.id == target_admin_id:
+        raise SelfApprovalOrRoleError("Cannot modify your own admin role.")
+
+    target = db.get(AdminUser, target_admin_id)
+    if target is None:
+        raise AdminUserNotFoundError(f"AdminUser '{target_admin_id}' not found.")
+
+    target.role = new_role
+    db.commit()
+    db.refresh(target)
+    return target
+
+
 __all__ = [
     "AdminServiceError",
+    "AdminUserNotFoundError",
     "ExemptionValidationError",
     "FlagNotFoundError",
     "OverrideNotFoundError",
@@ -691,4 +731,5 @@ __all__ = [
     "list_policy_configs",
     "record_proctor_review",
     "reject_identity_override_request",
+    "update_admin_user_role",
 ]

@@ -965,6 +965,25 @@ class TestWebSocketSession:
         # Verify it stayed ACTIVE (not re-set to PENDING or changed).
         assert reloaded.status == SessionStatus.ACTIVE
 
+    def test_missing_consent_recorded_at_rejected(
+        self, ws_client, settings, participant, exam_session, test_db
+    ):
+        """A session with consent_recorded_at=None must be rejected at WS handshake."""
+        from starlette.websockets import WebSocketDisconnect
+        exam_session.consent_recorded_at = None
+        test_db.commit()
+        token = issue_session_token(
+            participant.id,
+            exam_session.id,
+            AppRole.LEARNER,
+            settings=settings,
+            now=NOW,
+        )
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(token)]):
+                pass
+        assert exc_info.value.code == 4009
+
 
 class TestWebSocketMessageDispatch:
     """Message ingestion over the WebSocket."""
@@ -1173,6 +1192,8 @@ class TestIdentityVerificationAtHandshake:
             exam_reference="exam-1",
             attempt_reference="attempt-1",
             status=SessionStatus.PENDING,
+            consent_recorded_at=NOW,
+            started_at=NOW,
             identity_verification_status=IdentityVerificationStatus.PENDING_CHECK,
         )
         test_db.add(session)

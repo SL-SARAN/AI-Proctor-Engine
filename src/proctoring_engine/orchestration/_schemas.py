@@ -529,6 +529,38 @@ class SealEvidenceApiResponse(BaseModel):
     media_type: str
 
 
+class UpdateAdminRoleRequest(BaseModel):
+    """Body to update an AdminUser role."""
+
+    model_config = _CLOSED_CONFIG
+
+    role: Literal["instructor", "proctor", "admin", "head"]
+
+
+class AdminUserResponse(BaseModel):
+    """Response model for AdminUser."""
+
+    model_config = _CLOSED_CONFIG
+
+    id: uuid.UUID
+    lti_issuer: str
+    lms_user_reference: str
+    display_name: str | None = None
+    role: str
+
+    @classmethod
+    def from_orm(cls, orm: Any) -> "AdminUserResponse":
+        return cls(
+            id=orm.id,
+            lti_issuer=orm.lti_issuer,
+            lms_user_reference=orm.lms_user_reference,
+            display_name=orm.display_name,
+            role=orm.role.value if hasattr(orm.role, "value") else str(orm.role),
+        )
+
+
+
+
 # ---------------------------------------------------------------------------
 # Constants — the closed set of error codes the orchestration layer
 # surfaces.  Mirrored here (and in :mod:`proctoring_engine.orchestration._routes`)
@@ -541,6 +573,7 @@ class SealEvidenceApiResponse(BaseModel):
 # round-trip a string in a request body without importing the ORM enum.
 __all__ = [
     "AccommodationExemptionResponse",
+    "AdminUserResponse",
     "CreateExemptionRequest",
     "CreateIdentityOverrideRequest",
     "CreatePolicyConfigRequest",
@@ -554,10 +587,11 @@ __all__ = [
     "PolicyConfigResponse",
     "ProctorReviewCreatedResponse",
     "ProctorReviewResponse",
+    "ReferenceMaterialPolicy",
     "SealEvidenceApiRequest",
     "SealEvidenceApiResponse",
     "SessionStatusResponse",
     "TerminateRequest",
     "TerminateResponse",
-    "ReferenceMaterialPolicy",  # re-exported for callers
+    "UpdateAdminRoleRequest",
 ]

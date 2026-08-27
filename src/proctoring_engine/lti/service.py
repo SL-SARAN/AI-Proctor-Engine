@@ -297,6 +297,7 @@ _ADMIN_ROLE_PRIVILEGE = {
     AdminRole.INSTRUCTOR: 1,
     AdminRole.PROCTOR: 2,
     AdminRole.ADMIN: 3,
+    AdminRole.HEAD: 4,
 }
 
 

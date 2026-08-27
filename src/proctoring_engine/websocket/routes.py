@@ -111,6 +111,9 @@ WS_CLOSE_HEARTBEAT_TIMEOUT = 4007
 WS_CLOSE_IDENTITY_BACKEND_UNAVAILABLE = 4008
 """Identity backend could not be constructed and no valid override exists."""
 
+WS_CLOSE_CONSENT_REQUIRED = 4009
+"""Consent has not been recorded for this session."""
+
 
 # ---------------------------------------------------------------------------
 # Router dependencies (test-injectable)
@@ -312,6 +315,13 @@ def build_ws_router(deps: _WsRouterDeps) -> APIRouter:
             await websocket.close(
                 code=WS_CLOSE_SESSION_INVALID,
                 reason="Session not found or in terminal state.",
+            )
+            return
+
+        if exam_session.consent_recorded_at is None:
+            await websocket.close(
+                code=WS_CLOSE_CONSENT_REQUIRED,
+                reason="Consent has not been recorded for this session.",
             )
             return
 
