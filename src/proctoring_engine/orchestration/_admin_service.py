@@ -47,6 +47,7 @@ from sqlalchemy.orm import Session
 from proctoring_engine.models import (
     AccommodationExemption,
     AdminRole,
+    AdminRoleAudit,
     AdminUser,
     ExamSession,
     Flag,
@@ -686,24 +687,41 @@ def update_admin_user_role(
     target_admin_id: uuid.UUID,
     new_role: AdminRole,
     caller_admin: AdminUser,
+    *,
+    reason: str | None = None,
 ) -> AdminUser:
-    """Promote or update an AdminUser role out-of-band.
+    """Promote or update an AdminUser role out-of-band with audit logging.
 
     Guards:
-    1. Caller must hold ADMIN or HEAD role.
-    2. Caller cannot modify their own role (self-promotion / demotion rejected).
+    1. Caller cannot modify their own role (self-promotion / demotion rejected).
+    2. Promotion to HEAD specifically requires caller to hold HEAD role.
+    3. Management of non-HEAD roles requires caller to hold ADMIN or HEAD role.
     """
-    if caller_admin.role not in (AdminRole.ADMIN, AdminRole.HEAD):
-        raise SelfApprovalOrRoleError("Only ADMIN or HEAD role may update admin roles.")
-
     if caller_admin.id == target_admin_id:
         raise SelfApprovalOrRoleError("Cannot modify your own admin role.")
+
+    if new_role == AdminRole.HEAD and caller_admin.role != AdminRole.HEAD:
+        raise SelfApprovalOrRoleError("HEAD role required to grant HEAD role.")
+
+    if caller_admin.role not in (AdminRole.ADMIN, AdminRole.HEAD):
+        raise SelfApprovalOrRoleError("ADMIN or HEAD role required to update admin roles.")
 
     target = db.get(AdminUser, target_admin_id)
     if target is None:
         raise AdminUserNotFoundError(f"AdminUser '{target_admin_id}' not found.")
 
+    previous_role = target.role
     target.role = new_role
+
+    audit = AdminRoleAudit(
+        target_admin_id=target_admin_id,
+        changed_by_admin_id=caller_admin.id,
+        previous_role=previous_role,
+        new_role=new_role,
+        reason=reason,
+    )
+    db.add(audit)
+
     db.commit()
     db.refresh(target)
     return target

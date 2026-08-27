@@ -535,6 +535,7 @@ class UpdateAdminRoleRequest(BaseModel):
     model_config = _CLOSED_CONFIG
 
     role: Literal["instructor", "proctor", "admin", "head"]
+    reason: str | None = None
 
 
 class AdminUserResponse(BaseModel):

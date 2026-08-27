@@ -367,6 +367,45 @@ class AdminUser(Base):
     )
 
 
+class AdminRoleAudit(Base):
+    """Immutable audit record for admin role promotions and changes.
+
+    Tracks privilege escalations and role updates (e.g. promoting to HEAD)
+    recording the actor, the target user, previous/new roles, reason, and timestamp.
+    """
+
+    __tablename__ = "admin_role_audits"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    target_admin_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    changed_by_admin_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("admin_users.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    previous_role: Mapped[AdminRole] = mapped_column(
+        enum_type(AdminRole, "admin_role"), nullable=False
+    )
+    new_role: Mapped[AdminRole] = mapped_column(
+        enum_type(AdminRole, "admin_role"), nullable=False
+    )
+    reason: Mapped[str | None] = mapped_column(String(1024))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    target_admin: Mapped["AdminUser"] = relationship(
+        foreign_keys=[target_admin_id]
+    )
+    changed_by_admin: Mapped["AdminUser"] = relationship(
+        foreign_keys=[changed_by_admin_id]
+    )
+
+
 class Participant(Base):
     """A test-taker identified by a stable LMS subject within an issuer.
 

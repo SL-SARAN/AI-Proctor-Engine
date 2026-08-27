@@ -624,6 +624,7 @@ def build_orchestration_router(deps: _OrchestrationDeps) -> APIRouter:
                 target_admin_id=admin_user_id,
                 new_role=target_role,
                 caller_admin=admin,
+                reason=request.reason,
             )
         except AdminUserNotFoundError as exc:
             raise _http_error("admin_user_not_found", str(exc)) from exc

@@ -1456,17 +1456,18 @@ class TestProctorReviewEndpoint:
 
 
 class TestUpdateAdminRoleEndpoint:
-    def test_admin_can_promote_target_to_head(
+    def test_admin_cannot_promote_target_to_head(
         self,
         app_factory: Callable[[], tuple[FastAPI, Session]],
         lti_settings: LtiSettings,
     ) -> None:
+        """A plain ADMIN account cannot grant HEAD role (must be rejected)."""
         app, db = app_factory()
         part_admin, admin_caller = _make_admin_participant_pair(
-            db, role=AdminRole.ADMIN, lms_user_reference="admin_super"
+            db, role=AdminRole.ADMIN, lms_user_reference="admin_plain"
         )
         part_target, target_admin = _make_admin_participant_pair(
-            db, role=AdminRole.INSTRUCTOR, lms_user_reference="target_user"
+            db, role=AdminRole.INSTRUCTOR, lms_user_reference="target_user_head"
         )
         session = _make_exam_session(
             db, participant=part_admin, policy=_make_minimal_policy(db)
@@ -1478,7 +1479,41 @@ class TestUpdateAdminRoleEndpoint:
         client = TestClient(app)
         r = client.post(
             f"/admin/users/{target_admin.id}/role",
-            json={"role": "head"},
+            json={"role": "head", "reason": "Attempting unilateral HEAD grant"},
+            headers={"Authorization": "Bearer " + token},
+        )
+        assert r.status_code == 403
+        assert r.json()["detail"]["code"] == "role_unauthorized"
+        # Confirm target role is untouched
+        db.refresh(target_admin)
+        assert target_admin.role == AdminRole.INSTRUCTOR
+
+    def test_head_can_promote_target_to_head_and_audits(
+        self,
+        app_factory: Callable[[], tuple[FastAPI, Session]],
+        lti_settings: LtiSettings,
+    ) -> None:
+        """A HEAD account can promote another admin to HEAD, creating an audit record."""
+        from proctoring_engine.models import AdminRoleAudit
+
+        app, db = app_factory()
+        part_head, head_caller = _make_admin_participant_pair(
+            db, role=AdminRole.HEAD, lms_user_reference="head_dept"
+        )
+        part_target, target_admin = _make_admin_participant_pair(
+            db, role=AdminRole.ADMIN, lms_user_reference="target_deputy"
+        )
+        session = _make_exam_session(
+            db, participant=part_head, policy=_make_minimal_policy(db)
+        )
+        token = _admin_token(
+            lti_settings, admin_participant=part_head, session_id=session.id,
+            role=AppRole.ADMIN,
+        )
+        client = TestClient(app)
+        r = client.post(
+            f"/admin/users/{target_admin.id}/role",
+            json={"role": "head", "reason": "Appointing deputy department head"},
             headers={"Authorization": "Bearer " + token},
         )
         assert r.status_code == 200, r.text
@@ -1486,6 +1521,59 @@ class TestUpdateAdminRoleEndpoint:
         assert body["role"] == "head"
         db.refresh(target_admin)
         assert target_admin.role == AdminRole.HEAD
+
+        # Verify audit trail record in database
+        audit = db.execute(
+            select(AdminRoleAudit).where(AdminRoleAudit.target_admin_id == target_admin.id)
+        ).scalar_one_or_none()
+        assert audit is not None
+        assert audit.changed_by_admin_id == head_caller.id
+        assert audit.previous_role == AdminRole.ADMIN
+        assert audit.new_role == AdminRole.HEAD
+        assert audit.reason == "Appointing deputy department head"
+
+    def test_admin_can_manage_non_head_roles_and_audits(
+        self,
+        app_factory: Callable[[], tuple[FastAPI, Session]],
+        lti_settings: LtiSettings,
+    ) -> None:
+        """A plain ADMIN can promote/change non-HEAD roles (e.g. INSTRUCTOR -> PROCTOR)."""
+        from proctoring_engine.models import AdminRoleAudit
+
+        app, db = app_factory()
+        part_admin, admin_caller = _make_admin_participant_pair(
+            db, role=AdminRole.ADMIN, lms_user_reference="admin_mgr"
+        )
+        part_target, target_admin = _make_admin_participant_pair(
+            db, role=AdminRole.INSTRUCTOR, lms_user_reference="instructor_user"
+        )
+        session = _make_exam_session(
+            db, participant=part_admin, policy=_make_minimal_policy(db)
+        )
+        token = _admin_token(
+            lti_settings, admin_participant=part_admin, session_id=session.id,
+            role=AppRole.ADMIN,
+        )
+        client = TestClient(app)
+        r = client.post(
+            f"/admin/users/{target_admin.id}/role",
+            json={"role": "proctor", "reason": "Assigning proctor duties for exam"},
+            headers={"Authorization": "Bearer " + token},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["role"] == "proctor"
+        db.refresh(target_admin)
+        assert target_admin.role == AdminRole.PROCTOR
+
+        # Verify audit trail
+        audit = db.execute(
+            select(AdminRoleAudit).where(AdminRoleAudit.target_admin_id == target_admin.id)
+        ).scalar_one_or_none()
+        assert audit is not None
+        assert audit.changed_by_admin_id == admin_caller.id
+        assert audit.previous_role == AdminRole.INSTRUCTOR
+        assert audit.new_role == AdminRole.PROCTOR
+        assert audit.reason == "Assigning proctor duties for exam"
 
     def test_self_promotion_rejected(
         self,
@@ -1539,6 +1627,7 @@ class TestUpdateAdminRoleEndpoint:
         )
         assert r.status_code == 403
         assert r.json()["detail"]["code"] == "role_unauthorized"
+
 
 
 # ---------------------------------------------------------------------------

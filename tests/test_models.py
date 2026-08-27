@@ -866,3 +866,45 @@ def test_admin_user_fk_rejects_nonexistent(db_session: Session) -> None:
     with pytest.raises(IntegrityError):
         db_session.commit()
     db_session.rollback()
+
+
+# ----------------------------------------------------------------------
+# AdminRoleAudit: round-trip and FK integrity
+# ----------------------------------------------------------------------
+
+
+def test_admin_role_audit_round_trip(db_session: Session) -> None:
+    """AdminRoleAudit persists target, actor, roles, reason and relationships."""
+    from proctoring_engine.models import AdminRoleAudit
+
+    caller = AdminUser(
+        lti_issuer="https://lms.example.edu",
+        lms_user_reference=f"head-{uuid.uuid4()}",
+        role=AdminRole.HEAD,
+    )
+    target = AdminUser(
+        lti_issuer="https://lms.example.edu",
+        lms_user_reference=f"target-{uuid.uuid4()}",
+        role=AdminRole.ADMIN,
+    )
+    db_session.add_all([caller, target])
+    db_session.commit()
+
+    audit = AdminRoleAudit(
+        target_admin_id=target.id,
+        changed_by_admin_id=caller.id,
+        previous_role=AdminRole.ADMIN,
+        new_role=AdminRole.HEAD,
+        reason="Promoted to department head",
+    )
+    db_session.add(audit)
+    db_session.commit()
+
+    db_session.refresh(audit)
+    assert audit.target_admin_id == target.id
+    assert audit.changed_by_admin_id == caller.id
+    assert audit.previous_role == AdminRole.ADMIN
+    assert audit.new_role == AdminRole.HEAD
+    assert audit.reason == "Promoted to department head"
+    assert audit.target_admin.id == target.id
+    assert audit.changed_by_admin.id == caller.id
