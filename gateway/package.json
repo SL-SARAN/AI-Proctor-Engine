@@ -1,0 +1,23 @@
+{
+  "name": "proctoring-engine-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Durable Objects edge WebSocket gateway for AI Proctoring Engine. Provides Anycast termination, session-affinity routing, and bidirectional streaming to origin.",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "node node_modules/wrangler/bin/wrangler.js dev",
+    "build": "node node_modules/wrangler/bin/wrangler.js deploy --dry-run",
+    "deploy": "node node_modules/wrangler/bin/wrangler.js deploy",
+    "test": "node node_modules/vitest/vitest.mjs run",
+    "typecheck": "node node_modules/typescript/bin/tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241127.0",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0",
+    "wrangler": "^3.91.0"
+  }
+}

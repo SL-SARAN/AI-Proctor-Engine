@@ -1,0 +1,24 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "proctoring-engine-gateway",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "ORIGIN_WS_URL": "ws://localhost:8000/ws"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SESSION_GATEWAY",
+        "class_name": "SessionGatewayDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_classes": ["SessionGatewayDO"]
+    }
+  ]
+}

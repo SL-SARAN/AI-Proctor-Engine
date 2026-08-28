@@ -8,4 +8,7 @@ __pycache__/
 .claude/
 node_modules/
 client/dist/
+gateway/node_modules/
+gateway/dist/
+gateway/.wrangler/
 *.pt
