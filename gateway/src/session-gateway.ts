@@ -31,126 +31,120 @@ export class SessionGatewayDO {
     const subprotocolHeader = request.headers.get("Sec-WebSocket-Protocol");
     const originBaseUrl = this.env.ORIGIN_WS_URL || "ws://localhost:8000/ws";
 
-    // Setup client-side WebSocket pair
+    // 1. Prepare outbound request to origin FastAPI backend
+    const originHeaders: Record<string, string> = {
+      Upgrade: "websocket",
+      Connection: "Upgrade",
+    };
+
+    if (subprotocolHeader) {
+      originHeaders["Sec-WebSocket-Protocol"] = subprotocolHeader;
+    }
+
+    const clientIp = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for");
+    if (clientIp) {
+      originHeaders["X-Forwarded-For"] = clientIp;
+    }
+
+    const originReq = new Request(originBaseUrl, {
+      headers: originHeaders,
+    });
+
+    let originResponse: Response;
+    try {
+      originResponse = await fetch(originReq);
+    } catch (err) {
+      console.error("Failed to reach origin WebSocket backend:", err);
+      return new Response("Origin backend unavailable", { status: 502 });
+    }
+
+    // 2. If origin rejected the upgrade (e.g. non-101 HTTP status), pass the origin response directly
+    const originWs = originResponse.webSocket;
+    if (originResponse.status !== 101 || !originWs) {
+      return new Response(originResponse.body, {
+        status: originResponse.status,
+        headers: originResponse.headers,
+      });
+    }
+
+    // 3. Origin accepted! Create client WebSocket pair and bind 1:1 bidirectional forwarding
     const webSocketPair = new WebSocketPair();
     const [clientSocket, serverSocket] = Object.values(webSocketPair);
 
-    // Accept the server end of the pair inside the Durable Object
     serverSocket.accept();
+    originWs.accept();
 
-    // Establish outbound WebSocket to the FastAPI backend
-    try {
-      const originHeaders: Record<string, string> = {
-        Upgrade: "websocket",
-        Connection: "Upgrade",
-      };
-
-      if (subprotocolHeader) {
-        originHeaders["Sec-WebSocket-Protocol"] = subprotocolHeader;
-      }
-
-      // Forward client origin / IP headers for backend audit logging if present
-      const clientIp = request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for");
-      if (clientIp) {
-        originHeaders["X-Forwarded-For"] = clientIp;
-      }
-
-      const originReq = new Request(originBaseUrl, {
-        headers: originHeaders,
-      });
-
-      const originResponse = await fetch(originReq);
-      const originWs = originResponse.webSocket;
-
-      if (!originWs) {
-        serverSocket.close(4003, "Origin did not accept WebSocket upgrade");
-        return new Response(null, {
-          status: 101,
-          webSocket: clientSocket,
-        });
-      }
-
-      originWs.accept();
-
-      // Setup bidirectional message forwarding
-      serverSocket.addEventListener("message", (event: MessageEvent) => {
-        try {
-          if (originWs.readyState === WebSocket.OPEN) {
-            originWs.send(event.data);
-          }
-        } catch (err) {
-          console.error("Error forwarding message from client to origin:", err);
+    // Bidirectional message forwarding
+    serverSocket.addEventListener("message", (event: MessageEvent) => {
+      try {
+        if (originWs.readyState === WebSocket.OPEN) {
+          originWs.send(event.data);
         }
-      });
-
-      originWs.addEventListener("message", (event: MessageEvent) => {
-        try {
-          if (serverSocket.readyState === WebSocket.OPEN) {
-            serverSocket.send(event.data);
-          }
-        } catch (err) {
-          console.error("Error forwarding message from origin to client:", err);
-        }
-      });
-
-      // Handle close events: 1:1 lifecycle teardown
-      serverSocket.addEventListener("close", (event: CloseEvent) => {
-        try {
-          if (originWs.readyState === WebSocket.OPEN || originWs.readyState === WebSocket.CONNECTING) {
-            originWs.close(event.code || 1000, event.reason || "Client disconnected");
-          }
-        } catch (err) {
-          console.error("Error closing origin socket:", err);
-        }
-      });
-
-      originWs.addEventListener("close", (event: CloseEvent) => {
-        try {
-          if (serverSocket.readyState === WebSocket.OPEN || serverSocket.readyState === WebSocket.CONNECTING) {
-            serverSocket.close(event.code || 1000, event.reason || "Origin disconnected");
-          }
-        } catch (err) {
-          console.error("Error closing server socket:", err);
-        }
-      });
-
-      // Handle error events
-      serverSocket.addEventListener("error", () => {
-        try {
-          if (originWs.readyState === WebSocket.OPEN) {
-            originWs.close(1011, "Client socket error");
-          }
-        } catch {}
-      });
-
-      originWs.addEventListener("error", () => {
-        try {
-          if (serverSocket.readyState === WebSocket.OPEN) {
-            serverSocket.close(1011, "Origin socket error");
-          }
-        } catch {}
-      });
-
-      const responseHeaders: Record<string, string> = {};
-      const originSubprotocol = originResponse.headers.get("Sec-WebSocket-Protocol");
-      if (originSubprotocol) {
-        responseHeaders["Sec-WebSocket-Protocol"] = originSubprotocol;
-      } else if (subprotocolHeader) {
-        responseHeaders["Sec-WebSocket-Protocol"] = subprotocolHeader.split(",")[0].trim();
+      } catch (err) {
+        console.error("Error forwarding client message to origin:", err);
       }
+    });
 
-      return new Response(null, {
-        status: 101,
-        webSocket: clientSocket,
-        headers: responseHeaders,
-      });
-    } catch (err) {
-      console.error("Failed to connect to origin WebSocket:", err);
-      serverSocket.close(4003, "Origin backend unavailable");
-      return new Response(null, {
-        status: 101,
-        webSocket: clientSocket,
-      });
+    originWs.addEventListener("message", (event: MessageEvent) => {
+      try {
+        if (serverSocket.readyState === WebSocket.OPEN) {
+          serverSocket.send(event.data);
+        }
+      } catch (err) {
+        console.error("Error forwarding origin message to client:", err);
+      }
+    });
+
+    // 1:1 Connection Lifecycle: Clean close propagation
+    serverSocket.addEventListener("close", (event: CloseEvent) => {
+      try {
+        if (originWs.readyState === WebSocket.OPEN || originWs.readyState === WebSocket.CONNECTING) {
+          originWs.close(event.code || 1000, event.reason || "Client disconnected");
+        }
+      } catch (err) {
+        console.error("Error closing origin socket:", err);
+      }
+    });
+
+    originWs.addEventListener("close", (event: CloseEvent) => {
+      try {
+        if (serverSocket.readyState === WebSocket.OPEN || serverSocket.readyState === WebSocket.CONNECTING) {
+          serverSocket.close(event.code || 1000, event.reason || "Origin disconnected");
+        }
+      } catch (err) {
+        console.error("Error closing server socket:", err);
+      }
+    });
+
+    // Error propagation
+    serverSocket.addEventListener("error", () => {
+      try {
+        if (originWs.readyState === WebSocket.OPEN) {
+          originWs.close(1011, "Client socket error");
+        }
+      } catch {}
+    });
+
+    originWs.addEventListener("error", () => {
+      try {
+        if (serverSocket.readyState === WebSocket.OPEN) {
+          serverSocket.close(1011, "Origin socket error");
+        }
+      } catch {}
+    });
+
+    const responseHeaders: Record<string, string> = {};
+    const originSubprotocol = originResponse.headers.get("Sec-WebSocket-Protocol");
+    if (originSubprotocol) {
+      responseHeaders["Sec-WebSocket-Protocol"] = originSubprotocol;
+    } else if (subprotocolHeader) {
+      responseHeaders["Sec-WebSocket-Protocol"] = subprotocolHeader.split(",")[0].trim();
     }
+
+    return new Response(null, {
+      status: 101,
+      webSocket: clientSocket,
+      headers: responseHeaders,
+    });
   }
 }
