@@ -5,7 +5,8 @@ export interface Env {
 }
 
 export interface SessionTokenPayload {
-  session_id: string;
+  sid?: string;
+  session_id?: string;
   sub?: string;
   role?: string;
   exp?: number;

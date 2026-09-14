@@ -71,13 +71,10 @@ export class SessionGatewayDO {
     const webSocketPair = new WebSocketPair();
     const [clientSocket, serverSocket] = Object.values(webSocketPair);
 
-    serverSocket.accept();
-    originWs.accept();
-
     // Bidirectional message forwarding
     serverSocket.addEventListener("message", (event: MessageEvent) => {
       try {
-        if (originWs.readyState === WebSocket.OPEN) {
+        if (originWs.readyState === WebSocket.OPEN || typeof originWs.readyState === "undefined") {
           originWs.send(event.data);
         }
       } catch (err) {
@@ -87,7 +84,7 @@ export class SessionGatewayDO {
 
     originWs.addEventListener("message", (event: MessageEvent) => {
       try {
-        if (serverSocket.readyState === WebSocket.OPEN) {
+        if (serverSocket.readyState === WebSocket.OPEN || typeof serverSocket.readyState === "undefined") {
           serverSocket.send(event.data);
         }
       } catch (err) {
@@ -95,41 +92,36 @@ export class SessionGatewayDO {
       }
     });
 
+    serverSocket.accept();
+    originWs.accept();
+
     // 1:1 Connection Lifecycle: Clean close propagation
     serverSocket.addEventListener("close", (event: CloseEvent) => {
       try {
-        if (originWs.readyState === WebSocket.OPEN || originWs.readyState === WebSocket.CONNECTING) {
-          originWs.close(event.code || 1000, event.reason || "Client disconnected");
-        }
+        originWs.close(event.code || 1000, event.reason || "Client disconnected");
       } catch (err) {
-        console.error("Error closing origin socket:", err);
+        // Already closed or terminating
       }
     });
 
     originWs.addEventListener("close", (event: CloseEvent) => {
       try {
-        if (serverSocket.readyState === WebSocket.OPEN || serverSocket.readyState === WebSocket.CONNECTING) {
-          serverSocket.close(event.code || 1000, event.reason || "Origin disconnected");
-        }
+        serverSocket.close(event.code || 1000, event.reason || "Origin disconnected");
       } catch (err) {
-        console.error("Error closing server socket:", err);
+        // Already closed or terminating
       }
     });
 
     // Error propagation
     serverSocket.addEventListener("error", () => {
       try {
-        if (originWs.readyState === WebSocket.OPEN) {
-          originWs.close(1011, "Client socket error");
-        }
+        originWs.close(1011, "Client socket error");
       } catch {}
     });
 
     originWs.addEventListener("error", () => {
       try {
-        if (serverSocket.readyState === WebSocket.OPEN) {
-          serverSocket.close(1011, "Origin socket error");
-        }
+        serverSocket.close(1011, "Origin socket error");
       } catch {}
     });
 

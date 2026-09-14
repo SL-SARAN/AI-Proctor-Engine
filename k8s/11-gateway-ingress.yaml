@@ -1,0 +1,36 @@
+# Cloudflare Workers & Durable Objects Edge Gateway Ingress definition.
+# Routes /ws traffic from the Cloudflare edge proxy (SessionGatewayDO)
+# to the internal proctoring-engine-api service with WebSocket-tuned timeouts.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: proctoring-engine-gateway-ingress
+  namespace: proctoring-engine
+  annotations:
+    # NGINX Ingress WebSocket tuning
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "7200"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "7200"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    nginx.ingress.kubernetes.io/websocket-services: "proctoring-engine-api"
+    # Ensure Cloudflare client IP preservation
+    nginx.ingress.kubernetes.io/enable-real-ip: "true"
+    nginx.ingress.kubernetes.io/real-ip-header: "CF-Connecting-IP"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - origin.proctoring.example.edu
+      secretName: proctoring-origin-tls
+  rules:
+    - host: origin.proctoring.example.edu
+      http:
+        paths:
+          - path: /ws
+            pathType: Prefix
+            backend:
+              service:
+                name: proctoring-engine-api
+                port:
+                  number: 80

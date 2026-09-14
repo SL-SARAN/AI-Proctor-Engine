@@ -43,8 +43,11 @@ export function extractSessionId(request: Request, env?: Env): string | null {
             const base64 = base64Url.replace(/-/g, "+").replace(/_/g, "/");
             const jsonPayload = atob(base64);
             const parsed = JSON.parse(jsonPayload) as SessionTokenPayload;
-            if (parsed && typeof parsed.session_id === "string") {
-              return parsed.session_id;
+            if (parsed) {
+              const sid = typeof parsed.sid === "string" ? parsed.sid : (typeof parsed.session_id === "string" ? parsed.session_id : null);
+              if (sid) {
+                return sid;
+              }
             }
           } catch {
             // If token payload cannot be parsed, return null

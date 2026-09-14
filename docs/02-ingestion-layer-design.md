@@ -18,30 +18,50 @@ This follows the standard LTI Advantage / OIDC third-party-initiated login flow 
 
 ---
 
-## 2. WebSocket connection
+## 2. WebSocket connection & Edge Gateway
 
-**Endpoint pattern:** one connection per exam session, established after the LTI launch using the session token issued in step 5 above for authentication (passed as a query param or subprotocol header at connect time — the WebSocket handshake itself is a plain HTTP request, so the token travels the same way a normal auth header would).
+### 2.1 Topology & Cloudflare Durable Objects Gateway
+The ingestion architecture uses a dedicated **Cloudflare Workers + Durable Objects Edge Gateway** (`gateway/`) positioned between the browser client and the origin FastAPI backend cluster.
 
-> **Flagged, not yet resolved:** the LTI launch redirect
-> (`redirect_url = f"{settings.exam_client_url}?session_token={token}"`,
-> per turn N+1's `process_launch` implementation) puts the session
-> token in a plain URL query parameter. This is a real, known
-> anti-pattern — query params get logged by reverse proxies/CDNs
-> along the path, leak via `Referer` headers on any outbound link,
-> and persist in browser history. The standard fix is a URL
-> **fragment** (`#session_token=...`) instead — fragments never get
-> sent to the server or logged by intermediate infrastructure, and
-> resolve entirely client-side, so the browser client reads it the
-> same way. This already has 134 unit + 9 integration tests built
-> around the query-param behavior (turn N+1) — worth a deliberate
-> decision on whether to fix now (touching tested code) or accept as
-> known debt, not something to silently carry forward into the
-> browser-client layer that's about to consume this same redirect
-> URL.
+```
+┌───────────────────────────────┐
+│ Browser Client (TypeScript)   │
+└──────────────┬────────────────┘
+               │ wss:// (Sec-WebSocket-Protocol: proctoring-v1.{JWT})
+               ▼
+┌───────────────────────────────┐
+│ Cloudflare Edge Worker        │  Extracts session_id from unverified JWT payload
+└──────────────┬────────────────┘  Routes deterministically to DO shard
+               │ env.SESSION_GATEWAY.idFromName(sessionId)
+               ▼
+┌───────────────────────────────┐
+│ SessionGatewayDO (Durable Obj)│  1:1 session-scoped proxy instance
+└──────────────┬────────────────┘
+               │ ws:// / wss:// (Passes Sec-WebSocket-Protocol unchanged)
+               ▼
+┌───────────────────────────────┐
+│ Kubernetes Ingress & Origin   │  Authoritative HMAC validation, DB checks,
+│ FastAPI Backend (/ws)         │  consent enforcement, frame dispatch & acks
+└───────────────────────────────┘
+```
 
-**Heartbeat:** a ping/pong every ~15s. No pong within a grace window (proposed: 30s) doesn't mean instant termination — it means a `connection_lost` `MEDIUM` flag, since a dropped connection could be a network blip, not misconduct. This is a real design fork worth flagging: silence isn't evidence of a violation, and treating it as one would punish students with bad Wi-Fi. Escalation from repeated drops to something more serious should go through the same accumulated-score path as other `MEDIUM` signals, not a special case.
+**Key Architectural Invariants:**
+1. **Zero-Trust / Zero-Authority Edge Token Decoding:**
+   - The edge gateway decodes the base64url payload segment of `Sec-WebSocket-Protocol: proctoring-v1.{JWT}` strictly to extract `session_id` (or `sid`) to route to the designated Durable Object (`idFromName(sessionId)`).
+   - The edge gateway does **not** verify cryptographic signatures, check expiration, or access database state.
+   - FastAPI is the single authoritative source of truth. If a token has an invalid signature, expired timestamp, missing consent, or non-learner role, FastAPI immediately rejects the handshake with RFC 6455 application close codes (`4001`, `4002`, `4005`, `4009`, `4003`), which the DO gateway transparently propagates back to the client.
+2. **1:1 Connection Lifecycle (No Transparent Socket Swapping):**
+   - The gateway maintains a strict 1:1 coupling between the client-facing WebSocket and the outbound origin WebSocket.
+   - When the client disconnects, the origin socket is closed cleanly.
+   - When the client reconnects, the DO establishes a fresh origin connection. This prevents sequence number desynchronization (`DeliveryService._seq`), eliminates dead-state accumulation, and ensures FastAPI's heartbeat monitoring accurately reflects live client connectivity.
+3. **Verified Edge Pricing & Metering Model (2026 Cloudflare Rates):**
+   - **Base:** $5/month Workers Paid base plan.
+   - **DO Requests:** $0.15 / 1M requests (incoming WebSocket messages metered at 20:1 ratio for DOs).
+   - **DO Compute Duration:** $12.50 / 1M GB-seconds (minimum 128 MB allocation). Because the outbound origin WebSocket connection keeps the DO resident in memory throughout the exam, compute is metered on wall-clock session duration ($\approx 128\text{ MB} \times 7200\text{ s} \approx 0.9\text{ GB-s} \approx \$0.011$ per 2-hour student exam).
 
-**Reconnect:** the client should be able to reconnect with the same session token and resume the same `ExamSession` row rather than creating a new one, as long as the session hasn't already reached a terminal `status`.
+**Heartbeat:** a ping/pong every ~15s. No pong within a grace window (default 30s) does not trigger instant termination — it emits a `connection_lost` `MEDIUM` flag, handled via the accumulated-score pipeline.
+
+**Reconnect:** the client may reconnect with the same valid session token and resume the active `ExamSession` row as long as the session has not reached a terminal status (`COMPLETED`, `TERMINATED`).
 
 ---
 
