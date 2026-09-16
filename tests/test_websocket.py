@@ -821,9 +821,11 @@ class TestWebSocketAuth:
         is rejected — the server requires the token in the subprotocol,
         not in a query parameter, not in any other header.
         """
-        with pytest.raises(Exception):
-            with ws_client.websocket_connect("/ws"):
-                pass  # Should never reach here.
+        from starlette.websockets import WebSocketDisconnect
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with ws_client.websocket_connect("/ws") as ws:
+                ws.receive_text()
+        assert exc_info.value.code == 4001
 
     def test_unprefixed_subprotocol_closes_4001(self, ws_client):
         """A subprotocol value without the ``proctoring-v1.`` prefix
@@ -831,11 +833,13 @@ class TestWebSocketAuth:
         an arbitrary token-shaped string from a different service
         cannot be misinterpreted as ours.
         """
-        with pytest.raises(Exception):
+        from starlette.websockets import WebSocketDisconnect
+        with pytest.raises(WebSocketDisconnect) as exc_info:
             with ws_client.websocket_connect(
                 "/ws", subprotocols=["garbage"]
-            ):
-                pass
+            ) as ws:
+                ws.receive_text()
+        assert exc_info.value.code == 4001
 
     def test_query_param_token_not_accepted(self, ws_client, learner_token):
         """A query-parameter token is **rejected**, not silently
@@ -845,20 +849,25 @@ class TestWebSocketAuth:
         same way the LTI redirect's ``?session_token=...`` did, and
         the fix at this layer is to not accept that path at all.
         """
-        with pytest.raises(Exception):
-            with ws_client.websocket_connect(f"/ws?token={learner_token}"):
-                pass
+        from starlette.websockets import WebSocketDisconnect
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with ws_client.websocket_connect(f"/ws?token={learner_token}") as ws:
+                ws.receive_text()
+        assert exc_info.value.code == 4001
 
     def test_invalid_token_closes_4001(self, ws_client):
         """A subprotocol with the right prefix but a garbage JWT
         payload is rejected with the auth-failed close code."""
-        with pytest.raises(Exception):
+        from starlette.websockets import WebSocketDisconnect
+        with pytest.raises(WebSocketDisconnect) as exc_info:
             with ws_client.websocket_connect(
                 "/ws", subprotocols=[_subprotocol_for("garbage")]
-            ):
-                pass
+            ) as ws:
+                ws.receive_text()
+        assert exc_info.value.code == 4001
 
     def test_expired_token_closes_4002(self, ws_client, settings, participant, exam_session):
+        from starlette.websockets import WebSocketDisconnect
         expired = issue_session_token(
             participant.id,
             exam_session.id,
@@ -866,14 +875,17 @@ class TestWebSocketAuth:
             settings=settings,
             now=NOW - timedelta(hours=5),  # Expired (TTL is 4 h).
         )
-        with pytest.raises(Exception):
-            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(expired)]):
-                pass
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(expired)]) as ws:
+                ws.receive_text()
+        assert exc_info.value.code == 4002
 
     def test_instructor_token_rejected(self, ws_client, instructor_token):
-        with pytest.raises(Exception):
-            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(instructor_token)]):
-                pass
+        from starlette.websockets import WebSocketDisconnect
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(instructor_token)]) as ws:
+                ws.receive_text()
+        assert exc_info.value.code == 4005
 
 
 class TestWebSocketSession:
@@ -881,6 +893,7 @@ class TestWebSocketSession:
 
     def test_session_not_found_closes_4003(self, ws_client, settings, participant):
         """Token points to a non-existent session."""
+        from starlette.websockets import WebSocketDisconnect
         fake_session_id = uuid.uuid4()
         token = issue_session_token(
             participant.id,
@@ -889,14 +902,16 @@ class TestWebSocketSession:
             settings=settings,
             now=NOW,
         )
-        with pytest.raises(Exception):
-            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(token)]):
-                pass
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(token)]) as ws:
+                ws.receive_text()
+        assert exc_info.value.code == 4003
 
     def test_terminated_session_rejected(
         self, ws_client, settings, participant, exam_session, test_db
     ):
         """A session in terminal state cannot be reconnected."""
+        from starlette.websockets import WebSocketDisconnect
         exam_session.status = SessionStatus.TERMINATED
         test_db.commit()
         token = issue_session_token(
@@ -906,9 +921,10 @@ class TestWebSocketSession:
             settings=settings,
             now=NOW,
         )
-        with pytest.raises(Exception):
-            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(token)]):
-                pass
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(token)]) as ws:
+                ws.receive_text()
+        assert exc_info.value.code == 4003
 
     def test_pending_session_transitions_to_active(
         self, ws_client, learner_token, exam_session, test_db
@@ -980,8 +996,8 @@ class TestWebSocketSession:
             now=NOW,
         )
         with pytest.raises(WebSocketDisconnect) as exc_info:
-            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(token)]):
-                pass
+            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(token)]) as ws:
+                ws.receive_text()
         assert exc_info.value.code == 4009
 
 

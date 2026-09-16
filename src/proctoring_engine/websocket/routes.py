@@ -272,8 +272,23 @@ def build_ws_router(deps: _WsRouterDeps) -> APIRouter:
         # fragment) does not apply here — fragments are never sent to
         # the server, so the server cannot authenticate against them.
         # The Sec-WebSocket-Protocol header is the RFC 6455 mechanism
-        # for passing a credential on the WS handshake without it
-        # touching the URL, and it is the only mechanism we accept.
+        # ------------------------------------------------------------------
+        # 1. Accept the WebSocket handshake upon entry
+        #
+        # Accept the WebSocket handshake immediately so that any subsequent
+        # authentication, authorization, or session validation rejection
+        # transmits a real RFC 6455 application close frame (with explicit code
+        # e.g. 4001, 4005, 4009, 4003 and human-readable reason string) over the
+        # wire, rather than aborting at the HTTP layer with HTTP 403 (which
+        # obscures the cause and manifests as code 1006 abnormal closure).
+        # ------------------------------------------------------------------
+        await websocket.accept(subprotocol=_echo_subprotocol(websocket))
+
+        # ------------------------------------------------------------------
+        # 2. Extract and validate the session token
+        #
+        # The token arrives in the ``Sec-WebSocket-Protocol`` subprotocol
+        # header, never as a query parameter.
         # ------------------------------------------------------------------
         token = _extract_token_from_subprotocol(websocket)
         if token is None:
@@ -307,7 +322,7 @@ def build_ws_router(deps: _WsRouterDeps) -> APIRouter:
             return
 
         # ------------------------------------------------------------------
-        # 2. Verify the session exists and is connectable
+        # 3. Verify the session exists and is connectable
         # ------------------------------------------------------------------
         db = deps.get_db()
         exam_session = _lookup_session(db, claims.session_id)
@@ -326,18 +341,7 @@ def build_ws_router(deps: _WsRouterDeps) -> APIRouter:
             return
 
         # ------------------------------------------------------------------
-        # 3. Accept the WebSocket before attempting identity verification
-        # ------------------------------------------------------------------
-        # Echo the selected subprotocol back to the client (RFC 6455
-        # §4.2.2 — the server may accept at most one of the client's
-        # offered subprotocols, or none).  Echoing is not required for
-        # the auth flow but it lets the client confirm the server
-        # actually validated the token rather than silently accepting
-        # the connection.
-        await websocket.accept(subprotocol=_echo_subprotocol(websocket))
-
-        # ------------------------------------------------------------------
-        # 4. Attempt identity backend construction after WebSocket accept
+        # 4. Attempt identity backend construction after validation
         # ------------------------------------------------------------------
         from proctoring_engine.inference.identity_match import (
             FaceRecognitionBackend,

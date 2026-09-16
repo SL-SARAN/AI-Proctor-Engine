@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
-import { Miniflare } from "miniflare";
+import { Miniflare, Log, LogLevel } from "miniflare";
 import esbuild from "esbuild";
 import path from "node:path";
 
@@ -46,13 +46,14 @@ beforeAll(async () => {
   serverTokens = await new Promise<ServerTokens>((resolve, reject) => {
     pythonProc.stdout?.on("data", (chunk) => {
       const text = chunk.toString();
+      console.log("[Python STDOUT]:", text);
       const match = text.match(/READY:(\{.*\})/);
       if (match) {
         resolve(JSON.parse(match[1]));
       }
     });
     pythonProc.stderr?.on("data", (chunk) => {
-      // keep stderr piped if needed
+      console.error("[Python STDERR]:", chunk.toString());
     });
     pythonProc.on("error", reject);
     setTimeout(() => reject(new Error("Timeout waiting for FastAPI backend to start")), 10000);
@@ -71,6 +72,7 @@ beforeAll(async () => {
     },
     compatibilityDate: "2026-08-01",
     compatibilityFlags: ["nodejs_compat"],
+    log: new Log(LogLevel.DEBUG),
   });
 
   const mfUrl = await mf.ready;
@@ -135,8 +137,9 @@ describe("Cloudflare Durable Objects Gateway E2E Integration Suite", () => {
       setTimeout(() => reject(new Error("Timeout waiting for rejection close")), 5000);
     });
 
-    // In RFC 6455, origin-level handshake rejection before 101 upgrade produces client close (1006 / 4001)
-    expect([1006, 4001]).toContain(closeResult.code);
+    console.log("[E2E Rejection Result - Invalid Token]:", closeResult);
+    expect(closeResult.code).toBe(4001);
+    expect(closeResult.reason).toContain("Invalid token");
   });
 
   it("rejects connection when connecting with non-learner token (instructor)", async () => {
@@ -149,7 +152,9 @@ describe("Cloudflare Durable Objects Gateway E2E Integration Suite", () => {
       setTimeout(() => reject(new Error("Timeout waiting for rejection close")), 5000);
     });
 
-    expect([1006, 4005]).toContain(closeResult.code);
+    console.log("[E2E Rejection Result - Non-Learner]:", closeResult);
+    expect(closeResult.code).toBe(4005);
+    expect(closeResult.reason).toContain("Only learner-role tokens may open a telemetry connection");
   });
 
   it("rejects connection when consent has not been recorded", async () => {
@@ -162,7 +167,9 @@ describe("Cloudflare Durable Objects Gateway E2E Integration Suite", () => {
       setTimeout(() => reject(new Error("Timeout waiting for rejection close")), 5000);
     });
 
-    expect([1006, 4009]).toContain(closeResult.code);
+    console.log("[E2E Rejection Result - No Consent]:", closeResult);
+    expect(closeResult.code).toBe(4009);
+    expect(closeResult.reason).toContain("Consent has not been recorded for this session");
   });
 
   it("rejects connection when session is in terminal state", async () => {
@@ -175,7 +182,9 @@ describe("Cloudflare Durable Objects Gateway E2E Integration Suite", () => {
       setTimeout(() => reject(new Error("Timeout waiting for rejection close")), 5000);
     });
 
-    expect([1006, 4003]).toContain(closeResult.code);
+    console.log("[E2E Rejection Result - Terminated Session]:", closeResult);
+    expect(closeResult.code).toBe(4003);
+    expect(closeResult.reason).toContain("Session not found or in terminal state");
   });
 
   it("streams telemetry_light to origin and receives monotonic ACK over DO gateway", async () => {
@@ -242,10 +251,29 @@ describe("Cloudflare Durable Objects Gateway E2E Integration Suite", () => {
     expect(receivedAcks[1].payload.seq).toBe(1);
   });
 
-  it("handles 1:1 reconnection cleanly without stale connection or state leakage", async () => {
+  it("handles 1:1 reconnection cleanly with verified fresh origin connection lifecycle and state teardown", async () => {
     const subprotocol = `proctoring-v1.${serverTokens.valid_learner_token}`;
 
-    // Connection 1: Connect, send message, close
+    // Helper to query origin server stats
+    async function getOriginStats() {
+      const res = await fetch(`http://127.0.0.1:${originPort}/test/connection-stats`);
+      return (await res.json()) as {
+        total_connections: number;
+        active_connections: number;
+        connection_history: Array<{
+          connection_id: string;
+          started_at: string;
+          ended_at: string | null;
+          status: string;
+        }>;
+      };
+    }
+
+    const initialStats = await getOriginStats();
+
+    // -------------------------------------------------------------
+    // Connection 1: Open, verify active origin connection & seq=0 ACK
+    // -------------------------------------------------------------
     const ws1 = new globalThis.WebSocket(gatewayWsUrl, subprotocol) as any;
     const ack1 = await new Promise<any>((resolve, reject) => {
       ws1.addEventListener("open", () => {
@@ -269,12 +297,40 @@ describe("Cloudflare Durable Objects Gateway E2E Integration Suite", () => {
     });
 
     expect(ack1.type).toBe("ack");
+    // Fresh connection 1 must start sequence at 0
+    expect(ack1.payload.seq).toBe(0);
+
+    const stats1 = await getOriginStats();
+    expect(stats1.total_connections).toBe(initialStats.total_connections + 1);
+    expect(stats1.active_connections).toBe(1);
+    const conn1Record = stats1.connection_history[stats1.connection_history.length - 1];
+    expect(conn1Record.status).toBe("active");
+    expect(conn1Record.ended_at).toBeNull();
+    const conn1Id = conn1Record.connection_id;
+
+    // -------------------------------------------------------------
+    // Teardown Connection 1: Close and verify full origin resource release
+    // -------------------------------------------------------------
     ws1.close(1000, "Normal disconnect");
 
-    // Wait 200ms for teardown to settle
-    await new Promise((r) => setTimeout(r, 200));
+    // Wait for origin teardown to settle
+    let statsAfterClose1: any;
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      statsAfterClose1 = await getOriginStats();
+      if (statsAfterClose1.active_connections === 0) break;
+    }
 
-    // Connection 2: Reconnect with same valid token to active session
+    expect(statsAfterClose1.active_connections).toBe(0);
+    const conn1ClosedRecord = statsAfterClose1.connection_history.find(
+      (c: any) => c.connection_id === conn1Id
+    );
+    expect(conn1ClosedRecord.status).toBe("closed");
+    expect(conn1ClosedRecord.ended_at).not.toBeNull();
+
+    // -------------------------------------------------------------
+    // Connection 2: Reconnect with same token to active session
+    // -------------------------------------------------------------
     const ws2 = new globalThis.WebSocket(gatewayWsUrl, subprotocol) as any;
     const ack2 = await new Promise<any>((resolve, reject) => {
       ws2.addEventListener("open", () => {
@@ -298,6 +354,30 @@ describe("Cloudflare Durable Objects Gateway E2E Integration Suite", () => {
     });
 
     expect(ack2.type).toBe("ack");
+    // CRITICAL: Fresh origin connection has fresh DeliveryService sequence starting at 0, NOT continuing from connection 1
+    expect(ack2.payload.seq).toBe(0);
+
+    const stats2 = await getOriginStats();
+    expect(stats2.total_connections).toBe(initialStats.total_connections + 2);
+    expect(stats2.active_connections).toBe(1);
+
+    const conn2Record = stats2.connection_history[stats2.connection_history.length - 1];
+    expect(conn2Record.status).toBe("active");
+    expect(conn2Record.ended_at).toBeNull();
+    const conn2Id = conn2Record.connection_id;
+
+    // CRITICAL: Origin connection ID MUST be distinctly different, proving complete teardown & rebuild
+    expect(conn2Id).not.toBe(conn1Id);
+
+    // Clean close Connection 2
     ws2.close(1000, "Clean reconnected close");
+
+    let statsFinal: any;
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      statsFinal = await getOriginStats();
+      if (statsFinal.active_connections === 0) break;
+    }
+    expect(statsFinal.active_connections).toBe(0);
   });
 });

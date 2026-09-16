@@ -11,6 +11,7 @@ import json
 import sys
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI
@@ -138,11 +139,50 @@ def create_app_and_tokens():
         heartbeat_timeout_seconds=20.0,
     )
 
+    connection_history: list[dict[str, Any]] = []
+    active_connections: set[str] = set()
+
     app = FastAPI()
 
-    # Wrap the ws route with logging
-    router = build_ws_router(deps)
-    app.include_router(router)
+    # Track real WebSocket connection lifecycles via ASGI middleware
+    @app.middleware("http")
+    async def track_http_stats(request, call_next):
+        return await call_next(request)
+
+    class WebSocketTrackingMiddleware:
+        def __init__(self, app_):
+            self.app_ = app_
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "websocket" and scope.get("path") == "/ws":
+                conn_id = str(uuid.uuid4())
+                record = {
+                    "connection_id": conn_id,
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                    "ended_at": None,
+                    "status": "active",
+                }
+                connection_history.append(record)
+                active_connections.add(conn_id)
+                try:
+                    await self.app_(scope, receive, send)
+                finally:
+                    active_connections.discard(conn_id)
+                    record["ended_at"] = datetime.now(timezone.utc).isoformat()
+                    record["status"] = "closed"
+            else:
+                await self.app_(scope, receive, send)
+
+    app.include_router(build_ws_router(deps))
+    app.add_middleware(WebSocketTrackingMiddleware)
+
+    @app.get("/test/connection-stats")
+    def get_connection_stats():
+        return {
+            "total_connections": len(connection_history),
+            "active_connections": len(active_connections),
+            "connection_history": list(connection_history),
+        }
 
     tokens = {
         "valid_session_id": str(sess_valid.id),
