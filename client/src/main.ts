@@ -42,7 +42,7 @@ function updateStatusUI(status: WSStatus): void {
   }
 }
 
-function boot(): void {
+export function boot(): void {
   // 1. Extract launch params from URL fragment
   let sessionToken: string;
   let sessionId: string;
@@ -67,11 +67,11 @@ function boot(): void {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = `${protocol}//${window.location.host}/ws`;
 
-  // 7. Capture loop — created here, but started only once the WebSocket
-  //    is in the OPEN state. WsClient.send() silently drops messages
-  //    before readyState === OPEN, so starting the capture loop before
-  //    the connection is established would cause real data loss at the
-  //    start of every session.
+  // 7. Capture loop — created and started only once the WebSocket reaches
+  //    'connected', which requires an explicit server `session_ready` message
+  //    confirming token, role, consent, session status, and identity gates
+  //    have all passed. WsClient.send() also drops messages until then, so
+  //    camera access and telemetry cannot begin before consent is verified.
   let captureLoop: CaptureLoop | null = null;
   let captureLoopStarted = false;
 
@@ -147,8 +147,14 @@ function boot(): void {
 
 // Boot on DOMContentLoaded if document is still loading, otherwise
 // run directly (the script is type="module" so it's deferred).
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', boot);
-} else {
-  boot();
+// Tests can set __PROCTOR_TEST_NO_AUTOBOOT__ to invoke boot() explicitly.
+if (
+  typeof document !== 'undefined' &&
+  !(globalThis as Record<string, unknown>).__PROCTOR_TEST_NO_AUTOBOOT__
+) {
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
 }

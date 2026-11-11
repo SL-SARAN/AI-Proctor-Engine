@@ -8,7 +8,7 @@ before hand-off to the preprocessing layer.
 Server → client envelope shape (``docs/02-ingestion-layer-design.md`` §4)::
 
     {
-        "type": "ack | kill_switch | policy_update",
+        "type": "session_ready | ack | kill_switch | policy_update",
         "payload": { ... }
     }
 
@@ -69,6 +69,7 @@ class KillSwitchDeliverError(Exception):
 class ServerMessageType(str, enum.Enum):
     """Discriminator values for server → client messages."""
 
+    SESSION_READY = "session_ready"
     ACK = "ack"
     KILL_SWITCH = "kill_switch"
     POLICY_UPDATE = "policy_update"
@@ -77,6 +78,35 @@ class ServerMessageType(str, enum.Enum):
 # ---------------------------------------------------------------------------
 # Server → client payload / envelope models
 # ---------------------------------------------------------------------------
+
+class SessionReadyPayload(BaseModel):
+    """Server readiness confirmation payload after all handshake gates pass."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(
+        ...,
+        min_length=1,
+        description="UUID of the validated ExamSession.",
+    )
+    status: str = Field(
+        ...,
+        min_length=1,
+        description="Session status after handshake validation (e.g. 'active' or 'reinstated').",
+    )
+
+
+class SessionReadyDeliver(BaseModel):
+    """Server → client: handshake readiness signal sent only after all gates pass."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal[ServerMessageType.SESSION_READY] = ServerMessageType.SESSION_READY
+    payload: SessionReadyPayload
+
+    def to_json_dict(self) -> dict[str, Any]:
+        """Serialise to a JSON-compatible dict for ``websocket.send_json``."""
+        return self.model_dump(mode="json")
 
 class SessionAcknowledgePayload(BaseModel):
     """Per-frame acknowledgement payload."""

@@ -18,8 +18,9 @@ LTI 1.3 launch.
    the LTI redirect's token did, and the same fix applies at this
    layer (RFC 6455 ``Sec-WebSocket-Protocol``).
 2. Server validates the token, verifies the session exists and is in
-   an acceptable status (``PENDING`` or ``ACTIVE``), transitions
-   ``PENDING → ACTIVE``, and starts the heartbeat ticker.
+   an acceptable status (``PENDING``, ``ACTIVE``, or ``REINSTATED``),
+   transitions ``PENDING → ACTIVE``, sends ``session_ready``, and
+   starts the heartbeat ticker.
 3. Each client message is parsed via :func:`parse_client_message`,
    pushed into the :class:`TelemetryEventBuffer`, and acked with a
    monotonic sequence number.
@@ -33,16 +34,17 @@ LTI 1.3 launch.
 
 A server-initiated WebSocket ping every ``heartbeat_interval_seconds``
 (default 15 s).  No pong within ``heartbeat_timeout_seconds`` (default
-30 s) triggers a ``connection_lost`` MEDIUM flag — *not* an
-auto-termination.  Repeated drops escalate through the same
-accumulated-score path as other MEDIUM signals.
+30 s) closes the connection with :data:`WS_CLOSE_HEARTBEAT_TIMEOUT`
+(``4007``).  (The original design doc's ``connection_lost`` MEDIUM flag
+is not implemented.)
 
 **Reconnect:**
 
 A client may reconnect with the same session token to the same
 ``ExamSession`` row as long as the session hasn't reached a terminal
-status (``COMPLETED``, ``TERMINATED``).  The handler verifies this
-at connection time and rejects stale tokens.
+status (``COMPLETED``, ``TERMINATED``, ``UNDER_REVIEW``).  A
+``REINSTATED`` session is connectable and remains ``REINSTATED``.  The
+handler verifies this at connection time and rejects stale tokens.
 """
 
 from __future__ import annotations
@@ -76,6 +78,8 @@ from proctoring_engine.websocket.client import (
 )
 from proctoring_engine.websocket.server import (
     DeliveryService,
+    SessionReadyDeliver,
+    SessionReadyPayload,
     TelemetryEventBuffer,
 )
 
@@ -139,7 +143,7 @@ class _WsRouterDeps:
 # ---------------------------------------------------------------------------
 
 _CONNECTABLE_STATUSES = frozenset(
-    {SessionStatus.PENDING, SessionStatus.ACTIVE}
+    {SessionStatus.PENDING, SessionStatus.ACTIVE, SessionStatus.REINSTATED}
 )
 
 
@@ -180,10 +184,11 @@ def _activate_session(db: Session, exam_session: ExamSession) -> None:
 # Subprotocol token extraction
 # ---------------------------------------------------------------------------
 
-# The fixed prefix that scopes the subprotocol to this engine.  The
-# token arrives as ``proctoring-v1.<jwt>``.  Any other subprotocol value
-# (including the absence of one, or an unrelated value the client
-# offers for compatibility with a generic WS endpoint) is rejected.
+# The fixed marker and prefix that scope the subprotocol to this engine.
+# Clients offer both ``proctoring-v1`` and ``proctoring-v1.<jwt>`` so the
+# server can select the bare marker without echoing the session token
+# back in the 101 Switching Protocols response header.
+_SUBPROTOCOL_MARKER = "proctoring-v1"
 _SUBPROTOCOL_PREFIX = "proctoring-v1."
 
 
@@ -220,23 +225,19 @@ def _extract_token_from_subprotocol(websocket: WebSocket) -> str | None:
 def _echo_subprotocol(websocket: WebSocket) -> str | None:
     """Return the subprotocol value to echo on ``accept()``.
 
-    Per RFC 6455 §4.2.2, when the client offers a subprotocol the
-    server must echo exactly one of the offered values (or none, in
-    which case no ``Sec-WebSocket-Protocol`` header is sent on the
-    101 Switching Protocols response).  We echo the single matching
-    value so the client can correlate its offered list with the
-    server's acceptance.
+    Per RFC 6455 §4.2.2, browsers require the server to select one of
+    the offered subprotocols.  When the client offers the bare
+    ``proctoring-v1`` marker alongside ``proctoring-v1.<jwt>``, we
+    select only the bare marker so the session token is never echoed
+    back in the HTTP 101 response headers.
     """
 
     raw = websocket.headers.get("sec-websocket-protocol")
     if not raw:
         return None
     offered = [segment.strip() for segment in raw.split(",") if segment.strip()]
-    matching = [
-        value for value in offered if value.startswith(_SUBPROTOCOL_PREFIX)
-    ]
-    if len(matching) == 1:
-        return matching[0]
+    if _SUBPROTOCOL_MARKER in offered:
+        return _SUBPROTOCOL_MARKER
     return None
 
 
@@ -542,6 +543,13 @@ def build_ws_router(deps: _WsRouterDeps) -> APIRouter:
         )
 
         try:
+            ready_msg = SessionReadyDeliver(
+                payload=SessionReadyPayload(
+                    session_id=str(exam_session.id),
+                    status=exam_session.status.value,
+                )
+            )
+            await websocket.send_json(ready_msg.to_json_dict())
             await _message_loop(
                 websocket=websocket,
                 claims=claims,

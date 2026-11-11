@@ -527,8 +527,13 @@ def test_e2e_second_person_triggers_termination(
     # ----- Phase 2: Open WebSocket -----------------------------------
 
     subprotocol = f"proctoring-v1.{session_token}"
-    with e2e_client.websocket_connect("/ws", subprotocols=[subprotocol]) as ws:
-        # First message is a pong — the handler ignores pongs, so
+    with e2e_client.websocket_connect(
+        "/ws", subprotocols=["proctoring-v1", subprotocol]
+    ) as ws:
+        ready = ws.receive_json()
+        assert ready["type"] == "session_ready", f"Expected session_ready, got: {ready}"
+        assert ready["payload"]["status"] == "active"
+        # First client->server message is a pong — the handler ignores pongs, so
         # this is a no-op round-trip that confirms the connection
         # is alive before we start streaming telemetry.
         ws.send_json({"type": "pong"})

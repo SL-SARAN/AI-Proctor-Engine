@@ -67,6 +67,8 @@ from proctoring_engine.websocket.server import (
     ServerMessageType,
     SessionAcknowledgeDeliver,
     SessionAcknowledgePayload,
+    SessionReadyDeliver,
+    SessionReadyPayload,
     TelemetryEventBuffer,
 )
 from proctoring_engine.websocket.routes import (
@@ -106,15 +108,18 @@ def _envelope(
 
 
 def _subprotocol_for(token: str) -> str:
-    """Build the ``Sec-WebSocket-Protocol`` header value for a token.
-
-    The header takes the form ``proctoring-v1.<jwt>`` — the leading
-    ``proctoring-v1.`` prefix is a fixed protocol discriminator that
-    scopes the token to this engine.  See
-    :mod:`proctoring_engine.websocket.routes` for the matching
-    extraction logic.
-    """
+    """Build the token-bearing ``Sec-WebSocket-Protocol`` value."""
     return f"proctoring-v1.{token}"
+
+
+def _subprotocols_for(token: str) -> list[str]:
+    """Build the client-offered ``Sec-WebSocket-Protocol`` list.
+
+    Offers the bare ``proctoring-v1`` marker alongside the token-bearing
+    value so the server can select ``proctoring-v1`` in its 101 response
+    without echoing the JWT back.
+    """
+    return ["proctoring-v1", _subprotocol_for(token)]
 
 
 @pytest.fixture()
@@ -642,6 +647,18 @@ class TestServerMessageSerialisation:
         assert d["type"] == "policy_update"
         assert d["payload"]["updates"]["heavy_frame_interval_seconds"] == 3
 
+    def test_session_ready_shape(self):
+        sr = SessionReadyDeliver(
+            payload=SessionReadyPayload(
+                session_id=SESSION_ID,
+                status="active",
+            ),
+        )
+        d = sr.to_json_dict()
+        assert d["type"] == "session_ready"
+        assert d["payload"]["session_id"] == SESSION_ID
+        assert d["payload"]["status"] == "active"
+
 
 # ======================================================================
 # 4. DeliveryService
@@ -826,6 +843,7 @@ class TestWebSocketAuth:
             with ws_client.websocket_connect("/ws") as ws:
                 ws.receive_text()
         assert exc_info.value.code == 4001
+        assert exc_info.value.reason == "Missing or malformed Sec-WebSocket-Protocol token."
 
     def test_unprefixed_subprotocol_closes_4001(self, ws_client):
         """A subprotocol value without the ``proctoring-v1.`` prefix
@@ -840,6 +858,7 @@ class TestWebSocketAuth:
             ) as ws:
                 ws.receive_text()
         assert exc_info.value.code == 4001
+        assert exc_info.value.reason == "Missing or malformed Sec-WebSocket-Protocol token."
 
     def test_query_param_token_not_accepted(self, ws_client, learner_token):
         """A query-parameter token is **rejected**, not silently
@@ -854,6 +873,7 @@ class TestWebSocketAuth:
             with ws_client.websocket_connect(f"/ws?token={learner_token}") as ws:
                 ws.receive_text()
         assert exc_info.value.code == 4001
+        assert exc_info.value.reason == "Missing or malformed Sec-WebSocket-Protocol token."
 
     def test_invalid_token_closes_4001(self, ws_client):
         """A subprotocol with the right prefix but a garbage JWT
@@ -861,10 +881,11 @@ class TestWebSocketAuth:
         from starlette.websockets import WebSocketDisconnect
         with pytest.raises(WebSocketDisconnect) as exc_info:
             with ws_client.websocket_connect(
-                "/ws", subprotocols=[_subprotocol_for("garbage")]
+                "/ws", subprotocols=["proctoring-v1", _subprotocol_for("garbage")]
             ) as ws:
                 ws.receive_text()
         assert exc_info.value.code == 4001
+        assert exc_info.value.reason == "Invalid token."
 
     def test_expired_token_closes_4002(self, ws_client, settings, participant, exam_session):
         from starlette.websockets import WebSocketDisconnect
@@ -876,16 +897,33 @@ class TestWebSocketAuth:
             now=NOW - timedelta(hours=5),  # Expired (TTL is 4 h).
         )
         with pytest.raises(WebSocketDisconnect) as exc_info:
-            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(expired)]) as ws:
+            with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(expired)) as ws:
                 ws.receive_text()
         assert exc_info.value.code == 4002
+        assert exc_info.value.reason == "Token expired."
 
     def test_instructor_token_rejected(self, ws_client, instructor_token):
         from starlette.websockets import WebSocketDisconnect
         with pytest.raises(WebSocketDisconnect) as exc_info:
-            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(instructor_token)]) as ws:
+            with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(instructor_token)) as ws:
                 ws.receive_text()
         assert exc_info.value.code == 4005
+        assert exc_info.value.reason == "Only learner-role tokens may open a telemetry connection."
+
+    def test_echo_subprotocol_selects_bare_marker_without_token(self, ws_client, learner_token):
+        """Server must select the bare 'proctoring-v1' marker so the JWT is not echoed in 101 headers."""
+        with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(learner_token)) as ws:
+            assert ws.accepted_subprotocol == "proctoring-v1"
+            assert learner_token not in (ws.accepted_subprotocol or "")
+            ready = ws.receive_json()
+            assert ready["type"] == "session_ready"
+
+    def test_echo_subprotocol_never_echoes_token_when_marker_omitted(self, ws_client, learner_token):
+        """Even if a client omits the bare marker, the server must never echo the token-bearing value."""
+        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
+            assert ws.accepted_subprotocol is None
+            ready = ws.receive_json()
+            assert ready["type"] == "session_ready"
 
 
 class TestWebSocketSession:
@@ -903,9 +941,10 @@ class TestWebSocketSession:
             now=NOW,
         )
         with pytest.raises(WebSocketDisconnect) as exc_info:
-            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(token)]) as ws:
+            with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(token)) as ws:
                 ws.receive_text()
         assert exc_info.value.code == 4003
+        assert exc_info.value.reason == "Session not found or in terminal state."
 
     def test_terminated_session_rejected(
         self, ws_client, settings, participant, exam_session, test_db
@@ -922,16 +961,104 @@ class TestWebSocketSession:
             now=NOW,
         )
         with pytest.raises(WebSocketDisconnect) as exc_info:
-            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(token)]) as ws:
+            with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(token)) as ws:
                 ws.receive_text()
         assert exc_info.value.code == 4003
+        assert exc_info.value.reason == "Session not found or in terminal state."
+
+    def test_under_review_session_rejected_4003(
+        self, ws_client, settings, participant, exam_session, test_db
+    ):
+        """UNDER_REVIEW is terminal from the engine's perspective and must reject with 4003."""
+        from starlette.websockets import WebSocketDisconnect
+        exam_session.status = SessionStatus.UNDER_REVIEW
+        test_db.commit()
+        token = issue_session_token(
+            participant.id,
+            exam_session.id,
+            AppRole.LEARNER,
+            settings=settings,
+            now=NOW,
+        )
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(token)) as ws:
+                ws.receive_text()
+        assert exc_info.value.code == 4003
+        assert exc_info.value.reason == "Session not found or in terminal state."
+
+    def test_reinstated_session_can_connect_and_stays_reinstated(
+        self, ws_client, settings, participant, exam_session, test_db
+    ):
+        """A REINSTATED session (fast-track undo) must be able to reconnect and stay REINSTATED."""
+        exam_session.status = SessionStatus.REINSTATED
+        test_db.commit()
+        token = issue_session_token(
+            participant.id,
+            exam_session.id,
+            AppRole.LEARNER,
+            settings=settings,
+            now=NOW,
+        )
+        with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(token)) as ws:
+            ready = ws.receive_json()
+            assert ready == {
+                "type": "session_ready",
+                "payload": {
+                    "session_id": str(exam_session.id),
+                    "status": "reinstated",
+                },
+            }
+            ws.send_json(_envelope(
+                "telemetry_light",
+                {
+                    "modality": "face_presence",
+                    "face_count": 1,
+                    "confidence": 0.92,
+                },
+                session_id=str(exam_session.id),
+            ))
+            ack = ws.receive_json()
+            assert ack["type"] == "ack"
+            assert ack["payload"]["seq"] == 0
+
+        test_db.expire_all()
+        reloaded = test_db.get(ExamSession, exam_session.id)
+        assert reloaded is not None
+        assert reloaded.status == SessionStatus.REINSTATED
+
+    def test_successful_handshake_sends_session_ready_once(
+        self, ws_client, learner_token, exam_session
+    ):
+        """Successful handshake sends session_ready exactly once before normal traffic."""
+        with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(learner_token)) as ws:
+            ready = ws.receive_json()
+            assert ready == {
+                "type": "session_ready",
+                "payload": {
+                    "session_id": str(exam_session.id),
+                    "status": "active",
+                },
+            }
+            # Sending pong + telemetry yields only an ack (no duplicate session_ready)
+            ws.send_json({"type": "pong"})
+            ws.send_json(_envelope(
+                "browser_event",
+                {"event_type": "focus"},
+                session_id=str(exam_session.id),
+            ))
+            next_msg = ws.receive_json()
+            assert next_msg["type"] == "ack"
+            assert next_msg["payload"]["seq"] == 0
 
     def test_pending_session_transitions_to_active(
         self, ws_client, learner_token, exam_session, test_db
     ):
         """First connect transitions PENDING → ACTIVE."""
         assert exam_session.status == SessionStatus.PENDING
-        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(learner_token)) as ws:
+            ready = ws.receive_json()
+            assert ready["type"] == "session_ready"
+            assert ready["payload"]["status"] == "active"
             # Send a message to confirm the connection is working.
             ws.send_json(_envelope(
                 "telemetry_light",
@@ -965,7 +1092,9 @@ class TestWebSocketSession:
             settings=settings,
             now=NOW,
         )
-        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(token)]) as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(token)) as ws:
+            ready = ws.receive_json()
+            assert ready["type"] == "session_ready"
             ws.send_json(_envelope(
                 "browser_event",
                 {"event_type": "focus"},
@@ -996,16 +1125,19 @@ class TestWebSocketSession:
             now=NOW,
         )
         with pytest.raises(WebSocketDisconnect) as exc_info:
-            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(token)]) as ws:
+            with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(token)) as ws:
                 ws.receive_text()
         assert exc_info.value.code == 4009
+        assert exc_info.value.reason == "Consent has not been recorded for this session."
 
 
 class TestWebSocketMessageDispatch:
     """Message ingestion over the WebSocket."""
 
     def test_telemetry_light_acked(self, ws_client, learner_token, exam_session):
-        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(learner_token)) as ws:
+            ready = ws.receive_json()
+            assert ready["type"] == "session_ready"
             ws.send_json(_envelope(
                 "telemetry_light",
                 {
@@ -1020,7 +1152,9 @@ class TestWebSocketMessageDispatch:
             assert ack["payload"]["seq"] == 0
 
     def test_heavy_frame_acked(self, ws_client, learner_token, exam_session):
-        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(learner_token)) as ws:
+            ready = ws.receive_json()
+            assert ready["type"] == "session_ready"
             ws.send_json(_envelope(
                 "telemetry_heavy_frame",
                 {
@@ -1035,7 +1169,9 @@ class TestWebSocketMessageDispatch:
             assert ack["payload"]["seq"] == 0
 
     def test_audio_chunk_acked(self, ws_client, learner_token, exam_session):
-        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(learner_token)) as ws:
+            ready = ws.receive_json()
+            assert ready["type"] == "session_ready"
             ws.send_json(_envelope(
                 "audio_chunk",
                 {
@@ -1049,7 +1185,9 @@ class TestWebSocketMessageDispatch:
             assert ack["type"] == "ack"
 
     def test_browser_event_acked(self, ws_client, learner_token, exam_session):
-        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(learner_token)) as ws:
+            ready = ws.receive_json()
+            assert ready["type"] == "session_ready"
             ws.send_json(_envelope(
                 "browser_event",
                 {"event_type": "blur"},
@@ -1059,7 +1197,9 @@ class TestWebSocketMessageDispatch:
             assert ack["type"] == "ack"
 
     def test_seq_increments_across_messages(self, ws_client, learner_token, exam_session):
-        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(learner_token)) as ws:
+            ready = ws.receive_json()
+            assert ready["type"] == "session_ready"
             for i in range(3):
                 ws.send_json(_envelope(
                     "browser_event",
@@ -1070,34 +1210,51 @@ class TestWebSocketMessageDispatch:
                 assert ack["payload"]["seq"] == i
 
     def test_session_id_mismatch_closes_4004(self, ws_client, learner_token, exam_session):
-        with pytest.raises(Exception):
-            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
+        from starlette.websockets import WebSocketDisconnect
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(learner_token)) as ws:
+                ready = ws.receive_json()
+                assert ready["type"] == "session_ready"
                 ws.send_json(_envelope(
                     "browser_event",
                     {"event_type": "focus"},
                     session_id="wrong-session-id",
                 ))
                 ws.receive_json()  # Should trigger close.
+        assert exc_info.value.code == 4004
+        assert exc_info.value.reason == "session_id in message does not match token."
 
     def test_invalid_json_closes_4006(self, ws_client, learner_token, exam_session):
-        with pytest.raises(Exception):
-            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
+        from starlette.websockets import WebSocketDisconnect
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(learner_token)) as ws:
+                ready = ws.receive_json()
+                assert ready["type"] == "session_ready"
                 ws.send_text("not json at all {{{")
                 ws.receive_json()
+        assert exc_info.value.code == 4006
+        assert exc_info.value.reason == "Invalid JSON."
 
     def test_unknown_message_type_closes_4006(self, ws_client, learner_token, exam_session):
-        with pytest.raises(Exception):
-            with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
+        from starlette.websockets import WebSocketDisconnect
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(learner_token)) as ws:
+                ready = ws.receive_json()
+                assert ready["type"] == "session_ready"
                 ws.send_json(_envelope(
                     "unknown_type",
                     {},
                     session_id=str(exam_session.id),
                 ))
                 ws.receive_json()
+        assert exc_info.value.code == 4006
+        assert "Unknown client message type" in (exc_info.value.reason or "")
 
     def test_pong_is_silently_ignored(self, ws_client, learner_token, exam_session):
         """A ``pong`` message from the client doesn't produce an ack."""
-        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(learner_token)) as ws:
+            ready = ws.receive_json()
+            assert ready["type"] == "session_ready"
             ws.send_json({"type": "pong"})
             # Send a real message; its ack should be seq=0 (pong didn't increment).
             ws.send_json(_envelope(
@@ -1121,7 +1278,9 @@ class TestWebSocketMessageDispatch:
         # length is at least one (we may have already drained
         # some of them, but the connection succeeded and the
         # WS returned an ack, which is the real test signal).
-        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(learner_token)) as ws:
+            ready = ws.receive_json()
+            assert ready["type"] == "session_ready"
             for _ in range(3):
                 ws.send_json(_envelope(
                     "telemetry_light",
@@ -1148,7 +1307,9 @@ class TestWebSocketKillSwitchAckFlow:
     def test_kill_switch_ack_is_acked(self, ws_client, learner_token, exam_session):
         """The client can send a kill_switch_ack and receive an ack back."""
         flag_id = str(uuid.uuid4())
-        with ws_client.websocket_connect("/ws", subprotocols=[_subprotocol_for(learner_token)]) as ws:
+        with ws_client.websocket_connect("/ws", subprotocols=_subprotocols_for(learner_token)) as ws:
+            ready = ws.receive_json()
+            assert ready["type"] == "session_ready"
             ws.send_json(_envelope(
                 "kill_switch_ack",
                 {"flag_id": flag_id},
@@ -1247,8 +1408,11 @@ class TestIdentityVerificationAtHandshake:
         # Connect - should succeed
         with ws_client.websocket_connect(
             "/ws",
-            subprotocols=[_subprotocol_for(token)]
+            subprotocols=_subprotocols_for(token)
         ) as ws:
+            ready = ws.receive_json()
+            assert ready["type"] == "session_ready"
+            assert ready["payload"]["status"] == "active"
             # Connection succeeded - session should be ACTIVE now
             test_db.refresh(session)
             # Note: The session activates. Testing full identity backend

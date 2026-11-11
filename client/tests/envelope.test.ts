@@ -87,6 +87,20 @@ describe('parseServerMessage', () => {
     expect(msg!.type).toBe('policy_update');
   });
 
+  it('parses a valid session_ready message', () => {
+    const raw = JSON.stringify({
+      type: 'session_ready',
+      payload: { session_id: 'sess-123', status: 'active' },
+    });
+    const msg = parseServerMessage(raw);
+    expect(msg).not.toBeNull();
+    expect(msg!.type).toBe('session_ready');
+    if (msg!.type === 'session_ready') {
+      expect(msg!.payload.session_id).toBe('sess-123');
+      expect(msg!.payload.status).toBe('active');
+    }
+  });
+
   it('returns null for invalid JSON', () => {
     expect(parseServerMessage('not json{')).toBeNull();
   });

@@ -128,11 +128,16 @@ export function buildEnvelope<TType extends ClientMessageType, TPayload>(
 // Server -> Client Messages
 // ============================================================================
 
-export type ServerMessageType = 'ack' | 'kill_switch' | 'policy_update';
+export type ServerMessageType = 'session_ready' | 'ack' | 'kill_switch' | 'policy_update';
 
 export interface ServerEnvelope<TType extends ServerMessageType, TPayload> {
   type: TType;
   payload: TPayload;
+}
+
+export interface SessionReadyPayload {
+  session_id: string;
+  status: string;
 }
 
 export interface SessionAcknowledgePayload {
@@ -159,11 +164,13 @@ export interface PolicyUpdatePayload {
   config_dump: Record<string, unknown>;
 }
 
+export type SessionReadyServerEnvelope = ServerEnvelope<'session_ready', SessionReadyPayload>;
 export type SessionAcknowledgeServerEnvelope = ServerEnvelope<'ack', SessionAcknowledgePayload>;
 export type KillSwitchServerEnvelope = ServerEnvelope<'kill_switch', KillSwitchPayload>;
 export type PolicyUpdateServerEnvelope = ServerEnvelope<'policy_update', PolicyUpdatePayload>;
 
 export type ServerMessage =
+  | SessionReadyServerEnvelope
   | SessionAcknowledgeServerEnvelope
   | KillSwitchServerEnvelope
   | PolicyUpdateServerEnvelope;
@@ -180,7 +187,7 @@ export function parseServerMessage(rawText: string): ServerMessage | null {
     if (!('type' in raw) || !('payload' in raw)) return null;
 
     // Check type enum
-    if (!['ack', 'kill_switch', 'policy_update'].includes(raw.type)) {
+    if (!['session_ready', 'ack', 'kill_switch', 'policy_update'].includes(raw.type)) {
       return null;
     }
 

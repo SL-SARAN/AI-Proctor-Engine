@@ -127,9 +127,9 @@ describe("Cloudflare Durable Objects Gateway E2E Integration Suite", () => {
       .replace(/\+/g, "-")
       .replace(/\//g, "_");
     const forgedToken = `${header}.${payload}.forged_signature_here`;
-    const subprotocol = `proctoring-v1.${forgedToken}`;
+    const subprotocols = ["proctoring-v1", `proctoring-v1.${forgedToken}`];
 
-    const ws = new globalThis.WebSocket(gatewayWsUrl, subprotocol) as any;
+    const ws = new globalThis.WebSocket(gatewayWsUrl, subprotocols) as any;
 
     const closeResult = await new Promise<{ code: number; reason: string }>((resolve, reject) => {
       ws.addEventListener("close", (evt: any) => resolve({ code: evt.code, reason: evt.reason }));
@@ -143,8 +143,8 @@ describe("Cloudflare Durable Objects Gateway E2E Integration Suite", () => {
   });
 
   it("rejects connection when connecting with non-learner token (instructor)", async () => {
-    const subprotocol = `proctoring-v1.${serverTokens.instructor_token}`;
-    const ws = new globalThis.WebSocket(gatewayWsUrl, subprotocol) as any;
+    const subprotocols = ["proctoring-v1", `proctoring-v1.${serverTokens.instructor_token}`];
+    const ws = new globalThis.WebSocket(gatewayWsUrl, subprotocols) as any;
 
     const closeResult = await new Promise<{ code: number; reason: string }>((resolve, reject) => {
       ws.addEventListener("close", (evt: any) => resolve({ code: evt.code, reason: evt.reason }));
@@ -158,8 +158,8 @@ describe("Cloudflare Durable Objects Gateway E2E Integration Suite", () => {
   });
 
   it("rejects connection when consent has not been recorded", async () => {
-    const subprotocol = `proctoring-v1.${serverTokens.no_consent_token}`;
-    const ws = new globalThis.WebSocket(gatewayWsUrl, subprotocol) as any;
+    const subprotocols = ["proctoring-v1", `proctoring-v1.${serverTokens.no_consent_token}`];
+    const ws = new globalThis.WebSocket(gatewayWsUrl, subprotocols) as any;
 
     const closeResult = await new Promise<{ code: number; reason: string }>((resolve, reject) => {
       ws.addEventListener("close", (evt: any) => resolve({ code: evt.code, reason: evt.reason }));
@@ -173,8 +173,8 @@ describe("Cloudflare Durable Objects Gateway E2E Integration Suite", () => {
   });
 
   it("rejects connection when session is in terminal state", async () => {
-    const subprotocol = `proctoring-v1.${serverTokens.terminated_token}`;
-    const ws = new globalThis.WebSocket(gatewayWsUrl, subprotocol) as any;
+    const subprotocols = ["proctoring-v1", `proctoring-v1.${serverTokens.terminated_token}`];
+    const ws = new globalThis.WebSocket(gatewayWsUrl, subprotocols) as any;
 
     const closeResult = await new Promise<{ code: number; reason: string }>((resolve, reject) => {
       ws.addEventListener("close", (evt: any) => resolve({ code: evt.code, reason: evt.reason }));
@@ -188,30 +188,32 @@ describe("Cloudflare Durable Objects Gateway E2E Integration Suite", () => {
   });
 
   it("streams telemetry_light to origin and receives monotonic ACK over DO gateway", async () => {
-    const subprotocol = `proctoring-v1.${serverTokens.valid_learner_token}`;
-    const ws = new globalThis.WebSocket(gatewayWsUrl, subprotocol) as any;
+    const subprotocols = ["proctoring-v1", `proctoring-v1.${serverTokens.valid_learner_token}`];
+    const ws = new globalThis.WebSocket(gatewayWsUrl, subprotocols) as any;
 
+    let readyMsg: any = null;
     const receivedAcks: any[] = [];
 
     await new Promise<void>((resolve, reject) => {
-      ws.addEventListener("open", () => {
-        // Send first telemetry frame
-        const msg = {
-          type: "telemetry_light",
-          session_id: serverTokens.valid_session_id,
-          captured_at: new Date().toISOString(),
-          payload: {
-            modality: "face_presence",
-            face_count: 1,
-            confidence: 0.99,
-            bbox: [0.1, 0.1, 0.4, 0.4],
-          },
-        };
-        ws.send(JSON.stringify(msg));
-      });
-
       ws.addEventListener("message", (evt: any) => {
         const data = JSON.parse(evt.data.toString());
+        if (data.type === "session_ready" && readyMsg === null) {
+          readyMsg = data;
+          // Send first telemetry frame only after session_ready
+          const msg = {
+            type: "telemetry_light",
+            session_id: serverTokens.valid_session_id,
+            captured_at: new Date().toISOString(),
+            payload: {
+              modality: "face_presence",
+              face_count: 1,
+              confidence: 0.99,
+              bbox: [0.1, 0.1, 0.4, 0.4],
+            },
+          };
+          ws.send(JSON.stringify(msg));
+          return;
+        }
         receivedAcks.push(data);
         if (receivedAcks.length === 1) {
           // Send second telemetry frame
@@ -242,6 +244,12 @@ describe("Cloudflare Durable Objects Gateway E2E Integration Suite", () => {
       setTimeout(() => reject(new Error("Timeout waiting for ACKs")), 5000);
     });
 
+    expect(ws.protocol).toBe("proctoring-v1");
+    expect(readyMsg).not.toBeNull();
+    expect(readyMsg.type).toBe("session_ready");
+    expect(readyMsg.payload.session_id).toBe(serverTokens.valid_session_id);
+    expect(readyMsg.payload.status).toBe("active");
+
     ws.close(1000, "Clean client close");
 
     expect(receivedAcks).toHaveLength(2);
@@ -252,7 +260,7 @@ describe("Cloudflare Durable Objects Gateway E2E Integration Suite", () => {
   });
 
   it("handles 1:1 reconnection cleanly with verified fresh origin connection lifecycle and state teardown", async () => {
-    const subprotocol = `proctoring-v1.${serverTokens.valid_learner_token}`;
+    const subprotocols = ["proctoring-v1", `proctoring-v1.${serverTokens.valid_learner_token}`];
 
     // Helper to query origin server stats
     async function getOriginStats() {
@@ -274,24 +282,30 @@ describe("Cloudflare Durable Objects Gateway E2E Integration Suite", () => {
     // -------------------------------------------------------------
     // Connection 1: Open, verify active origin connection & seq=0 ACK
     // -------------------------------------------------------------
-    const ws1 = new globalThis.WebSocket(gatewayWsUrl, subprotocol) as any;
+    const ws1 = new globalThis.WebSocket(gatewayWsUrl, subprotocols) as any;
     const ack1 = await new Promise<any>((resolve, reject) => {
-      ws1.addEventListener("open", () => {
-        ws1.send(
-          JSON.stringify({
-            type: "telemetry_light",
-            session_id: serverTokens.valid_session_id,
-            captured_at: new Date().toISOString(),
-            payload: {
-              modality: "face_presence",
-              face_count: 1,
-              confidence: 0.99,
-              bbox: [0.2, 0.2, 0.3, 0.3],
-            },
-          })
-        );
+      let sawReady = false;
+      ws1.addEventListener("message", (evt: any) => {
+        const data = JSON.parse(evt.data.toString());
+        if (data.type === "session_ready" && !sawReady) {
+          sawReady = true;
+          ws1.send(
+            JSON.stringify({
+              type: "telemetry_light",
+              session_id: serverTokens.valid_session_id,
+              captured_at: new Date().toISOString(),
+              payload: {
+                modality: "face_presence",
+                face_count: 1,
+                confidence: 0.99,
+                bbox: [0.2, 0.2, 0.3, 0.3],
+              },
+            })
+          );
+          return;
+        }
+        resolve(data);
       });
-      ws1.addEventListener("message", (evt: any) => resolve(JSON.parse(evt.data.toString())));
       ws1.addEventListener("error", reject);
       setTimeout(() => reject(new Error("Timeout on WS1")), 5000);
     });
@@ -331,24 +345,30 @@ describe("Cloudflare Durable Objects Gateway E2E Integration Suite", () => {
     // -------------------------------------------------------------
     // Connection 2: Reconnect with same token to active session
     // -------------------------------------------------------------
-    const ws2 = new globalThis.WebSocket(gatewayWsUrl, subprotocol) as any;
+    const ws2 = new globalThis.WebSocket(gatewayWsUrl, subprotocols) as any;
     const ack2 = await new Promise<any>((resolve, reject) => {
-      ws2.addEventListener("open", () => {
-        ws2.send(
-          JSON.stringify({
-            type: "telemetry_light",
-            session_id: serverTokens.valid_session_id,
-            captured_at: new Date().toISOString(),
-            payload: {
-              modality: "face_presence",
-              face_count: 1,
-              confidence: 0.97,
-              bbox: [0.2, 0.2, 0.3, 0.3],
-            },
-          })
-        );
+      let sawReady = false;
+      ws2.addEventListener("message", (evt: any) => {
+        const data = JSON.parse(evt.data.toString());
+        if (data.type === "session_ready" && !sawReady) {
+          sawReady = true;
+          ws2.send(
+            JSON.stringify({
+              type: "telemetry_light",
+              session_id: serverTokens.valid_session_id,
+              captured_at: new Date().toISOString(),
+              payload: {
+                modality: "face_presence",
+                face_count: 1,
+                confidence: 0.97,
+                bbox: [0.2, 0.2, 0.3, 0.3],
+              },
+            })
+          );
+          return;
+        }
+        resolve(data);
       });
-      ws2.addEventListener("message", (evt: any) => resolve(JSON.parse(evt.data.toString())));
       ws2.addEventListener("error", reject);
       setTimeout(() => reject(new Error("Timeout on WS2 reconnect")), 5000);
     });

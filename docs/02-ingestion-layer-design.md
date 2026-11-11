@@ -27,7 +27,7 @@ The ingestion architecture uses a dedicated **Cloudflare Workers + Durable Objec
 ┌───────────────────────────────┐
 │ Browser Client (TypeScript)   │
 └──────────────┬────────────────┘
-               │ wss:// (Sec-WebSocket-Protocol: proctoring-v1.{JWT})
+               │ wss:// (Sec-WebSocket-Protocol: proctoring-v1, proctoring-v1.{JWT})
                ▼
 ┌───────────────────────────────┐
 │ Cloudflare Edge Worker        │  Extracts session_id from unverified JWT payload
@@ -37,19 +37,19 @@ The ingestion architecture uses a dedicated **Cloudflare Workers + Durable Objec
 ┌───────────────────────────────┐
 │ SessionGatewayDO (Durable Obj)│  1:1 session-scoped proxy instance
 └──────────────┬────────────────┘
-               │ ws:// / wss:// (Passes Sec-WebSocket-Protocol unchanged)
+               │ ws:// / wss:// (Passes Sec-WebSocket-Protocol unchanged; origin selects bare proctoring-v1)
                ▼
 ┌───────────────────────────────┐
 │ Kubernetes Ingress & Origin   │  Authoritative HMAC validation, DB checks,
-│ FastAPI Backend (/ws)         │  consent enforcement, frame dispatch & acks
+│ FastAPI Backend (/ws)         │  consent enforcement, session_ready gate, frame dispatch & acks
 └───────────────────────────────┘
 ```
 
 **Key Architectural Invariants:**
 1. **Zero-Trust / Zero-Authority Edge Token Decoding:**
-   - The edge gateway decodes the base64url payload segment of `Sec-WebSocket-Protocol: proctoring-v1.{JWT}` strictly to extract `session_id` (or `sid`) to route to the designated Durable Object (`idFromName(sessionId)`).
+   - The edge gateway decodes the base64url payload segment of the `proctoring-v1.{JWT}` entry in `Sec-WebSocket-Protocol` strictly to extract `session_id` (or `sid`) to route to the designated Durable Object (`idFromName(sessionId)`). Clients offer `["proctoring-v1", "proctoring-v1.{JWT}"]` so FastAPI selects only the bare `proctoring-v1` marker in its `101` response headers without echoing the JWT.
    - The edge gateway does **not** verify cryptographic signatures, check expiration, or access database state.
-   - FastAPI is the single authoritative source of truth. If a token has an invalid signature, expired timestamp, missing consent, or non-learner role, FastAPI immediately rejects the handshake with RFC 6455 application close codes (`4001`, `4002`, `4005`, `4009`, `4003`), which the DO gateway transparently propagates back to the client.
+   - FastAPI is the single authoritative source of truth. If a token has an invalid signature, expired timestamp, missing consent, or non-learner role, FastAPI immediately rejects the handshake with RFC 6455 application close codes (`4001`, `4002`, `4005`, `4009`, `4003`), which the DO gateway transparently propagates back to the client. Only after all handshake checks pass does FastAPI emit `session_ready`; the browser client waits for `session_ready` before marking itself `connected`, requesting camera capture (`getUserMedia`), or sending telemetry.
 2. **1:1 Connection Lifecycle (No Transparent Socket Swapping):**
    - The gateway maintains a strict 1:1 coupling between the client-facing WebSocket and the outbound origin WebSocket.
    - When the client disconnects, the origin socket is closed cleanly.
@@ -57,11 +57,11 @@ The ingestion architecture uses a dedicated **Cloudflare Workers + Durable Objec
 3. **Verified Edge Pricing & Metering Model (2026 Cloudflare Rates):**
    - **Base:** $5/month Workers Paid base plan.
    - **DO Requests:** $0.15 / 1M requests (incoming WebSocket messages metered at 20:1 ratio for DOs).
-   - **DO Compute Duration:** $12.50 / 1M GB-seconds (minimum 128 MB allocation). Because the outbound origin WebSocket connection keeps the DO resident in memory throughout the exam, compute is metered on wall-clock session duration ($\approx 128\text{ MB} \times 7200\text{ s} \approx 0.9\text{ GB-s} \approx \$0.011$ per 2-hour student exam).
+   - **DO Compute Duration:** $12.50 / 1M GB-seconds (minimum 128 MB allocation). Because the outbound origin WebSocket connection keeps the DO resident in memory throughout the exam, compute is metered on wall-clock session duration (`128 MB = 0.125 GB`; `0.125 GB × 7200 s = 900 GB-s`, `900 GB-s × $12.50 / 1M = $0.01125` ≈ `$0.011` per 2-hour student exam).
 
-**Heartbeat:** a ping/pong every ~15s. No pong within a grace window (default 30s) does not trigger instant termination — it emits a `connection_lost` `MEDIUM` flag, handled via the accumulated-score pipeline.
+**Heartbeat:** a server-initiated WebSocket ping every 15s (`heartbeat_interval_seconds`). If no pong is received within the grace window (`heartbeat_timeout_seconds`, default 30s), the server closes the WebSocket with `WS_CLOSE_HEARTBEAT_TIMEOUT` (`4007`). (A `connection_lost` flag is not emitted.)
 
-**Reconnect:** the client may reconnect with the same valid session token and resume the active `ExamSession` row as long as the session has not reached a terminal status (`COMPLETED`, `TERMINATED`).
+**Reconnect:** the client may reconnect with the same valid session token when the `ExamSession` row is in a connectable status (`PENDING`, `ACTIVE`, or `REINSTATED`); `REINSTATED` sessions connect and stay `REINSTATED` while awaiting human review. Terminal statuses (`COMPLETED`, `TERMINATED`, `UNDER_REVIEW`) are rejected with close code `4003`.
 
 ---
 
@@ -106,10 +106,16 @@ Sample rate matters concretely here: `webrtcvad` (the library named in the spec 
 
 ```json
 {
-  "type": "ack | kill_switch | policy_update",
+  "type": "session_ready | ack | kill_switch | policy_update",
   "payload": { }
 }
 ```
+
+**`session_ready`** is emitted once immediately after handshake authentication, consent, and session-status checks pass:
+```json
+{ "session_id": "uuid", "status": "active | reinstated" }
+```
+The client holds camera initialization (`getUserMedia`) and telemetry sending until `session_ready` arrives so rejected handshakes (`4001`, `4002`, `4003`, `4005`, `4009`) never briefly capture media.
 
 **`kill_switch`** is the important one — the single message that instructs the exam client to lock the interface and force-submit:
 ```json

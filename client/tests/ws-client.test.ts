@@ -14,6 +14,7 @@ class MockWebSocket {
   readyState = MockWebSocket.CONNECTING;
   url: string;
   protocol: string;
+  offeredProtocols: string[];
   sentMessages: string[] = [];
 
   onopen: ((this: MockWebSocket, ev: Event) => void) | null = null;
@@ -23,7 +24,10 @@ class MockWebSocket {
 
   constructor(url: string, protocol?: string | string[]) {
     this.url = url;
-    this.protocol = typeof protocol === 'string' ? protocol : (Array.isArray(protocol) ? protocol[0] ?? '' : '');
+    this.offeredProtocols = typeof protocol === 'string'
+      ? [protocol]
+      : (Array.isArray(protocol) ? protocol : []);
+    this.protocol = this.offeredProtocols[0] ?? '';
   }
 
   send(data: string) {
@@ -91,31 +95,74 @@ describe('WsClient', () => {
     } as ConstructorParameters<typeof WsClient>[0]);
   }
 
-  it('sends the token via the subprotocol header, not a query param', () => {
+  function simulateReady(ws: MockWebSocket, sessionId = 'test-session', status = 'active') {
+    ws.simulateOpen();
+    ws.simulateMessage(JSON.stringify({
+      type: 'session_ready',
+      payload: { session_id: sessionId, status },
+    }));
+  }
+
+  it('sends bare proctoring-v1 marker alongside token-bearing subprotocol, never in URL', () => {
     const client = makeClient();
     client.connect();
 
     expect(lastCreatedWs).not.toBeNull();
     expect(lastCreatedWs!.url).toBe('wss://example.com/ws');
-    // Token must be in the protocol, not the URL
+    // Token must be in the protocol list, not the URL
     expect(lastCreatedWs!.url).not.toContain('token=');
-    expect(lastCreatedWs!.protocol).toBe('proctoring-v1.test-jwt-token');
+    expect(lastCreatedWs!.offeredProtocols).toEqual([
+      'proctoring-v1',
+      'proctoring-v1.test-jwt-token',
+    ]);
   });
 
-  it('transitions to "connected" on open', () => {
+  it('does NOT transition to "connected" on open alone; waits for session_ready', () => {
     const statuses: WSStatus[] = [];
     const client = makeClient({ onStatusChange: (s: WSStatus) => statuses.push(s) });
     client.connect();
     lastCreatedWs!.simulateOpen();
+    expect(statuses).not.toContain('connected');
+    expect(client.getStatus()).toBe('connecting');
+
+    lastCreatedWs!.simulateMessage(JSON.stringify({
+      type: 'session_ready',
+      payload: { session_id: 's-1', status: 'active' },
+    }));
     expect(statuses).toContain('connected');
     expect(client.getStatus()).toBe('connected');
+  });
+
+  it('stays un-connected and drops telemetry when closed with 4009 before session_ready', () => {
+    const statuses: WSStatus[] = [];
+    let disconnectReason = '';
+    const client = makeClient({
+      onStatusChange: (s: WSStatus) => statuses.push(s),
+      onDisconnect: (reason: string) => { disconnectReason = reason; },
+    });
+    client.connect();
+    lastCreatedWs!.simulateOpen();
+
+    // Even with socket OPEN, send() must drop messages prior to session_ready
+    client.send({
+      type: 'browser_event',
+      session_id: 's',
+      captured_at: '',
+      payload: { event_type: 'blur', detail: {} },
+    });
+    expect(lastCreatedWs!.sentMessages).toHaveLength(0);
+
+    lastCreatedWs!.simulateClose(4009, 'Consent has not been recorded for this session.');
+    expect(statuses).not.toContain('connected');
+    expect(client.getStatus()).toBe('disconnected_terminal');
+    expect(disconnectReason).toContain('4009');
   });
 
   it('transitions to "disconnected_terminal" on 4xxx close code', () => {
     const statuses: WSStatus[] = [];
     const client = makeClient({ onStatusChange: (s: WSStatus) => statuses.push(s) });
     client.connect();
-    lastCreatedWs!.simulateOpen();
+    simulateReady(lastCreatedWs!);
     lastCreatedWs!.simulateClose(4001, 'Auth failed');
     expect(client.getStatus()).toBe('disconnected_terminal');
   });
@@ -125,7 +172,7 @@ describe('WsClient', () => {
     const statuses: WSStatus[] = [];
     const client = makeClient({ onStatusChange: (s: WSStatus) => statuses.push(s) });
     client.connect();
-    lastCreatedWs!.simulateOpen();
+    simulateReady(lastCreatedWs!);
     lastCreatedWs!.simulateClose(1006, 'Abnormal');
     expect(statuses).toContain('reconnecting');
     client.disconnect(); // Prevent timer leaks
@@ -135,7 +182,7 @@ describe('WsClient', () => {
   it('responds to server pings with pong', () => {
     const client = makeClient();
     client.connect();
-    lastCreatedWs!.simulateOpen();
+    simulateReady(lastCreatedWs!);
     lastCreatedWs!.simulateMessage('{"type":"ping"}');
     const sent = lastCreatedWs!.sentMessages;
     expect(sent[sent.length - 1]).toBe('{"type":"pong"}');
@@ -145,7 +192,7 @@ describe('WsClient', () => {
     const killSwitchHandler = vi.fn();
     const client = makeClient({ onKillSwitch: killSwitchHandler });
     client.connect();
-    lastCreatedWs!.simulateOpen();
+    simulateReady(lastCreatedWs!);
     lastCreatedWs!.simulateMessage(JSON.stringify({
       type: 'kill_switch',
       payload: { reason: 'second_person_detected', flag_id: 'flag-1' },
@@ -159,7 +206,7 @@ describe('WsClient', () => {
   it('marks connection as terminal after kill_switch', () => {
     const client = makeClient();
     client.connect();
-    lastCreatedWs!.simulateOpen();
+    simulateReady(lastCreatedWs!);
     lastCreatedWs!.simulateMessage(JSON.stringify({
       type: 'kill_switch',
       payload: { reason: 'gaze_frequency_exceeded', flag_id: 'flag-2' },
@@ -177,10 +224,10 @@ describe('WsClient', () => {
     expect(lastCreatedWs!.sentMessages).toHaveLength(0);
   });
 
-  it('send() delivers messages when WS is open', () => {
+  it('send() delivers messages after session_ready', () => {
     const client = makeClient();
     client.connect();
-    lastCreatedWs!.simulateOpen();
+    simulateReady(lastCreatedWs!);
     client.send({ type: 'browser_event', session_id: 's', captured_at: '', payload: { event_type: 'blur', detail: {} } });
     expect(lastCreatedWs!.sentMessages).toHaveLength(1);
   });
@@ -189,7 +236,7 @@ describe('WsClient', () => {
     vi.useFakeTimers();
     const client = makeClient();
     client.connect();
-    lastCreatedWs!.simulateOpen();
+    simulateReady(lastCreatedWs!);
     client.disconnect();
     expect(client.getStatus()).toBe('disconnected_terminal');
     vi.useRealTimers();
@@ -199,7 +246,7 @@ describe('WsClient', () => {
     const killSwitchHandler = vi.fn();
     const client = makeClient({ onKillSwitch: killSwitchHandler });
     client.connect();
-    lastCreatedWs!.simulateOpen();
+    simulateReady(lastCreatedWs!);
     lastCreatedWs!.simulateMessage(JSON.stringify({ type: 'unknown_type', payload: {} }));
     expect(killSwitchHandler).not.toHaveBeenCalled();
   });
@@ -207,7 +254,7 @@ describe('WsClient', () => {
   it('ignores malformed JSON messages', () => {
     const client = makeClient();
     client.connect();
-    lastCreatedWs!.simulateOpen();
+    simulateReady(lastCreatedWs!);
     // Should not throw
     lastCreatedWs!.simulateMessage('not valid json{');
   });

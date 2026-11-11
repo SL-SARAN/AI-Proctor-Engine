@@ -85,10 +85,10 @@ design doc, and code anchor is enumerated; the checklist mirrors
 | 10 | `AdminUser` table | **Implemented (2026-07-19, part of initial schema)** | `docs/01` open decision | `src/proctoring_engine/models.py` (initial migration's `Base.metadata.create_all` emits it; redundant `20260719_0003_admin_user.py` was removed) |
 | 11a | LTI 1.3 foundation (config, claims, roles, state store, session token, OIDC discovery, JWKS fetcher) | **Implemented (turn N, 70 unit tests)** | `docs/02-ingestion-layer-design.md` §1, §6 | `src/proctoring_engine/lti/` |
 | 11b | LTI 1.3 launch routes + `process_launch` service + OIDC test double + PostgreSQL integration tests | **Implemented (turn N+1, 134 unit + 9 integration tests)** | `docs/02-ingestion-layer-design.md` §1, §6 | `src/proctoring_engine/lti/routes.py`, `src/proctoring_engine/lti/service.py`, `tests/integration/test_lti_launch.py` |
-| 12 | Authenticated WebSocket protocol & Cloudflare DO Edge Gateway | **Implemented (92 Pytest + 18 Vitest tests)** | `docs/02-ingestion-layer-design.md` §2–§4 | `src/proctoring_engine/websocket/`, `gateway/` |
-| 13 | Preprocessing layer | **Implemented (38 unit tests)** | `docs/03-preprocessing-layer-design.md` | `src/proctoring_engine/preprocessing/` |
-| 14 | Inference modules (6 modalities) | **Implemented (62 unit tests)** | `docs/04-inference-modules-design.md` | `src/proctoring_engine/inference/` |
-| 15 | Fusion & flagging engine | **Implemented (89 unit tests)** | `docs/05-fusion-flagging-engine-design.md` | `src/proctoring_engine/fusion/` |
+| 12 | Authenticated WebSocket protocol & Cloudflare DO Edge Gateway | **Implemented (98 Pytest + 18 Vitest tests)** | `docs/02-ingestion-layer-design.md` §2–§4 | `src/proctoring_engine/websocket/`, `gateway/` |
+| 13 | Preprocessing layer | **Implemented (128 unit tests)** | `docs/03-preprocessing-layer-design.md` | `src/proctoring_engine/preprocessing/` |
+| 14 | Inference modules (6 modalities) | **Implemented (99 unit tests)** | `docs/04-inference-modules-design.md` | `src/proctoring_engine/inference/` |
+| 15 | Fusion & flagging engine | **Implemented (87 unit tests)** | `docs/05-fusion-flagging-engine-design.md` | `src/proctoring_engine/fusion/` |
 | 16 | Evidence store | **Implemented (turn N+6, 58 unit tests)** | `docs/06-evidence-audit-store-design.md` | `src/proctoring_engine/evidence/` |
 | 17 | API & orchestration | **Implemented (turn N+7, 73 unit tests)** | `docs/07-api-orchestration-design.md` | `src/proctoring_engine/orchestration/` |
 | 18 | Browser client skeleton (WS client, browser events, rolling buffer, kill-switch UI) | **Implemented (turn N+8, 63 Vitest tests)** | `docs/02-ingestion-layer-design.md` | `client/` |

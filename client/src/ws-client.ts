@@ -53,10 +53,13 @@ export class WsClient {
 
     // Token goes into the subprotocol header. The server explicitly rejects
     // ?session_token=... on the query string.
-    const subprotocol = `proctoring-v1.${this.options.sessionToken}`;
+    // Offer the bare 'proctoring-v1' marker alongside the token-bearing
+    // subprotocol so the server can select only the bare marker in its
+    // 101 response without echoing the JWT back.
+    const subprotocols = ['proctoring-v1', `proctoring-v1.${this.options.sessionToken}`];
 
     try {
-      this.ws = new WebSocket(this.options.url, subprotocol);
+      this.ws = new WebSocket(this.options.url, subprotocols);
     } catch (err) {
       this.handleTerminalDisconnect(`WebSocket creation failed: ${(err as Error).message}`);
       return;
@@ -81,19 +84,21 @@ export class WsClient {
   }
 
   /**
-   * Enqueue a message. If the WS is not open, it is synchronously dropped.
-   * (We don't queue messages offline; we're sampling live data).
+   * Enqueue a message. If the session is not validated and connected,
+   * it is synchronously dropped. (We don't queue messages offline; we're
+   * sampling live data, and we must not emit telemetry before session_ready.)
    */
   public send(msg: ClientEnvelope) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
+    if (this.ws?.readyState === WebSocket.OPEN && this.status === 'connected') {
       this.ws.send(JSON.stringify(msg));
     }
   }
 
   private handleOpen() {
-    this.reconnectAttempt = 0;
-    this.setStatus('connected');
-    this.startHeartbeat();
+    // Do NOT mark 'connected' yet: the server completes the 101 handshake
+    // before checking auth, consent, and session status so that rejections
+    // can travel as 4xxx RFC 6455 close frames. We wait for 'session_ready'
+    // before transitioning to 'connected' and triggering camera capture.
   }
 
   private handleMessage(event: MessageEvent) {
@@ -109,6 +114,13 @@ export class WsClient {
 
     const msg = parseServerMessage(rawData);
     if (!msg) return; // Ignore unknown or malformed messages
+
+    if (msg.type === 'session_ready') {
+      this.reconnectAttempt = 0;
+      this.setStatus('connected');
+      this.startHeartbeat();
+      return;
+    }
 
     if (msg.type === 'kill_switch') {
       // We got the kill switch. This is structurally terminal.

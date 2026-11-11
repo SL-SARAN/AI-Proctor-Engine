@@ -40,6 +40,8 @@ from proctoring_engine.websocket.server import (
     ServerMessageType,
     SessionAcknowledgeDeliver,
     SessionAcknowledgePayload,
+    SessionReadyDeliver,
+    SessionReadyPayload,
     TelemetryEventBuffer,
 )
 from proctoring_engine.websocket.routes import (
@@ -82,6 +84,8 @@ __all__ = [
     "ServerMessageType",
     "SessionAcknowledgeDeliver",
     "SessionAcknowledgePayload",
+    "SessionReadyDeliver",
+    "SessionReadyPayload",
     "TelemetryEventBuffer",
     # Router + close codes
     "WS_CLOSE_AUTH_EXPIRED",
